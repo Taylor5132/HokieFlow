@@ -280,14 +280,27 @@ def is_dynamic(place_key: str) -> bool:
         return bool(PLACES.get(place_key, {}).get("dynamic"))
 
 # ---------------------------------------------------------------- dining ids
-# Verified from Locations.aspx and the hours API on 2026-09-19.
+# ALL 12 official FoodPro locations, verified from Locations.aspx and the hours
+# API on 2026-09-19. Names are the API's own `name` with surrounding whitespace
+# stripped (the API returns "Turner Place at Lavery Hall " with a trailing space);
+# the internal double space in the Viva row is upstream and preserved verbatim so
+# the API-vs-config equality test keeps passing.
+#
+# This is the deterministic directory: `dining.location_directory()` is built
+# from it, sorted by location_num, and never silently drops an entry.
 DINING_LOCATIONS: dict[str, str] = {
-    "09": "Hokie Grill at Owens",
-    "15": "D2 at Dietrick Hall",
-    "72": "Deet's Place",
     "01": "Ducky's at GLC",
-    "71": "DX",
+    "06": "Perry Place at HITT Hall",
+    "07": "Xpress Lane Market",
+    "09": "Hokie Grill at Owens",
+    "14": "Turner Place at Lavery Hall",
+    "15": "D2 at Dietrick Hall",
+    "16": "West End at Cochrane Hall",
+    "18": "Squires Food Court",
+    "19": "Viva Market - Johnston Student Center & Viva Too  - Goodwin Hall",
     "39": "Owens Food Court",
+    "71": "DX",
+    "72": "Deet's Place",
 }
 
 KNOWN_ALLERGENS = [

@@ -78,6 +78,30 @@ def build_bundle() -> dict:
         })
 
     # ---- dining ------------------------------------------------------------
+    # The full directory + per-location status are exported ONCE, separately
+    # from the food rows, so a frontend/Genie can distinguish ok / closed /
+    # empty / unavailable without inferring it from a thin menu table.
+    directory = dining.location_directory()
+    dining_locations = [
+        {"location_num": loc.location_num, "name": loc.name}
+        for loc in directory
+    ]
+    dining_status: list[dict] = []
+    for loc in directory:
+        try:
+            dining_status.append(dining.location_status(
+                loc.location_num, service_date).as_dict())
+        except Exception as exc:                       # noqa: BLE001
+            print(f"  WARN status {loc.location_num}: {exc}")
+
+    # BASIC food rows (no nutrition) across every reachable location. This is
+    # the multi-location menu layer; nutrition stays a separate, later join.
+    food_basic: list[dict] = []
+    try:
+        food_basic = list(dining.list_foods(d=service_date)["rows"])
+    except Exception as exc:                           # noqa: BLE001
+        print(f"  WARN basic food: {exc}")
+
     eat_options: list[dict] = []
     hours_rows: list[dict] = []
     for loc in DEMO_LOCATIONS:
@@ -91,7 +115,10 @@ def build_bundle() -> dict:
             print(f"  WARN nutrition {loc}: {exc}")
             nut = {}
         try:
-            for it in dining.menu(loc, service_date):
+            # menu_result: a valid date with no published menu is EMPTY, not an
+            # error; only an unreachable source is unavailable.
+            mres = dining.menu_result(loc, service_date)
+            for it in mres.items:
                 n = nut.get(it.recipe_id)
                 eat_options.append({
                     "location_num": loc, "meal": it.meal, "section": it.section,
@@ -136,12 +163,18 @@ def build_bundle() -> dict:
         "stops": stops,
         "next_departures": departures,
         "live_buses": live,
+        "dining_locations": dining_locations,
+        "dining_status": dining_status,
+        "food_basic": food_basic,
         "eat_options": eat_options,
         "dining_hours": hours_rows,
         "_stats": {
             "stops": len(stops),
             "next_departures": len(departures),
             "live_buses": len(live),
+            "dining_locations": len(dining_locations),
+            "dining_status": len(dining_status),
+            "food_basic": len(food_basic),
             "eat_options": len(eat_options),
             "eating_with_kcal": with_kcal,
             "eating_with_blank_allergens": empty_allergen,
@@ -170,7 +203,8 @@ def main() -> int:
     # would have to be unpicked in SQL, which is fiddly and error-prone.
     tables_dir = OUT_DIR / "tables"
     tables_dir.mkdir(parents=True, exist_ok=True)
-    for name in ("stops", "next_departures", "live_buses", "eat_options",
+    for name in ("stops", "next_departures", "live_buses", "dining_locations",
+                 "dining_status", "food_basic", "eat_options",
                  "dining_hours"):
         rows = bundle.get(name) or []
         with (tables_dir / f"{name}.jsonl").open("w", encoding="utf-8") as fh:

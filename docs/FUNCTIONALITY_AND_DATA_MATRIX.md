@@ -8,8 +8,8 @@ as such.
 **Brand:** **HokieFlow** is the user-visible product name. Internal identifiers stay `hokieday`
 (package `hokieday/`, imports, file names, config keys).
 
-**As verified:** 2026-09-20 at integrated `master` commit `95b0fa3` (VT GIS + reviewed NWS
-weather + public class/ICS backend). Offline suite: **526 tests, 0 failures** under `DEMO_MODE=cache`. Live bus
+**As verified:** 2026-09-20 after VT GIS, reviewed NWS weather and public class/ICS
+backend integration. Offline suite: **526 tests, 0 failures** under `DEMO_MODE=cache`. Live bus
 fixture captured **2026-09-19T15:22:29Z**. See §12 for the exact verification commands.
 
 ---
@@ -459,7 +459,7 @@ forcing GTFS. B1 and P1 are therefore closed below.
 | Rank | Item | Why it unlocks Figma states | Acceptance criteria | Depends on |
 |---|---|---|---|---|
 | B1 | ✅ **DONE — explicit "no feasible plan" state** | Removes the dishonest "fits" headline; adds a real failure design | Shipped: top-level `feasible` + `infeasible_reason` (`deadline_missed`/`unknown_place`/`no_legs`/`invalid_window`); a late best effort is retained; a zero-leg itinerary is never returned as valid; the rationale never says "fits"/"to spare" when late | — |
-| B2 | **Multi-location dining fixtures** (at least Owens `39`, Hokie Grill `09`) | Broadens the food picker and "closing soon, try X" re-plan | Menus + hours + nutrition for 2+ non-D2 locations; `find_food(location_num=None)` returns rows for >1 location | Data capture + seed |
+| B2 | ✅ **DONE (basic) — multi-location dining** (Owens `39`, DX `71`, Turner `14`, plus empty `09`/`07`) | Broadens the food picker and the closed/empty/unavailable states | Shipped: 12-location directory; `location_status` (`ok`/`closed`/`empty`/`unavailable`) separate from rows; `list_foods`/`search_foods`/`filter_foods` basic rows with provenance; `find_food(location_num=None)` returns >1 location with typed `sources_ok`/`sources_skipped`. Nutrition for the new halls is deliberately NOT committed (basic menu first; a later layer) | Data capture + seed |
 | B3 | **Attach live state to the chosen bus leg** | Enables a "live vehicle" badge on the plan, not just in the header | Chosen bus leg carries real `is_realtime`, `load_pct`, `sched_delta_min`, `observed_at` | — |
 | B4 | **Consecutive bus samples + a stated staleness policy** | Justifies any future motion/heading; strengthens the replay label | ≥ N samples at 60 s cadence persisted; UI exposes "observed at" and refuses to animate from one sample | Poller running |
 | B5 | 🟡 **PARTIAL — Weather backend** (NWS) | Normalization, freshness and deterministic leg-risk are implemented | Remaining: LocalSource/tool adapter, `/api/weather`, attach risk to walk legs, weather re-plan trigger and UI; replay stays unavailable until coherent capture | NWS backend complete |

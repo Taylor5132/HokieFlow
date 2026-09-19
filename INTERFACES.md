@@ -220,6 +220,74 @@ def eat_options(location_num: str, d: date | str, diet: str | None = None,
     `081108*1*1,214022*1*1,141002*2*1`. Both are real; the pairing was wrong.)*
   - nutrient values come back as **strings**, not floats — cast before comparing
 
+### 3b. ADDITIVE basic/location layer (post-push, frontend contract)
+
+These functions are **new** — no §3 signature changed. They add multi-location
+basic menus and a status separate from the food rows. **No function in this
+layer fetches nutrition** (nutrition stays a later, separate join).
+
+```python
+STATUS_OK = "ok"; STATUS_CLOSED = "closed"
+STATUS_EMPTY = "empty"; STATUS_UNAVAILABLE = "unavailable"
+
+@dataclass(frozen=True)
+class LocationStatus:
+    location_num: str; name: str; date: date; status: str
+    open_now: bool | None; menu_count: int | None
+    windows: tuple[HoursWindow, ...]; stale: bool | None
+    source: str | None; fetched_at: str | None; reason: str | None
+    def as_dict(self) -> dict
+
+@dataclass(frozen=True)
+class MenuResult:
+    location_num: str; name: str; date: date; status: str
+    items: tuple[MenuItem, ...]; reason: str | None
+    source: str | None; fetched_at: str | None; stale: bool | None
+
+@dataclass(frozen=True)
+class FoodRow:  # as_dict() -> JSON-ready basic row
+dict with location_num, location_name, date (ISO), meal, section, name,
+description, portion, diet_tags[], allergens[], allergens_known,
+venue_allergen_free, recipe_id, source, fetched_at
+
+def location_directory() -> list[Location]          # all 12, sorted by num
+def location_status(location_num, d=None, at=None, force=False,
+                    max_age_s=None) -> LocationStatus
+def menu_result(location_num, d, force=False,
+                max_age_s=None) -> MenuResult
+def list_foods(location_num=None, d=None, meal=None, section=None,
+               diet=None, avoid=(), query=None, force=False,
+               max_age_s=None) -> dict
+def search_foods(query, location_num=None, d=None, diet=None, avoid=(),
+                 force=False, max_age_s=None) -> dict
+def filter_foods(location_num=None, d=None, meal=None, section=None,
+                 diet=None, avoid=(), force=False, max_age_s=None) -> dict
+def window_span(w: HoursWindow) -> tuple[datetime, datetime]   # overnight roll
+```
+
+`list_foods`/`search_foods`/`filter_foods` return a dict:
+
+```
+{date, count, rows[FoodRow.as_dict()],
+ sources_ok: [location_num],        # reachable (ok or empty)
+ sources_skipped: [{location_num, location_name, status, reason}],
+ sources_stale: [location_num],     # age > max_age_s
+ statuses: [LocationStatus.as_dict()],
+ reason: str | None}
+```
+
+**Status semantics** (precedence): unreachable source -> `unavailable`; no
+published hours for the date -> `closed` (even when a menu exists); operating
+but zero recipes -> `empty`; otherwise `ok`. `stale` is orthogonal (served
+copy older than `max_age_s`). `window_span` rolls `close <= open` to the next
+day, so an overnight window (e.g. DX 22:00:01 -> 02:00:00) reads correctly.
+
+**`tools.find_food(location_num=None)`** now searches every configured location
+and returns `sources_ok` / `sources_skipped` / `statuses` in addition to
+`items`; no location is ever silently dropped. Deterministic ranking is
+unchanged (meal-ish section, most filling, name). For an all-locations search
+kcal is left unknown on purpose (no campus-wide nutrition sweep).
+
 ---
 
 ## 4. NOT assigned yet (parent owns)

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import math
 from contextvars import ContextVar
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -246,32 +246,63 @@ class LocalSource:
         return out
 
     # -------------------------------------------------------------- dining
-    def eat_options(self, location_num: str | None, diet: str | None,
+    def food_search(self, location_num: str | None, diet: str | None,
                     avoid: tuple[str, ...], max_kcal: float | None,
-                    open_only: bool) -> list[dict]:
+                    open_only: bool) -> dict:
+        """Search one location, or ALL configured locations, without losing any.
+
+        Returns {items, sources_ok, sources_skipped, statuses,
+        nutrition_attached}. Every configured location lands in exactly one of
+        sources_ok (reachable) or sources_skipped (unreachable, with status + a
+        typed reason) -- a location is NEVER silently dropped.
+
+        NUTRITION: for a single-location query real macros are attached (the
+        planner can quote kcal). For an all-locations query nutrition is NOT
+        fetched -- a campus-wide NutritiveReport sweep per search is exactly the
+        cost blow-up this layer must avoid, so kcal is left unknown there.
+        """
         today = self._now_local().date()
-        nums = (list(config.DINING_LOCATIONS)
-                if location_num is None else [str(location_num)])
+        if location_num in (None, ""):
+            nums = sorted(config.DINING_LOCATIONS)
+            with_nutrition = False
+        else:
+            nums = [str(location_num)]
+            with_nutrition = True
+
         rows: list[dict] = []
+        sources_ok: list[str] = []
+        sources_skipped: list[dict] = []
+        statuses: list[dict] = []
         for num in nums:
+            name = config.DINING_LOCATIONS.get(num, "")
+            statuses.append(dining.location_status(num, today).as_dict())
             try:
                 items = dining.eat_options(
                     num, today, diet=diet, avoid=tuple(avoid or ()),
-                    max_kcal=max_kcal, open_only=open_only,
+                    # No nutrition fetch on a campus-wide search, so do not ask
+                    # eat_options to apply a kcal ceiling it cannot evaluate.
+                    max_kcal=(None if (max_kcal is not None
+                                       and not with_nutrition) else max_kcal),
+                    open_only=open_only,
                 )
-            except Exception:                                # noqa: BLE001
+            except Exception as exc:                         # noqa: BLE001
                 # CacheMiss in replay mode (no fixture for this location), a
-                # bad location number, or a MenuError: skip, never raise.
+                # bad location number, or a MenuError: record it, never raise
+                # and never drop it silently.
+                sources_skipped.append({
+                    "location_num": num, "location_name": name,
+                    "status": dining.STATUS_UNAVAILABLE, "reason": str(exc),
+                })
                 continue
-            # Nutrition is a cached per-location lookup now, so attach real
-            # macros. It used to be hardcoded None (only populated when a kcal
-            # ceiling forced a fetch), which meant the agent could never quote a
-            # calorie count and the eat leg read `kcal=None`.
+            sources_ok.append(num)
+            # Nutrition is a cached per-location lookup; attach real macros so
+            # the agent can quote a calorie count for a single-location pick.
             nut: dict = {}
-            try:
-                nut = dining.nutrition_for_location(num, today)
-            except Exception:                            # noqa: BLE001
-                nut = {}
+            if with_nutrition:
+                try:
+                    nut = dining.nutrition_for_location(num, today)
+                except Exception:                            # noqa: BLE001
+                    nut = {}
             for it in items:
                 n = nut.get(it.recipe_id)
                 rows.append({
@@ -294,7 +325,20 @@ class LocalSource:
                     "recipe_id": it.recipe_id,
                     "portion": f"{it.portion_size} {it.portion_unit}".strip(),
                 })
-        return rows
+        return {
+            "items": rows,
+            "sources_ok": sources_ok,
+            "sources_skipped": sources_skipped,
+            "statuses": statuses,
+            "nutrition_attached": with_nutrition,
+        }
+
+    def eat_options(self, location_num: str | None, diet: str | None,
+                    avoid: tuple[str, ...], max_kcal: float | None,
+                    open_only: bool) -> list[dict]:
+        """Frozen Source-protocol method: the item rows from food_search()."""
+        return self.food_search(location_num, diet, avoid, max_kcal,
+                                open_only)["items"]
 
     def hours(self, foodpro_id: str) -> list[dict]:
         try:
@@ -303,14 +347,18 @@ class LocalSource:
             return []
         out = []
         for w in wins:
+            # Overnight windows (close < open) must roll the close to the next
+            # day, or a 22:00->02:00 window can never read as open. window_span
+            # is the shared resolver so this path and dining.is_open agree.
+            open_dt, close_dt = dining.window_span(w)
             out.append({
                 "foodpro_id": w.foodpro_id,
                 "name": w.name,
                 "date": w.date.isoformat(),
                 "open_time": w.open_time,
                 "close_time": w.close_time,
-                "open_dt": datetime.combine(w.date, _clock(w.open_time)),
-                "close_dt": datetime.combine(w.date, _clock(w.close_time)),
+                "open_dt": open_dt,
+                "close_dt": close_dt,
             })
         return out
 
@@ -396,11 +444,6 @@ def _src(source: Any) -> Any:
 # ---------------------------------------------------------------------------
 # small helpers
 # ---------------------------------------------------------------------------
-def _clock(s: str) -> time:
-    hh, mm, ss = (int(p) for p in str(s).split(":"))
-    return time(hh, mm, ss)
-
-
 def _place(name: str) -> dict | None:
     """Case-insensitive lookup in config.PLACES (a COPY of the row, or None).
 
@@ -636,7 +679,7 @@ def find_food(location_num: str | None = None, diet: str | None = None,
               avoid: tuple[str, ...] = (), max_kcal: float | None = None,
               open_only: bool = False, source: Any = None) -> dict:
     """Menu items matching diet / allergen / kcal constraints -- one dining
-    location, or every location when location_num is None.
+    location, or every configured location when location_num is None.
 
     THE ALLERGEN RULE (SDD risk R8): `avoid` is a HARD filter applied
     upstream (case-insensitive substring). A BLANK allergen field means
@@ -644,20 +687,38 @@ def find_food(location_num: str | None = None, diet: str | None = None,
     are never presented as safe. Requested diet tags are also cross-checked
     against declared allergens so a self-contradictory source row is not
     recommended (for example, a row tagged vegan that declares Eggs).
+
+    PARTIAL SUCCESS: an all-locations search reports `sources_ok` (reachable)
+    and `sources_skipped` (unreachable, each with status + reason) so a location
+    that failed upstream is visible, never silently dropped. Ranking stays
+    deterministic: meal-ish section first, then most filling, then name.
     """
     src = _src(source)
     if isinstance(avoid, str):
         avoid = (avoid,)
     avoid = tuple(avoid or ())
+    loc = None if location_num in (None, "") else str(location_num)
+    sources_ok: list[str] | None = None
+    sources_skipped: list[dict] = []
+    statuses: list[dict] = []
     try:
-        rows = src.eat_options(
-            None if location_num in (None, "") else str(location_num),
-            diet, avoid, max_kcal, bool(open_only),
-        )
+        search = getattr(src, "food_search", None)
+        if callable(search):
+            res = search(loc, diet, avoid, max_kcal, bool(open_only))
+            rows = res.get("items") or []
+            sources_ok = res.get("sources_ok")
+            sources_skipped = res.get("sources_skipped") or []
+            statuses = res.get("statuses") or []
+        else:
+            # A Source that only implements the frozen protocol: partial-success
+            # bookkeeping is unavailable, but the rows still work.
+            rows = src.eat_options(loc, diet, avoid, max_kcal, bool(open_only))
+            sources_ok = None if loc is None else [loc]
     except Exception as exc:                                 # noqa: BLE001
         return {"location_num": location_num, "diet": diet, "avoid": list(avoid),
                 "max_kcal": max_kcal, "open_only": bool(open_only),
-                "count": 0, "items": [],
+                "count": 0, "items": [], "sources_ok": sources_ok,
+                "sources_skipped": sources_skipped, "statuses": statuses,
                 "reason": f"menu data unavailable: {exc}"}
     # Rank: meal-ish section first, then dessert/condiment/drink, then closeness
     # to a MEAL-sized target. Three naive rankings failed visibly: cheapest-first
@@ -682,6 +743,8 @@ def find_food(location_num: str | None = None, diet: str | None = None,
         "location_num": location_num, "diet": diet, "avoid": list(avoid),
         "max_kcal": max_kcal, "open_only": bool(open_only),
         "count": len(rows), "items": rows, "reason": reason,
+        "sources_ok": sources_ok, "sources_skipped": sources_skipped,
+        "statuses": statuses,
     }
 
 
