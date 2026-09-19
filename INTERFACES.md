@@ -10,8 +10,11 @@ Everything below is in `hokieday/` (import as `from hokieday import gtfs`).
 ## 0. Non-negotiable rules for every worker
 
 1. **Do not edit `hokieday/config.py` or `hokieday/cache.py`.** Parent owns them.
-2. **All HTTP goes through `cache.get_json(...)` or `cache.get_bytes(...)`.**
-   Never import `urllib`/`requests` directly — doing so bypasses the offline demo
+2. **All library HTTP goes through `cache.get_json(...)`, `cache.get_bytes(...)`,
+   or `cache.post_form_json(...)`.** `post_form_json` is the sanctioned form-POST
+   path for cache-identified computational APIs such as the VT GIS route solve;
+   its identity includes the exact URL and encoded body digest. Never import
+   `urllib`/`requests` in `hokieday/*.py` — doing so bypasses the offline demo
    path (`DEMO_MODE=cache`), which is a Tier 1 acceptance criterion.
 3. **Do not edit another worker's file.** Three workers run in parallel in this
    checkout on disjoint files.
