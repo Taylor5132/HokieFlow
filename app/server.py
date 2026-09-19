@@ -24,6 +24,7 @@ import argparse
 import errno
 import json
 import re
+import socket
 import sys
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -68,6 +69,54 @@ SCENARIOS: list[dict] = [
 ]
 
 TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})\b")
+
+# Served inline so the app has no asset files to lose.
+MANIFEST = {
+    "name": "HokieDay",
+    "short_name": "HokieDay",
+    "description": "Campus-life agent: one question across dining, transit and hours.",
+    "start_url": "/",
+    "display": "standalone",
+    "orientation": "portrait",
+    "background_color": "#0f1115",
+    "theme_color": "#0f1115",
+    "icons": [{"src": "/icon.svg", "sizes": "any",
+               "type": "image/svg+xml", "purpose": "any maskable"}],
+}
+
+ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="112" fill="#861f41"/>
+  <text x="256" y="330" font-family="-apple-system,Helvetica,Arial,sans-serif"
+        font-size="210" font-weight="700" text-anchor="middle" fill="#ffffff">HD</text>
+  <circle cx="388" cy="124" r="36" fill="#e87722"/>
+</svg>
+"""
+
+
+def lan_ips() -> list[str]:
+    """Best-effort LAN addresses, so a phone on the same network can connect.
+
+    The UDP connect sends nothing; it just asks the routing table which local
+    address would be used to reach the outside world.
+    """
+    ips: set[str] = set()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ips.add(s.getsockname()[0])
+        finally:
+            s.close()
+    except Exception:                                      # noqa: BLE001
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127."):
+                ips.add(ip)
+    except Exception:                                      # noqa: BLE001
+        pass
+    return sorted(ips)
 
 
 def parse_free_text(text: str) -> dict:
@@ -177,6 +226,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/scenarios":
             self._json([{k: s[k] for k in ("id", "label", "text")} for s in SCENARIOS])
             return
+        if path == "/manifest.webmanifest":
+            self._send(200, json.dumps(MANIFEST).encode("utf-8"),
+                       "application/manifest+json; charset=utf-8")
+            return
+        if path == "/icon.svg":
+            self._send(200, ICON_SVG.encode("utf-8"), "image/svg+xml")
+            return
+        if path == "/favicon.ico":        # keep the console clean
+            self._send(204, b"", "image/x-icon")
+            return
         if path == "/api/raw":
             from urllib.parse import parse_qs, urlparse
             n = int((parse_qs(urlparse(self.path).query).get("n", ["1"])[0]))
@@ -215,8 +274,13 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8321)
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default=None,
+                    help="bind address; defaults to 127.0.0.1, or 0.0.0.0 with --lan")
+    ap.add_argument("--lan", action="store_true",
+                    help="bind 0.0.0.0 so a phone on the same Wi-Fi can open it")
     args = ap.parse_args()
+    if args.host is None:
+        args.host = "0.0.0.0" if args.lan else "127.0.0.1"
 
     st = status()
     print("=" * 68)
@@ -247,7 +311,18 @@ def main() -> int:
         return 1
 
     bound = httpd.server_address[1]
-    print(f"\n  open http://{args.host}:{bound}/")
+    print(f"\n  open on this machine : http://127.0.0.1:{bound}/")
+    if args.lan or args.host == "0.0.0.0":
+        ips = lan_ips()
+        if ips:
+            print("  open on a phone     : " +
+                  "  ".join(f"http://{ip}:{bound}/" for ip in ips))
+            print("                        (same Wi-Fi; if it will not load, the")
+            print("                         network is blocking device-to-device traffic)")
+        else:
+            print("  --lan: could not determine a LAN address")
+    else:
+        print("  (add --lan to reach it from a phone on the same Wi-Fi)")
     print("  Ctrl-C to stop\n")
     httpd.serve_forever()
     return 0
