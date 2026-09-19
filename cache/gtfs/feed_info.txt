@@ -1,2 +1,0 @@
-feed_publisher_name,feed_publisher_url,feed_lang,default_lang,feed_start_date,feed_end_date,feed_version,feed_contact_email,feed_contact_url
-Blacksburg Transit,https://ridebt.org/,en,en,20260912,20261031,FY27 Blacksburg 1.6A,ridebt@blacksburg.gov,https://ridebt.org/
