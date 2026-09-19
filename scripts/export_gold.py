@@ -82,13 +82,25 @@ def build_bundle() -> dict:
     eat_options: list[dict] = []
     hours_rows: list[dict] = []
     for loc in DEMO_LOCATIONS:
+        # Nutrition must travel with the menu: the platform table needs kcal for
+        # the UC function's calorie filter, and find_food cannot fetch it there
+        # (serverless UDFs have no network). Missing this column made
+        # find_food(max_kcal=...) fail with UNRESOLVED_COLUMN.
+        try:
+            nut = dining.nutrition_for_location(loc, service_date)
+        except Exception as exc:                       # noqa: BLE001
+            print(f"  WARN nutrition {loc}: {exc}")
+            nut = {}
         try:
             for it in dining.menu(loc, service_date):
+                n = nut.get(it.recipe_id)
                 eat_options.append({
                     "location_num": loc, "meal": it.meal, "section": it.section,
                     "recipe_id": it.recipe_id, "name": it.name,
                     "portion": f"{it.portion_size} {it.portion_unit}".strip(),
                     "description": it.description[:200],
+                    "kcal": round(n.cals, 1) if n is not None else None,
+                    "protein_g": round(n.protein_g, 1) if n is not None else None,
                     "allergens": list(it.allergens), "diet_tags": list(it.diet_tags),
                     # SAFETY: blank allergens are UNKNOWN, never "safe" (SDD risk R8)
                     "allergens_known": bool(it.allergens),
@@ -106,6 +118,7 @@ def build_bundle() -> dict:
             print(f"  WARN hours {loc}: {exc}")
 
     empty_allergen = sum(1 for r in eat_options if not r["allergens"])
+    with_kcal = sum(1 for r in eat_options if r.get("kcal") is not None)
     return {
         "_meta": {
             "generated_at": config.now().isoformat(timespec="seconds"),
@@ -128,6 +141,7 @@ def build_bundle() -> dict:
             "next_departures": len(departures),
             "live_buses": len(live),
             "eat_options": len(eat_options),
+            "eating_with_kcal": with_kcal,
             "eating_with_blank_allergens": empty_allergen,
             "dining_hours": len(hours_rows),
         },
