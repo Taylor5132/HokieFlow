@@ -9,6 +9,7 @@ against. Every fixture here is a REAL payload from 2026-09-19.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -16,6 +17,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+
+# This script exists to build the FROZEN replay store, so force replay mode
+# before config is imported: that makes config.CACHE_DIR resolve to
+# config.FIXTURES_DIR. Seeding the live cache/ here would let a demo overwrite
+# its own expectations, which is the exact failure this split prevents.
+os.environ.setdefault("DEMO_MODE", "cache")
 
 from hokieday import cache, config  # noqa: E402
 
@@ -88,6 +95,7 @@ def main() -> int:
         written += 1
 
     print(f"\nseeded {written} fixtures into {config.CACHE_DIR}")
+    print(f"  mode={config.DEMO_MODE} | frozen replay store (live cache is {config.REPO_DIR / 'cache'})")
     return 0
 
 

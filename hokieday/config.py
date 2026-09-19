@@ -1,27 +1,92 @@
-"""Configuration: endpoints, paths, and tuning constants.
+"""Configuration: endpoints, paths, tuning constants, and the replay clock.
 
 OWNER: parent (do not edit from a worker subagent).
 """
 from __future__ import annotations
 
+import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------- paths
 PKG_DIR = Path(__file__).resolve().parent          # .../hokieday/hokieday
 REPO_DIR = PKG_DIR.parent                          # .../hokieday
-CACHE_DIR = Path(os.environ.get("HOKIEDAY_CACHE", REPO_DIR / "cache"))
-DATA_DIR = Path(os.environ.get("HOKIEDAY_DATA", REPO_DIR / "data"))
-GTFS_DIR = CACHE_DIR / "gtfs"                      # extracted static feed
 
-for _d in (CACHE_DIR, DATA_DIR):
-    _d.mkdir(parents=True, exist_ok=True)
+# Two SEPARATE stores, deliberately:
+#   cache/     - the live cache. Refreshed whenever we hit the network.
+#   fixtures/  - the FROZEN replay snapshot. Only scripts/seed_cache.py writes it.
+# They must never be the same directory: a live poll used to overwrite the very
+# fixture the tests and the offline demo read, which silently changed expected
+# values mid-session (observed: fixture `fetched_at` jumped 15:22 -> 15:51).
+CACHE_DIR = Path(os.environ.get("HOKIEDAY_CACHE", REPO_DIR / "cache"))
+FIXTURES_DIR = Path(os.environ.get("HOKIEDAY_FIXTURES", REPO_DIR / "fixtures"))
+DATA_DIR = Path(os.environ.get("HOKIEDAY_DATA", REPO_DIR / "data"))
 
 # ---------------------------------------------------------------- demo mode
-# "live"  -> hit the network, write through to cache, fall back to stale cache
-# "cache" -> never touch the network; read cache only (demo safety, tests)
+# "live"  -> hit the network, write through to cache/, fall back to stale cache
+# "cache" -> never touch the network; read the FROZEN fixtures/ only
 DEMO_MODE = os.environ.get("DEMO_MODE", "live").strip().lower()
 CACHE_ONLY = DEMO_MODE == "cache"
+
+if CACHE_ONLY:
+    CACHE_DIR = FIXTURES_DIR        # a replay never reads the live cache
+
+GTFS_DIR = CACHE_DIR / "gtfs"      # extracted static feed
+
+for _d in (CACHE_DIR, FIXTURES_DIR, DATA_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------- replay clock
+# A schedule delta is `now - scheduled_departure`, so a cached snapshot's deltas
+# grow by exactly one minute per minute of real time. Verified failure: a
+# 6.7-minute gap between capture and replay inflated all 13 live deltas to a
+# +7.73 min mean, and a fixture replayed the next morning reads as ~20 hours late.
+# In replay mode the clock must therefore be pinned to the snapshot, not the wall.
+_DEMO_NOW_ENV = os.environ.get("DEMO_NOW")
+_pin: datetime | None = None
+_pin_resolved = False
+
+
+def _resolve_pin() -> datetime | None:
+    """Pin the replay clock: explicit DEMO_NOW wins, else the live-bus snapshot's
+    own capture time (so the bus positions and the clock agree)."""
+    global _pin, _pin_resolved
+    if _pin_resolved:
+        return _pin
+    _pin_resolved = True
+
+    if _DEMO_NOW_ENV:
+        try:
+            _pin = datetime.fromisoformat(_DEMO_NOW_ENV).astimezone(timezone.utc)
+            return _pin
+        except ValueError:
+            print(f"[config] WARN DEMO_NOW={_DEMO_NOW_ENV!r} is not ISO-8601; ignoring")
+
+    p = CACHE_DIR / "bt_buses.json"
+    if p.exists():
+        try:
+            _pin = datetime.fromisoformat(
+                json.loads(p.read_text(encoding="utf-8"))["fetched_at"]
+            ).astimezone(timezone.utc)
+        except Exception as exc:                            # noqa: BLE001
+            print(f"[config] WARN could not read snapshot time from {p.name}: {exc}")
+    return _pin
+
+
+def now(tz=None) -> datetime:
+    """The system clock for all library code.
+
+    live mode : the real wall clock (UTC).
+    cache mode: pinned to the replay snapshot (see above), so replayed schedule
+                deltas and staleness labels stay self-consistent.
+
+    Pass `tz` (e.g. ZoneInfo(CAMPUS_TZ)) to get the time in that zone.
+    """
+    t = _resolve_pin() if CACHE_ONLY else None
+    if t is None:
+        t = datetime.now(timezone.utc)
+    return t.astimezone(tz) if tz is not None else t
 
 # ---------------------------------------------------------------- endpoints
 ENDPOINTS = {

@@ -73,11 +73,22 @@ def next_departures(g: Gtfs, stop_id: str, at: datetime, horizon_min: int = 180,
 def walk_minutes(a: tuple[float, float], b: tuple[float, float]) -> float
 ```
 
+### TYPE PIN — added after an integration failure; do not re-loosen
+
+`arr` / `dep` are **`int` seconds after the service-day midnight** (hours may
+exceed 24, so `27:00:00` becomes `97200`). The original contract left their type
+unstated; both workers made a defensible choice; the mismatch **silently broke
+the 13/13 keystone join** — every vehicle came back unmatched, with no error.
+Consumers MUST tolerate both `int` seconds and `"HH:MM:SS"` strings.
+
 **Hard requirements**
 
 - **There is no `calendar.txt` in this feed.** Service MUST be resolved from
-  `calendar_dates.txt` only (`exception_type=1` added, `2` removed). Code that
-  expects `calendar.txt` will silently return zero trips.
+  `calendar_dates.txt` only (`exception_type=1` added, `2` removed).
+  **The failure mode is NOT "zero trips" — it is a plausible-looking wrong day's
+  trips.** Only 2 of the feed's 8 services are active on any given Saturday, so
+  unfiltered queries return weekday/Friday trips that look perfectly normal.
+  This exact bug was found in the integrator's own spike; do not reintroduce it.
 - GTFS times are `HH:MM:SS` and **may exceed 24:00:00** for after-midnight
   service (e.g. `25:10:00`). Parse as `hours*3600+...`, do not use `%H`.
 - `next_departures` must filter to trips whose service IS active on `at.date()`.
@@ -85,8 +96,12 @@ def walk_minutes(a: tuple[float, float], b: tuple[float, float]) -> float
   Handle the case where `cache/gtfs/` already exists (that is the normal path).
 - Verified expectations to assert in tests:
   - 297 stops, 24 routes, 3658 trips, 74301 stop_times, 181 calendar_dates rows
+  - **the feed contains only 8 services, and only 2 are active on 2026-09-19**
   - stop `1600` "Main/Roanoke Sbnd" is ~37 m from (37.22957, -80.41394)
-  - on 2026-09-19 with `at=11:22`, stop `1600` yields departures starting ~11:23:29 (route SME)
+  - on **2026-09-19** with `at=11:22`, the service-filtered departures from stop `1600` are
+    **`SME 11:48:29`, `HDG 11:50:21`, `SME 12:18:29`, `HDG 12:20:21`**
+    *(an earlier draft of this file said 11:23:29 — that number was an artifact of
+    not filtering by service date and is WRONG; see SDD §5.2 v1.1)*
 
 ---
 
@@ -185,11 +200,20 @@ def eat_options(location_num: str, d: date | str, diet: str | None = None,
   API's `locationNum` (verified for D2 = `15`). Keep this as a documented helper.
 - Verified expectations to assert:
   - D2 (`15`) on `09/19/2026` -> **470** recipes
-  - 174 vegetarian, 231 vegan, 240 with no Peanuts/Tree Nuts
+  - 174 vegetarian, 231 vegan
+  - **42** items list nut allergens, **188** have a BLANK allergen field, and
+    **428** do not contain nut allergens. (An earlier draft said 240 — that came
+    from a condition that excluded blank-allergen items. Do not assert 240.)
+  - **SAFETY:** blank allergen field is NOT "allergen-free". Treat blank as
+    UNKNOWN; never as safe.
   - `avoid=("Peanuts",)` returns **zero** items whose allergen string contains Peanuts
   - allergen list has 10 entries; diet categories have 4
   - hours fixture -> 2 windows, `09:30:01–15:00:00` and `15:00:01–20:00:00`
-  - nutrition fixture for `214022*1*1,141002*2*1` -> cals ~529.6
+  - nutrition fixture for `214022*1*1,141002*2*1` (biscuit + pancakes, **2 items**)
+    -> cals **479.616**
+    *(an earlier draft said 529.6 — that is the **3-item** query WITH bacon:
+    `081108*1*1,214022*1*1,141002*2*1`. Both are real; the pairing was wrong.)*
+  - nutrient values come back as **strings**, not floats — cast before comparing
 
 ---
 

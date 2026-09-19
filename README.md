@@ -20,7 +20,8 @@ hokieday/
     seed_cache.py      # build cache/ from real captured payloads
     poll_buses.py      # 60s poller -> appends the ML training dataset
     ingest_gtfs.py
-  cache/               # REAL payloads (fixtures). DEMO_MODE=cache reads these.
+  cache/               # LIVE cache. Refreshed whenever we hit the network.
+  fixtures/            # FROZEN replay snapshot. ONLY scripts/seed_cache.py writes it.
   data/                # bronze JSONL (the ML dataset we generate ourselves)
   tests/               # offline tests; must pass with DEMO_MODE=cache
   notebooks/           # thin Databricks wrappers around the core library
@@ -31,15 +32,39 @@ hokieday/
 
 The same code must run in three places: locally for tests, in a Databricks notebook, and inside a Databricks App. A `pyspark` import in the core would break the first. **Notebooks adapt to the library; the library never adapts to the notebook.**
 
+## Two stores, deliberately separated
+
+| dir | who writes | who reads |
+|---|---|---|
+| `cache/` | any live fetch | `DEMO_MODE=live` |
+| `fixtures/` | **only** `scripts/seed_cache.py` | `DEMO_MODE=cache` (tests + offline demo) |
+
+They must never be the same directory. A live poll once overwrote the very
+fixture the tests read, which silently changed expected values mid-session
+(observed: fixture `fetched_at` jumped 15:22 → 15:51).
+
+## The replay clock (`config.now()`)
+
+A schedule delta is `now − scheduled_departure`, so **a cached snapshot's deltas
+grow one minute per minute of real time.** Measured: a 6.7-minute gap inflated all
+13 live deltas to a +7.73 min mean; a fixture replayed the next morning reads as
+~20 hours late.
+
+So in `DEMO_MODE=cache`, `config.now()` is **pinned to the snapshot's capture
+time** instead of the wall clock. After pinning, the same 13 vehicles read
+mean **+0.96 min** — physically sensible. Override with `DEMO_NOW=<iso8601>`.
+
+**Rule:** library code calls `config.now()`, never `datetime.now()`.
+
 ## Offline demo (non-negotiable — NFR-1)
 
 ```bash
 export DEMO_MODE=cache
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v     # 55 tests, no network
 ```
 
-With `DEMO_MODE=cache` nothing touches the network. If a demo-day idea needs a
-network call, it is wrong.
+With `DEMO_MODE=cache` nothing touches the network and the clock is pinned. If a
+demo-day idea needs a network call, it is wrong.
 
 > No pytest, no pandas on this machine (Python 3.14.7) — tests use stdlib `unittest`, and the core library is stdlib-only.
 
@@ -47,9 +72,16 @@ network call, it is wrong.
 
 ```bash
 unset DEMO_MODE          # or DEMO_MODE=live
-python3 scripts/seed_cache.py     # only needed once
-python3 scripts/poll_buses.py     # start the 60s poller EARLY - it builds the ML dataset
+python3 scripts/tap_buses.py --once       # one sample
+python3 scripts/tap_buses.py              # 60s poller; leave it running all night
 ```
+
+The tap writes to `cache/` (live) and appends one JSON line **per vehicle per
+poll** to `data/bus_bronze.jsonl` — the ML training set. It never touches
+`fixtures/`.
+
+**Before any demo, re-run `DEMO_MODE=cache python3 scripts/seed_cache.py`** to
+restore a known-good frozen snapshot.
 
 ## Rules for contributors / subagents
 
@@ -61,3 +93,7 @@ python3 scripts/poll_buses.py     # start the 60s poller EARLY - it builds the M
 4. Poll the live bus endpoint no faster than `config.LIVE_BUS_POLL_SECONDS`.
 5. Never emit a number that the code did not compute. (Design root R2: a language
    model predicts text, it does not calculate.)
+6. **Never call `datetime.now()` in library code — call `config.now()`.** Otherwise
+   you reintroduce the replay-clock drift (see above).
+7. **Never treat a blank allergen field as allergen-free.** 188 of 470 D2 items
+   state no allergens; blank means UNKNOWN (SDD risk R8).
