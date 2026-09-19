@@ -6,14 +6,16 @@ imports urllib; it parses the HTML snapshot this script writes, which keeps the
 whole library offline-testable and the demo reproducible (DEMO_MODE=cache).
 
 PUBLIC DATA ONLY. This script:
-  * POSTs the public timetable form (HZSKVTSC) and GETs the public building and
-    final-exam pages;
+  * POSTs the public timetable form (HZSKVTSC) and GETs the public building
+    page;
   * sends no credentials, no cookies, and never touches HokieSPA / My VT;
   * never requests or stores grades, GPA, rosters, or student PIDs;
   * is rate-limited (default 2 s between requests) and uses a descriptive
     User-Agent so an administrator can identify the client;
   * does NOT crawl by default. Full-term subject-by-subject collection is
     available (``--all-subjects --yes-crawl``) for a deliberate, slow run.
+
+Final-exam data is NOT supported (no parser, no capture).
 
 Usage
 -----
@@ -23,9 +25,8 @@ Usage
     # a pasted CRN
     python3 scripts/fetch_classes.py --term 202609 --crn 81476 --name my_crn
 
-    # public reference pages
+    # the public building-abbreviation page
     python3 scripts/fetch_classes.py --buildings
-    python3 scripts/fetch_classes.py --exams --term 202609
 
     # list the subjects the form offers (no network beyond the form page)
     python3 scripts/fetch_classes.py --list-subjects
@@ -36,6 +37,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import sys
 import time
@@ -111,10 +113,6 @@ def fetch_timetable(*, term: str, subject: str = "", course_number: str = "",
 
 def fetch_buildings() -> str:
     return _request(classes.BANNER_BUILDINGS_URL)
-
-
-def fetch_exams() -> str:
-    return _request(classes.BANNER_EXAMS_URL)
 
 
 # ---------------------------------------------------------------------------
@@ -268,8 +266,6 @@ def main(argv: list[str] | None = None) -> int:
                     help="seconds between crawl requests (default 2)")
     ap.add_argument("--buildings", action="store_true",
                     help="fetch the public building-abbreviation page")
-    ap.add_argument("--exams", action="store_true",
-                    help="fetch the public final-exam schedule page")
     ap.add_argument("--list-subjects", action="store_true",
                     help="print the form's subject codes and exit")
     ap.add_argument("--all-subjects", action="store_true",
@@ -280,8 +276,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="cap the crawl (safety valve); 0 = all")
     args = ap.parse_args(argv)
 
-    if args.delay < 1.0:
-        print("--delay must be >= 1 second (be a polite client)", file=sys.stderr)
+    if not math.isfinite(args.delay) or args.delay < 1.0:
+        print("--delay must be a finite number >= 1 second (be a polite client)",
+              file=sys.stderr)
         return 2
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -291,13 +288,6 @@ def main(argv: list[str] | None = None) -> int:
         html = fetch_buildings()
         path = write_html_fixture(args.out, "classes_buildings.html", html)
         print(f"buildings -> {path} ({len(html):,} bytes)")
-        did_something = True
-
-    if args.exams:
-        html = fetch_exams()
-        path = args.out / f"classes_exams_{args.term}.html"
-        path.write_text(html, encoding="utf-8")
-        print(f"exams -> {path} ({len(html):,} bytes)")
         did_something = True
 
     if args.list_subjects or args.all_subjects or (

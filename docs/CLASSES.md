@@ -17,7 +17,6 @@ module only — no UI, no LLM.
 | Timetable form | `https://selfservice.banner.vt.edu/ssb/HZSKVTSC.P_DispRequest` | GET | form + subject list |
 | Timetable search | `https://selfservice.banner.vt.edu/ssb/HZSKVTSC.P_ProcRequest` | **POST** | HTML results table |
 | Building abbreviations | `https://selfservice.banner.vt.edu/ssb/hzskvtsc.P_DispBldgList` | GET | code → description |
-| Final-exam schedule | `https://selfservice.banner.vt.edu/ssb/hzskexam.P_DispExamInfo` | GET | **raw capture only** — the unreliable parser was removed (see §8) |
 
 **Never accessed:** HokieSPA, My VT, any authenticated page, any login. No
 credentials, cookies, grades, GPA, rosters, or PIDs are requested or stored.
@@ -139,10 +138,12 @@ reused across terms, so every selection/resolution path carries the term.
   Fall Break, Thanksgiving break.
 
 **Conflicts**
-- `find_conflicts(occurrences, *, include_same_crn=False)` — half-open
-  intervals; `end == start` is not a conflict; meetings of the same CRN are
-  never a conflict by default.
-- `schedule_conflicts(sections, *, start, end, tz)`.
+- `find_conflicts(occurrences, *, include_same_crn=False, max_conflicts=MAX_CONFLICTS)`
+  — half-open intervals; `end == start` is not a conflict. Same-class exclusion
+  uses the SOURCE-AWARE composite identity (`ClassOccurrence.identity`: Banner
+  `("banner", term, crn)` vs ICS `("ics", uid, "")`), never bare CRN equality.
+  Raises `BoundsExceeded` past `max_conflicts`.
+- `schedule_conflicts(sections, *, start, end, tz, ics_events, allow_term_assumption=False)`.
 
 **Next class / deadline**
 - `next_class(sections, at, *, start, end, buffer_min=10, skip_online, tz,
@@ -162,15 +163,35 @@ reused across terms, so every selection/resolution path carries the term.
   "buffer_min": 10.0, "minutes_until": 85.0,
   "crn": "81478", "course": "AS-1115",
   "building": "CLMS", "room": "270",
-  "location_raw": "CLMS 270", "is_online": false
+  "location_raw": "CLMS 270", "is_online": false,
+  "source": "banner", "term_assumed": true,
+  "provenance": "banner_weekly_assumed",
+  "allow_term_assumption": true
 }
 ```
 
 `deadline` is `class_start − buffer_min`. `status` is `scheduled` | `online` |
-`unavailable` | `none`. `buffer_min` must be finite, non-negative and ≤
-`MAX_BUFFER_MIN` (240) or `ValueError` is raised. An unknown/unverified term
-yields `status="unavailable"` with `unverified_terms` — no fallback window.
-TBA meetings are surfaced via `ClassSection.flags().has_tba`.
+`recurrence_unavailable` | `unavailable` | `bounds_exceeded` | `none`.
+`buffer_min` must be finite, non-negative and ≤ `MAX_BUFFER_MIN` (240) or
+`ValueError` is raised.
+
+**Term-assumption provenance (partial-term safety).** Banner exposes only a
+weekly meeting pattern, so its recurrence is a WHOLE-TERM INFERENCE flagged
+`term_assumed=True` / `provenance="banner_weekly_assumed"`. It must NOT drive a
+deadline or a conflict by default: `next_class`/`next_class_json`,
+`schedule_conflicts`, `schedule_occurrences` and `schedule_json` take
+`allow_term_assumption=False` by default. Without it, a Banner-only request
+returns `status="recurrence_unavailable"` (or `state="recurrence_unavailable"`)
+with `term_assumption_required=true`; pass `allow_term_assumption=True` to opt
+in. ICS dated occurrences are always usable. An unknown/unverified term yields
+`status="unavailable"` with `unverified_terms` — no fallback window ever.
+
+**Global bounds.** `combined_occurrences`/`find_conflicts` refuse to build an
+unbounded result: `MAX_TOTAL_OCCURRENCES` (5 000) and `MAX_CONFLICTS` (1 000)
+raise the typed `BoundsExceeded(kind, limit, actual)`. `next_class_json` returns
+`status="bounds_exceeded"` + `bounds`; `schedule_json` returns
+`state="bounds_exceeded"` + `bounds` + `reason`. TBA meetings are surfaced via
+`ClassSection.flags().has_tba`.
 
 **Schedule (no DB; JSON/Lakebase-ready records)**
 - `add_to_schedule(schedule, sections=None, crns=None, *, term, snapshot_id,
@@ -180,8 +201,8 @@ TBA meetings are surfaced via `ClassSection.flags().has_tba`.
 - `remove_from_schedule(schedule, crns=None, *, term=None, uids=None)` →
   `removed` / `not_in_schedule` / **`ambiguous`** / `invalid`. A CRN that
   appears under more than one term is NOT removed unless `term` is supplied; it
-  is reported as ambiguous instead. Removal must never delete the same CRN in
-  another term.
+  is reported as `ambiguous` (and is NOT also reported as `not_in_schedule`).
+  Removal must never delete the same CRN in another term.
 - `resolve_schedule(schedule, sections)` — rejoin Banner records by (term, crn).
 - `resolve_ics_schedule(schedule)` — rebuild ICS events (re-validated through
   `parse_ics`).
@@ -201,20 +222,27 @@ A stored schedule record is deliberately minimal:
 **ICS import (bounded VEVENT subset)**
 - `parse_ics(text, *, tz) -> IcsParse(events, warnings, errors, valid)`.
   Supported: `VCALENDAR`/`VEVENT`, line unfolding, `DTSTART`/`DTEND`
-  (`VALUE=DATE`, UTC `Z`, `TZID`, or floating→campus-time **warning**),
-  `SUMMARY`, `LOCATION`, `UID`, and `FREQ=WEEKLY` with `BYDAY`/`INTERVAL`/
-  `COUNT`/`UNTIL`. TEXT escapes (`\n`, `\,`, `\;`, `\\`) are decoded.
-  Anything else (`FREQ=MONTHLY`, `WKST`, `RDATE`, `EXDATE`, ordinal `BYDAY`,
-  non-positive `INTERVAL`/`COUNT`, invalid `UNTIL`, unknown `TZID`, missing
-  `UID`, malformed `DTSTART`, truncated `VEVENT`) is **flagged and skipped**,
-  never guessed.
+  (`VALUE=DATE` requiring EXACTLY `YYYYMMDD`, UTC `Z`, `TZID`, or
+  floating→campus-time **warning**), `SUMMARY`, `LOCATION`, `UID`, and
+  `FREQ=WEEKLY` with `BYDAY`/`INTERVAL`/`COUNT`/`UNTIL`. TEXT escapes (`\n`,
+  `\,`, `\;`, `\\`) are decoded, and re-encoding on storage round-trips
+  (including commas, semicolons, backslashes and newlines). Nested components
+  (e.g. `VALARM`) are TRACKED: their inner properties are ignored and can never
+  overwrite a VEVENT property; an unterminated sub-component discards the
+  event. Anything else (`FREQ=MONTHLY`, `WKST`, `RDATE`, `EXDATE`, ordinal
+  `BYDAY`, non-positive `INTERVAL`/`COUNT`, invalid `UNTIL`, unknown `TZID`,
+  missing `UID`, malformed `DTSTART`, truncated `VEVENT`) is **flagged and
+  skipped**, never guessed.
 - **Safety bounds** (exceeding is an explicit error): `MAX_ICS_BYTES` (512 KiB),
   `MAX_ICS_LINES` (20 000), `MAX_ICS_EVENTS` (500), `MAX_ICS_OCCURRENCES`
   (2 000), `MAX_ICS_WINDOW_DAYS` (730).
 - `expand_ics_event(event, *, start, end, tz)` — a non-recurring event yields a
   single occurrence; a weekly RRULE expands only within `COUNT`/`UNTIL`/window.
-  It never raises (a malformed event returns `[]`).
+  `UNTIL` is compared as an AWARE INSTANT (not a date), inclusive. It never
+  raises (a malformed event returns `[]`).
 - `expand_ics_events(events, ...)` — many events to one sorted list.
+- ICS occurrences carry `source="ics"`, `term_assumed=False`,
+  `provenance="ics_dated"`.
 - **No `to_section`.** An ICS event is NOT converted into a Banner section, so
   it can never be expanded as a full-term weekly class. Conflicts/next-class
   consume expanded ICS occurrences directly (`combined_occurrences`,
@@ -274,6 +302,8 @@ them. `section_state(section)` returns the per-section ones.
 | `conflict` | two selected occurrences overlap | `schedule_json.state == "conflict"` + `conflicts[]` |
 | `stale_snapshot` | snapshot older than window | `snapshot.is_stale` and/or top-level `state` |
 | `malformed_ics` | ICS warnings/errors | `IcsParse.valid == false`, `warnings`/`errors` |
+| `recurrence_unavailable` | Banner-only recurrence, no opt-in | `next_class_json.status == "recurrence_unavailable"` / `schedule_json.state` |
+| `bounds_exceeded` | occurrence/conflict caps hit | `BoundsExceeded`; `status`/`state == "bounds_exceeded"` + `bounds` |
 
 ---
 
@@ -283,7 +313,6 @@ them. `section_state(section)` returns the per-section ones.
 python3 scripts/fetch_classes.py --term 202609 --subject AS
 python3 scripts/fetch_classes.py --term 202609 --crn 81476 --name my_crn
 python3 scripts/fetch_classes.py --buildings
-python3 scripts/fetch_classes.py --exams --term 202609
 python3 scripts/fetch_classes.py --list-subjects
 # full-term, one snapshot per subject (slow; explicit opt-in):
 python3 scripts/fetch_classes.py --all-subjects --yes-crawl --delay 3
@@ -292,9 +321,9 @@ python3 scripts/fetch_classes.py --all-subjects --yes-crawl --delay 3
 The library never imports `urllib` (enforced by a test); the POST lives only
 here and writes an HTML snapshot envelope the library can parse offline and
 `DEMO_MODE=cache` can replay. `--max-subjects N` is a safety valve, `--delay`
-must be ≥ 1 s, subject codes are read only from the requested term's case block
-and de-duplicated, and the crawl exits non-zero if it writes nothing.
-`--exams` captures the raw exam page only (no parser).
+must be finite and ≥ 1 s, subject codes are read only from the requested
+term's case block and de-duplicated, and the crawl exits non-zero if it writes
+nothing. Final-exam pages are NOT fetched or parsed (there is no `--exams`).
 
 ---
 
@@ -304,11 +333,13 @@ and de-duplicated, and the crawl exits non-zero if it writes nothing.
    `LocalSource` method (e.g. `scheduled_classes`) that loads the newest class
    snapshot and caches parsed sections on the instance, then have `plan_day`
    replace the sentence-parsed "1:25" deadline with
-   `classes.next_class_json(sections, at, ics_events=...) ["deadline"]`. Keep
-   the existing text parser as a fallback when no snapshot exists — a missing
-   snapshot returns `status="none"` and an unknown term returns
-   `status="unavailable"`, so the demo never invents a window and never depends
-   on a live Banner call.
+   `classes.next_class_json(sections, at, ics_events=..., allow_term_assumption=...)`.
+   Decide the Banner opt-in explicitly: default is `recurrence_unavailable` for
+   Banner-only input (whole-term inference), so either pass
+   `allow_term_assumption=True` in the planner or surface the typed state and
+   fall back to the text parser. Missing snapshot → `status="none"`; unknown
+   term → `status="unavailable"`; over-cap → `status="bounds_exceeded"`; so the
+   demo never invents a window and never depends on a live Banner call.
 2. **Add a `hokieday/classes.json` snapshot selection.** Prefer
    `config.DATA_DIR / "classes"` (live cache) then any
    `config.FIXTURES_DIR / "classes_snapshot_*.json"` (or generate one from the
@@ -345,21 +376,27 @@ and de-duplicated, and the crawl exits non-zero if it writes nothing.
   academic-calendar source) before expanding a new term. An unknown/unverified
   term expands to NO occurrences (`term_expandability`), never a fallback
   window. A meeting pattern is expanded for the WHOLE term window: Banner does
-  not expose part-of-term session dates in the results table, so first/second
-  half-term courses are expanded over the full term (documented limitation).
+  not expose part-of-term session dates in the results table, so Banner
+  occurrences are flagged `term_assumed=True` and are excluded from
+  conflicts/deadlines unless `allow_term_assumption=True` is passed explicitly
+  (documented limitation; ICS dated occurrences are unaffected).
 - **No open/closed filtering in code.** The results page shows `Capacity`, not
   seats remaining, so the module does not claim a section is open.
   `--open-only` passes the filter to Banner; the code never re-labels it.
 - **No coordinates in the crosswalk.** The VT GIS join is deferred; classroom
   walk times are not available from this data alone.
-- **Final exams are not parsed.** The public page's year-less date matrix could
-  not be parsed reliably, so the parser was REMOVED rather than shipped with
-  wrong dates. `--exams` captures the raw HTML for a future verified parser;
-  nothing exam-related is exported today.
+- **Final exams are not supported.** The public page's year-less date matrix
+  could not be parsed without risking wrong dates, so there is no parser and no
+  raw-capture option; exam data is out of scope. (A section's `exam_code` from
+  the timetable row is still stored as an opaque identifier.)
 - **ICS subset.** Monthly recurrence, exception dates (`EXDATE`/`RDATE`),
-  `WKST`, ordinal `BYDAY`, and alarms are out of scope and are rejected/flagged.
-  Input size and recurrence are bounded (`MAX_ICS_*`), and an ICS event is never
-  turned into a weekly Banner section.
+  `WKST`, and ordinal `BYDAY` are out of scope and are rejected/flagged. Nested
+  components (e.g. `VALARM`) are tracked and ignored, never allowed to overwrite
+  a VEVENT property; `VALUE=DATE` requires exactly 8 digits; `UNTIL` is
+  compared as an aware instant. Input size, per-event recurrence and GLOBAL
+  combined occurrence/conflict counts are bounded (`MAX_ICS_*`,
+  `MAX_TOTAL_OCCURRENCES`, `MAX_CONFLICTS`); an ICS event is never turned into a
+  weekly Banner section.
 - **No persistence.** Schedule records are plain dicts for a later
   Lakebase/JSON store; nothing is written to a DB by this module.
 - **All-term crawl not done.** Deliberately; the fetcher is capable
@@ -380,14 +417,19 @@ DEMO_MODE=cache python3 -m unittest tests.test_classes -v
 ```
 
 Covers fixture parsing (sections, comments, colspan/TBA/online rows), multi-
-meeting merge, `search`/`select_crns`, add/remove/resolve schedule (including
-term-scoped removal and ICS UID identity), recurrence + holiday skipping + term
-clamping and unknown-term unavailability, conflict detection (Banner×Banner and
-Banner×ICS), next-class deadline + buffer bounds, timezone (TZID/UTC/floating)
-and unknown-TZID rejection, ICS happy + malformed + unsupported/bounded RRULE,
-ICS schedule semantics (no Banner `to_section`, dated recurrence, UID add/
-remove), building crosswalk (no coordinates + GIS join validation), snapshot
-deterministic generation/content hash/missing-fetched_at rejection/query
-sanitization, the edge script's required form fields, per-term subject parsing,
-delay floor and nonzero-on-nothing-written, and privacy exclusions (no network
-imports in the library, no PII keys in payloads).
+meeting merge, `search`/`select_crns` (including cross-term ambiguity), add/
+remove/resolve schedule (term-scoped removal, ICS UID identity, ambiguous not
+reported as missing), recurrence + holiday skipping + term clamping and
+unknown-term unavailability, Banner term-assumption provenance and the typed
+`recurrence_unavailable` default, conflict detection (Banner×Banner and
+Banner×ICS, source-aware identity), next-class deadline + buffer bounds,
+timezone (TZID/UTC/floating) and unknown-TZID rejection, ICS happy + malformed
++ unsupported/bounded RRULE + TEXT-escape round-trip + VALARM injection +
+VALUE=DATE exactness + UNTIL instant, global occurrence/conflict bounds
+(500 overlapping events refused), ICS schedule semantics (no Banner
+`to_section`, dated recurrence, UID add/remove), building crosswalk (no
+coordinates + GIS join validation), snapshot deterministic generation/content
+hash/missing-fetched_at rejection/query sanitization, the edge script's required
+form fields, per-term subject parsing, finite delay floor, exams removed, and
+nonzero-on-nothing-written, and privacy exclusions (no network imports in the
+library, no PII keys in payloads).

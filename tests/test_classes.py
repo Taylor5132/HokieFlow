@@ -438,7 +438,8 @@ class TestConflicts(unittest.TestCase):
         a = _section("10001", days=("M",), begin="10:00", end="11:00", building="A")
         b = _section("10002", days=("M",), begin="10:30", end="11:30", building="B")
         conflicts = classes.schedule_conflicts(
-            [a, b], start=date(2026, 9, 14), end=date(2026, 9, 14))
+            [a, b], start=date(2026, 9, 14), end=date(2026, 9, 14),
+            allow_term_assumption=True)
         self.assertEqual(len(conflicts), 1)
         self.assertAlmostEqual(conflicts[0].overlap_min, 30.0)
         self.assertEqual(
@@ -449,7 +450,8 @@ class TestConflicts(unittest.TestCase):
         b = _section("10002", days=("M",), begin="11:00", end="12:00")
         self.assertEqual(
             classes.schedule_conflicts([a, b], start=date(2026, 9, 14),
-                                       end=date(2026, 9, 14)), [])
+                                       end=date(2026, 9, 14),
+                                       allow_term_assumption=True), [])
 
     def test_same_crn_meetings_not_conflicts_by_default(self):
         m1 = classes.Meeting(days=("M",), begin="10:00", end="11:00",
@@ -459,8 +461,9 @@ class TestConflicts(unittest.TestCase):
         s = classes.ClassSection(term="202609", crn="10001", subject="CS",
                                  course_number="2114", title="x",
                                  meetings=(m1, m2))
-        self.assertEqual(classes.schedule_conflicts([s], start=date(2026, 9, 14),
-                                                    end=date(2026, 9, 14)), [])
+        self.assertEqual(classes.schedule_conflicts(
+            [s], start=date(2026, 9, 14), end=date(2026, 9, 14),
+            allow_term_assumption=True), [])
 
 
 class TestNextClass(unittest.TestCase):
@@ -475,7 +478,7 @@ class TestNextClass(unittest.TestCase):
         nc = classes.next_class(
             self.sections, datetime(2026, 9, 21, 12, 0, tzinfo=TZ),
             start=date(2026, 9, 21), end=date(2026, 12, 9), tz=TZ,
-            buffer_min=10)
+            buffer_min=10, allow_term_assumption=True)
         self.assertIsNotNone(nc)
         self.assertEqual(nc.occurrence.crn, "81478")
         self.assertEqual(nc.leave_by.strftime("%H:%M"), "13:15")
@@ -486,23 +489,43 @@ class TestNextClass(unittest.TestCase):
     def test_json_contract(self):
         out = classes.next_class_json(
             self.sections, datetime(2026, 9, 21, 12, 0, tzinfo=TZ),
-            start=date(2026, 9, 21), end=date(2026, 12, 9), tz=TZ)
+            start=date(2026, 9, 21), end=date(2026, 12, 9), tz=TZ,
+            allow_term_assumption=True)
         self.assertEqual(out["schema"], classes.SCHEMA_NEXT_CLASS)
         self.assertEqual(out["status"], "scheduled")
         self.assertEqual(out["building"], "CLMS")
+        self.assertTrue(out["term_assumed"])
         self.assertIn("deadline", out)
 
     def test_no_class_after_term(self):
         out = classes.next_class_json(
             self.sections, datetime(2027, 1, 1, 9, 0, tzinfo=TZ),
-            start=date(2026, 9, 1), end=date(2026, 12, 9), tz=TZ)
+            start=date(2026, 9, 1), end=date(2026, 12, 9), tz=TZ,
+            allow_term_assumption=True)
         self.assertEqual(out["status"], "none")
         self.assertIsNone(out["deadline"])
+
+    def test_default_requires_term_assumption_for_banner(self):
+        # Banner recurrence is a whole-term inference; by default it does NOT
+        # drive a deadline and the payload is a typed recurrence_unavailable.
+        out = classes.next_class_json(
+            self.sections, datetime(2026, 9, 21, 12, 0, tzinfo=TZ),
+            start=date(2026, 9, 21), end=date(2026, 12, 9), tz=TZ)
+        self.assertEqual(out["status"], "recurrence_unavailable")
+        self.assertIsNone(out["deadline"])
+        self.assertTrue(out["term_assumption_required"])
+        self.assertFalse(out["allow_term_assumption"])
+        self.assertIn("allow_term_assumption", out["reason"])
+        # next_class itself returns None (does not silently use the inference).
+        self.assertIsNone(classes.next_class(
+            self.sections, datetime(2026, 9, 21, 12, 0, tzinfo=TZ),
+            start=date(2026, 9, 21), end=date(2026, 12, 9), tz=TZ))
 
     def test_unverified_term_is_typed_unavailable_not_invented(self):
         unknown = _section("77777", term="209999")
         out = classes.next_class_json(
-            [unknown], datetime(2026, 9, 21, 12, 0, tzinfo=TZ))
+            [unknown], datetime(2026, 9, 21, 12, 0, tzinfo=TZ),
+            allow_term_assumption=True)
         self.assertEqual(out["status"], "unavailable")
         self.assertIsNone(out["deadline"])
         self.assertTrue(out["unverified_terms"])
@@ -515,12 +538,14 @@ class TestNextClass(unittest.TestCase):
                             building="MCB", room="100")
         at = datetime(2026, 9, 14, 8, 0, tzinfo=TZ)
         picked = classes.next_class([online, physical], at, start=date(2026, 9, 14),
-                                    end=date(2026, 9, 14), tz=TZ)
+                                    end=date(2026, 9, 14), tz=TZ,
+                                    allow_term_assumption=True)
         self.assertEqual(picked.occurrence.crn, "90001")
         skipped = classes.next_class([online, physical], at,
                                      start=date(2026, 9, 14),
                                      end=date(2026, 9, 14), tz=TZ,
-                                     skip_online=True)
+                                     skip_online=True,
+                                     allow_term_assumption=True)
         self.assertEqual(skipped.occurrence.crn, "90002")
 
     def test_buffer_bounds_rejected(self):
@@ -782,7 +807,7 @@ class TestIcsScheduleSemantics(unittest.TestCase):
         banner = _section("10001", days=("W",), begin="10:30", end="11:30")
         conflicts = classes.schedule_conflicts(
             [banner], start=date(2026, 8, 24), end=date(2026, 8, 31),
-            ics_events=[self.recurring])
+            ics_events=[self.recurring], allow_term_assumption=True)
         self.assertTrue(conflicts)
 
     def test_next_class_consumes_ics_occurrence(self):
@@ -943,11 +968,21 @@ class TestSnapshot(unittest.TestCase):
         b = _section("10002", days=("M",), begin="10:30", end="11:30")
         sched = classes.add_to_schedule([], [a, b], "10001, 10002")["schedule"]
         out = classes.schedule_json(sched, [a, b], start=date(2026, 9, 14),
-                                    end=date(2026, 9, 14))
+                                    end=date(2026, 9, 14),
+                                    allow_term_assumption=True)
         self.assertEqual(out["state"], "conflict")
         self.assertEqual(len(out["conflicts"]), 1)
         self.assertEqual(out["count"], 2)
         self.assertEqual(out["unresolved"], [])
+
+    def test_schedule_json_default_recurrence_unavailable(self):
+        a = _section("10001", days=("M",), begin="10:00", end="11:00")
+        sched = classes.add_to_schedule([], [a], "10001")["schedule"]
+        out = classes.schedule_json(sched, [a], start=date(2026, 9, 14),
+                                    end=date(2026, 9, 14))
+        self.assertEqual(out["state"], "recurrence_unavailable")
+        self.assertTrue(out["term_assumption_required"])
+        self.assertEqual(out["conflicts"], [])
 
 
 # ===========================================================================
@@ -989,6 +1024,16 @@ class TestEdgeScript(unittest.TestCase):
     def test_delay_must_be_at_least_one_second(self):
         rc = self.mod.main(["--delay", "0.25"])
         self.assertEqual(rc, 2)
+
+    def test_delay_rejects_nan_and_inf(self):
+        for bad in ("nan", "inf", "-inf"):
+            self.assertEqual(self.mod.main([f"--delay={bad}"]), 2, bad)
+
+    def test_exams_feature_removed(self):
+        self.assertFalse(hasattr(self.mod, "fetch_exams"))
+        with self.assertRaises(SystemExit):
+            self.mod.main(["--exams"])
+        self.assertFalse(hasattr(classes, "BANNER_EXAMS_URL"))
 
     def test_nothing_written_is_nonzero(self):
         args = argparse.Namespace(
@@ -1047,6 +1092,162 @@ class TestPrivacyAndBoundary(unittest.TestCase):
         self.assertEqual(len(rebuilt), 1)
         self.assertEqual(rebuilt[0].days, recurring.days)
         self.assertEqual(rebuilt[0].rrule.get("FREQ"), "WEEKLY")
+
+
+class TestReviewRound2(unittest.TestCase):
+    """Adversarial regressions for the second re-review (P1/P2)."""
+
+    def test_text_escape_roundtrip(self):
+        s = "a,b;c\nd\\e"
+        self.assertEqual(classes._decode_ics_text(classes._escape_ics_text(s)), s)
+
+    def test_ics_valarm_cannot_overwrite_vevent(self):
+        ics = ("BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:u1\nSUMMARY:Real\n"
+               "DTSTART;TZID=America/New_York:20260824T100000\n"
+               "DTEND;TZID=America/New_York:20260824T110000\n"
+               "BEGIN:VALARM\nACTION:DISPLAY\nTRIGGER:-PT15M\n"
+               "SUMMARY:Injected\n"
+               "DTSTART;TZID=America/New_York:20990101T000000\n"
+               "END:VALARM\nEND:VEVENT\nEND:VCALENDAR\n")
+        ev = classes.parse_ics(ics).events[0]
+        self.assertEqual(ev.summary, "Real")
+        self.assertEqual(ev.dtstart.year, 2026)
+
+    def test_unterminated_subcomponent_discards_event(self):
+        ics = ("BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:u1\nSUMMARY:x\n"
+               "DTSTART;TZID=America/New_York:20260824T100000\n"
+               "BEGIN:VALARM\nACTION:DISPLAY\n"
+               "END:VEVENT\nEND:VCALENDAR\n")
+        p = classes.parse_ics(ics)
+        self.assertFalse(p.valid)
+        self.assertEqual(p.events, ())
+
+    def test_ics_record_roundtrip_preserves_text_escapes(self):
+        ics = ("BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:plainuid\n"
+               "SUMMARY:A\\,B\\;C\\nD\n"
+               "LOCATION:Hahn Hall\\, Rm 101\n"
+               "DTSTART;TZID=America/New_York:20260824T100000\n"
+               "DTEND;TZID=America/New_York:20260824T110000\n"
+               "END:VEVENT\nEND:VCALENDAR\n")
+        ev = classes.parse_ics(ics).events[0]
+        self.assertEqual(ev.summary, "A,B;C\nD")
+        out = classes.add_to_schedule([], ics_events=[ev])
+        rebuilt = classes.resolve_ics_schedule(out["schedule"])
+        self.assertEqual(len(rebuilt), 1)
+        self.assertEqual(rebuilt[0].summary, ev.summary)
+        self.assertEqual(rebuilt[0].location, "Hahn Hall, Rm 101")
+        self.assertEqual(rebuilt[0].uid, "plainuid")
+
+    def test_until_compares_instant_not_date(self):
+        # DTSTART 2026-09-14 10:00 America/New_York == 14:00Z.
+        def one(until):
+            text = ("BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:u\nSUMMARY:u\n"
+                    "DTSTART;TZID=America/New_York:20260914T100000\n"
+                    "DTEND;TZID=America/New_York:20260914T110000\n"
+                    f"RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL={until}\n"
+                    "END:VEVENT\nEND:VCALENDAR\n")
+            ev = classes.parse_ics(text).events[0]
+            return classes.expand_ics_event(ev, start=date(2026, 9, 14),
+                                            end=date(2026, 9, 14), tz=TZ)
+        self.assertEqual(len(one("20260914T140000Z")), 1, "UNTIL is inclusive")
+        self.assertEqual(len(one("20260914T135959Z")), 0,
+                         "an earlier same-day instant must exclude the class")
+
+    def test_five_hundred_overlapping_events_are_refused(self):
+        sections = [_section(f"{10000 + i}", days=("M",), begin="10:00",
+                             end="11:00") for i in range(500)]
+        occ = classes.combined_occurrences(
+            sections, [], start=date(2026, 9, 14), end=date(2026, 9, 14),
+            allow_term_assumption=True)
+        self.assertEqual(len(occ), 500)
+        with self.assertRaises(classes.BoundsExceeded) as ctx:
+            classes.find_conflicts(occ)
+        self.assertEqual(ctx.exception.kind, "conflicts")
+        with self.assertRaises(classes.BoundsExceeded):
+            classes.schedule_conflicts(sections, start=date(2026, 9, 14),
+                                       end=date(2026, 9, 14),
+                                       allow_term_assumption=True)
+        with self.assertRaises(classes.BoundsExceeded):
+            classes.combined_occurrences(
+                sections, [], start=date(2026, 9, 14), end=date(2026, 9, 14),
+                allow_term_assumption=True, max_occurrences=100)
+
+    def test_next_class_json_surfaces_occurrence_bounds(self):
+        sections = [_section(f"{30000 + i}", days=("M",), begin="10:00",
+                             end="11:00")
+                    for i in range(classes.MAX_TOTAL_OCCURRENCES + 1)]
+        out = classes.next_class_json(
+            sections, datetime(2026, 9, 14, 8, 0, tzinfo=TZ),
+            start=date(2026, 9, 14), end=date(2026, 9, 14),
+            allow_term_assumption=True)
+        self.assertEqual(out["status"], "bounds_exceeded")
+        self.assertEqual(out["bounds"]["kind"], "occurrences")
+
+    def test_schedule_json_surfaces_bounds_exceeded(self):
+        sections = [_section(f"{20000 + i}", days=("M",), begin="10:00",
+                             end="11:00") for i in range(500)]
+        crns = ",".join(s.crn for s in sections)
+        sched = classes.add_to_schedule([], sections, crns, term="202609")["schedule"]
+        out = classes.schedule_json(sched, sections, start=date(2026, 9, 14),
+                                    end=date(2026, 9, 14),
+                                    allow_term_assumption=True)
+        self.assertEqual(out["state"], "bounds_exceeded")
+        self.assertEqual(out["bounds"]["kind"], "conflicts")
+        self.assertIn("cap", out["reason"])
+
+    def test_conflict_identity_is_source_aware(self):
+        # An ICS UID equal to a Banner CRN string must NOT self-exclude.
+        banner = _section("12345", days=("M",), begin="10:00", end="11:00")
+        ev = classes.parse_ics(
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:12345\nSUMMARY:ICS\n"
+            "DTSTART;TZID=America/New_York:20260914T103000\n"
+            "DTEND;TZID=America/New_York:20260914T113000\n"
+            "END:VEVENT\nEND:VCALENDAR\n").events[0]
+        conflicts = classes.schedule_conflicts(
+            [banner], start=date(2026, 9, 14), end=date(2026, 9, 14),
+            ics_events=[ev], allow_term_assumption=True)
+        self.assertEqual(len(conflicts), 1)
+
+    def test_occurrence_provenance_flags(self):
+        sec = _section("10001")
+        occ = classes.expand_section(sec, start=date(2026, 9, 14),
+                                     end=date(2026, 9, 14), tz=TZ)[0]
+        self.assertTrue(occ.term_assumed)
+        self.assertEqual(occ.source, "banner")
+        self.assertEqual(occ.provenance, "banner_weekly_assumed")
+        self.assertEqual(occ.identity, ("banner", "202609", "10001"))
+        ev = classes.parse_ics(ICS_SAMPLE.read_text(encoding="utf-8")).events[0]
+        iocc = classes.expand_ics_event(ev, start=date(2026, 8, 24),
+                                        end=date(2026, 8, 24), tz=TZ)[0]
+        self.assertFalse(iocc.term_assumed)
+        self.assertEqual(iocc.source, "ics")
+        self.assertEqual(iocc.provenance, "ics_dated")
+        self.assertEqual(iocc.identity, ("ics", ev.uid, ""))
+
+    def test_ambiguous_removal_not_reported_as_missing(self):
+        sections = [_section("81476", term="202609"),
+                    _section("81476", term="202612")]
+        sched = classes.add_to_schedule([], sections, "81476", term="202609")["schedule"]
+        sched = classes.add_to_schedule(sched, sections, "81476", term="202612")["schedule"]
+        out = classes.remove_from_schedule(sched, "81476")
+        self.assertEqual(out["ambiguous"], ["81476"])
+        self.assertEqual(out["not_in_schedule"], [])
+        self.assertEqual(len(out["schedule"]), 2)
+
+    def test_value_date_requires_exactly_eight_digits(self):
+        for bad in ("2026082", "20260824T100000"):
+            p = classes.parse_ics(
+                "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:u\n"
+                f"DTSTART;VALUE=DATE:{bad}\n"
+                "END:VEVENT\nEND:VCALENDAR\n")
+            self.assertFalse(p.valid, bad)
+            self.assertEqual(p.events, (), bad)
+        ok = classes.parse_ics(
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:u\nSUMMARY:u\n"
+            "DTSTART;VALUE=DATE:20260824\nDTEND;VALUE=DATE:20260825\n"
+            "END:VEVENT\nEND:VCALENDAR\n")
+        self.assertTrue(ok.valid, ok.errors)
+        self.assertTrue(ok.events[0].all_day)
 
 
 if __name__ == "__main__":

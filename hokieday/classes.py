@@ -13,7 +13,7 @@ the building it is in. It is intentionally a *data* module -- no LLM, no UI.
 NON-NEGOTIABLE BOUNDARIES (see docs/CLASSES.md)
 -----------------------------------------------
 * PUBLIC pages only: HZSKVTSC (timetable), HZSKVTS P_DispBldgList (building
-  abbreviations), HZSKEXAM (final-exam schedule). NEVER HokieSPA / My VT,
+  abbreviations). NEVER HokieSPA / My VT,
   never a login, never a CRN owner's grades/GPA/roster/PID.
 * This module NEVER talks to the network. The polite form POST lives in the
   edge script ``scripts/fetch_classes.py``, which writes a JSON *snapshot* to
@@ -95,7 +95,6 @@ BANNER_BASE = "https://selfservice.banner.vt.edu/ssb/"
 BANNER_FORM_URL = BANNER_BASE + "HZSKVTSC.P_DispRequest"
 BANNER_PROC_URL = BANNER_BASE + "HZSKVTSC.P_ProcRequest"
 BANNER_BUILDINGS_URL = BANNER_BASE + "hzskvtsc.P_DispBldgList"
-BANNER_EXAMS_URL = BANNER_BASE + "hzskexam.P_DispExamInfo"
 
 # Default campus = Blacksburg. Banner campus codes are strings.
 DEFAULT_CAMPUS = "0"
@@ -121,6 +120,33 @@ MAX_ICS_WINDOW_DAYS = 730         # default recurrence cap (~2 years)
 
 # A planning buffer larger than this is almost certainly a bug, not a plan.
 MAX_BUFFER_MIN = 240.0
+
+# GLOBAL bounds across a combined (Banner + ICS) schedule. Beyond these the
+# result is refused with a typed ``BoundsExceeded`` error instead of building an
+# unbounded O(n^2) conflict list.
+MAX_TOTAL_OCCURRENCES = 5_000
+MAX_CONFLICTS = 1_000
+
+
+class BoundsExceeded(RuntimeError):
+    """Typed refusal when a bounded schedule computation would blow up.
+
+    ``kind`` is "occurrences" or "conflicts"; ``limit`` is the configured cap
+    and ``actual`` the count that tripped it. Callers surface it as a typed
+    state (e.g. ``schedule_json.state == "bounds_exceeded"``).
+    """
+
+    def __init__(self, kind: str, limit: int, actual: int):
+        super().__init__(
+            f"{kind} exceeded the {limit} cap (got {actual}); refusing to build "
+            "an unbounded result")
+        self.kind = kind
+        self.limit = int(limit)
+        self.actual = int(actual)
+
+    def to_dict(self) -> dict:
+        return {"kind": self.kind, "limit": self.limit, "actual": self.actual,
+                "message": str(self)}
 
 TERM_FALL_2026 = "202609"
 SUPPORTED_TERMS: dict[str, str] = {
@@ -379,7 +405,14 @@ class ClassSection:
 
 @dataclass(frozen=True)
 class ClassOccurrence:
-    """A concrete dated instance of a Meeting (recurrence expanded in code)."""
+    """A concrete dated instance of a Meeting (recurrence expanded in code).
+
+    ``source``/``provenance``/``term_assumed`` carry WHERE the date came from.
+    Banner only exposes a weekly meeting pattern, so its recurrence is a
+    WHOLE-TERM INFERENCE (``term_assumed=True``). ICS dates are explicit
+    (``term_assumed=False``). Callers must opt in to term-assumed occurrences;
+    see ``combined_occurrences(..., allow_term_assumption=...)``.
+    """
 
     term: str
     crn: str
@@ -391,12 +424,27 @@ class ClassOccurrence:
     end: datetime                    # campus-local, tz-aware
     meeting: Meeting
     title_extra: str = ""
+    source: str = "banner"           # "banner" | "ics"
+    term_assumed: bool = False
+    provenance: str = "banner_weekly_assumed"
 
     @property
     def course(self) -> str:
         if self.subject and self.course_number:
             return f"{self.subject}-{self.course_number}"
         return self.subject or self.course_number
+
+    @property
+    def identity(self) -> tuple[str, str, str]:
+        """SOURCE-AWARE composite identity, never bare CRN equality.
+
+        Banner: ("banner", term, crn). ICS: ("ics", uid, ""). This prevents a
+        numeric Banner CRN and a same-string ICS UID from being treated as the
+        same class (e.g. in conflict self-exclusion).
+        """
+        if self.source == "ics":
+            return ("ics", str(self.crn), "")
+        return ("banner", str(self.term), str(self.crn))
 
     def to_dict(self) -> dict:
         return {
@@ -412,6 +460,9 @@ class ClassOccurrence:
             "room": self.meeting.room,
             "location_raw": self.meeting.location_raw,
             "is_online": self.meeting.is_online,
+            "source": self.source,
+            "term_assumed": self.term_assumed,
+            "provenance": self.provenance,
         }
 
 
@@ -466,6 +517,9 @@ class NextClass:
             "room": o.meeting.room,
             "location_raw": o.meeting.location_raw,
             "is_online": o.meeting.is_online,
+            "source": o.source,
+            "term_assumed": o.term_assumed,
+            "provenance": o.provenance,
         }
 
 
@@ -975,6 +1029,8 @@ def expand_section(
                     course_number=section.course_number, title=section.title,
                     date=d, start=_make_dt(d, m.begin, tz),
                     end=_make_dt(d, m.end, tz), meeting=m,
+                    source="banner", term_assumed=True,
+                    provenance="banner_weekly_assumed",
                 ))
     out.sort(key=lambda o: (o.start, o.crn))
     return out
@@ -1033,9 +1089,15 @@ def find_conflicts(
     occurrences: Iterable[ClassOccurrence],
     *,
     include_same_crn: bool = False,
+    max_conflicts: int = MAX_CONFLICTS,
 ) -> list[Conflict]:
-    """Overlapping occurrences (half-open intervals: end == start is NOT a
-    conflict). Different meetings of the SAME CRN never conflict by default."""
+    """Overlapping occurrences (half-open: end == start is NOT a conflict).
+
+    Same-identity exclusions use the SOURCE-AWARE composite identity (Banner
+    term+CRN vs ICS UID), never bare CRN equality. The scan stops as soon as
+    the conflict cap is exceeded and raises ``BoundsExceeded`` instead of
+    materializing an unbounded O(n^2) list.
+    """
     items = sorted(occurrences, key=lambda o: (o.start, o.end, o.crn))
     out: list[Conflict] = []
     for i, a in enumerate(items):
@@ -1043,11 +1105,13 @@ def find_conflicts(
             if b.start >= a.end:
                 break
             if b.start < a.end and a.start < b.end:
-                if not include_same_crn and a.crn == b.crn:
+                if not include_same_crn and a.identity == b.identity:
                     continue
                 overlap = (min(a.end, b.end) - max(a.start, b.start)).total_seconds() / 60
                 if overlap > 0:
                     out.append(Conflict(a, b, overlap))
+                    if len(out) > max_conflicts:
+                        raise BoundsExceeded("conflicts", max_conflicts, len(out))
     return out
 
 
@@ -1058,9 +1122,11 @@ def schedule_conflicts(
     end: date | None = None,
     tz: ZoneInfo | None = None,
     ics_events: Iterable[IcsEvent] | None = None,
+    allow_term_assumption: bool = False,
 ) -> list[Conflict]:
-    occ = combined_occurrences(sections, ics_events or (), start=start, end=end,
-                               tz=tz)
+    occ = combined_occurrences(
+        sections, ics_events or (), start=start, end=end, tz=tz,
+        allow_term_assumption=allow_term_assumption)
     return find_conflicts(occ)
 
 
@@ -1071,12 +1137,31 @@ def combined_occurrences(
     start: date | None = None,
     end: date | None = None,
     tz: ZoneInfo | None = None,
+    allow_term_assumption: bool = False,
+    max_occurrences: int = MAX_TOTAL_OCCURRENCES,
 ) -> list[ClassOccurrence]:
-    """All dated occurrences: Banner sections expanded by term window, plus
-    ICS events expanded by their own dated recurrence. ICS events are NEVER
-    converted into Banner sections, so they cannot leak into weekly expansion."""
-    out = expand_sections(sections, start=start, end=end, tz=tz)
-    out.extend(expand_ics_events(ics_events, start=start, end=end, tz=tz))
+    """All dated occurrences, GLOBALLY bounded.
+
+    Banner sections expand to term-assumed recurrences (flagged
+    ``term_assumed=True``) and are EXCLUDED unless ``allow_term_assumption=True``
+    because Banner gives no section-specific start/end dates. ICS events expand
+    from their own dated recurrence and are always usable. ``BoundsExceeded``
+    is raised past ``max_occurrences`` so a huge schedule is refused, not
+    materialized.
+    """
+    out: list[ClassOccurrence] = []
+    for s in sections:
+        for o in expand_section(s, start=start, end=end, tz=tz):
+            if o.term_assumed and not allow_term_assumption:
+                continue
+            out.append(o)
+            if len(out) > max_occurrences:
+                raise BoundsExceeded("occurrences", max_occurrences, len(out))
+    for e in ics_events:
+        for o in expand_ics_event(e, start=start, end=end, tz=tz):
+            out.append(o)
+            if len(out) > max_occurrences:
+                raise BoundsExceeded("occurrences", max_occurrences, len(out))
     out.sort(key=lambda o: (o.start, o.crn))
     return out
 
@@ -1109,20 +1194,23 @@ def next_class(
     skip_online: bool = False,
     tz: ZoneInfo | None = None,
     ics_events: Iterable[IcsEvent] | None = None,
+    allow_term_assumption: bool = False,
 ) -> NextClass | None:
     """The next timed class meeting at/after ``at`` -> deterministic deadline.
 
     ``deadline`` (leave_by) = class start - ``buffer_min``. Banner sections are
-    clamped to their verified term window; ICS events are expanded from their
-    own dated recurrence. TBA meetings are ignored here (no time to schedule);
-    surface them with ``ClassSection.has_tba``.
+    clamped to their verified term window and are TERM-ASSUMED whole-term
+    inferences, so they are excluded unless ``allow_term_assumption=True``. ICS
+    events are dated and always usable. TBA meetings are ignored here (no time
+    to schedule). Raises ``BoundsExceeded`` when the occurrence cap is hit.
     """
     b = _validate_buffer(buffer_min)
     tz = tz or campus_tz()
     if at.tzinfo is None:
         at = at.replace(tzinfo=tz)
-    occ = combined_occurrences(list(sections), list(ics_events or ()),
-                               start=start, end=end, tz=tz)
+    occ = combined_occurrences(
+        list(sections), list(ics_events or ()), start=start, end=end, tz=tz,
+        allow_term_assumption=allow_term_assumption)
     for o in occ:
         if o.start < at:
             continue
@@ -1147,6 +1235,7 @@ def next_class_json(
     skip_online: bool = False,
     tz: ZoneInfo | None = None,
     ics_events: Iterable[IcsEvent] | None = None,
+    allow_term_assumption: bool = False,
 ) -> dict:
     b = _validate_buffer(buffer_min)
     tz = tz or campus_tz()
@@ -1154,13 +1243,37 @@ def next_class_json(
         at = at.replace(tzinfo=tz)
     section_list = list(sections)
     ics_list = list(ics_events or ())
-    nc = next_class(section_list, at, start=start, end=end, buffer_min=b,
-                    skip_online=skip_online, tz=tz, ics_events=ics_list)
+    has_timed_banner = any(
+        m.has_time for s in section_list for m in s.meetings)
+    assumed_excluded = bool(section_list) and has_timed_banner and (
+        not allow_term_assumption)
+    try:
+        nc = next_class(section_list, at, start=start, end=end, buffer_min=b,
+                        skip_online=skip_online, tz=tz, ics_events=ics_list,
+                        allow_term_assumption=allow_term_assumption)
+    except BoundsExceeded as exc:
+        return {
+            "schema": SCHEMA_NEXT_CLASS,
+            "status": "bounds_exceeded",
+            "at": at.isoformat(timespec="seconds"),
+            "deadline": None,
+            "buffer_min": b,
+            "reason": str(exc),
+            "bounds": exc.to_dict(),
+            "allow_term_assumption": allow_term_assumption,
+        }
     if nc is None:
         unverified = _dedupe(
             r for s in section_list
             for ok, r in [term_expandability(s.term)] if not ok and r)
-        if section_list and not ics_list and unverified:
+        if assumed_excluded and not ics_list:
+            status = "recurrence_unavailable"
+            reason = (
+                "Banner meeting patterns are whole-term inferences and do "
+                "not carry section-specific dates; pass "
+                "allow_term_assumption=True to use them, or use ICS for "
+                "dated occurrences.")
+        elif section_list and not ics_list and unverified:
             status = "unavailable"
             reason = ("; ".join(unverified) + ". Only verified TERM_WINDOWS "
                       "expand; no fallback window is invented.")
@@ -1176,8 +1289,11 @@ def next_class_json(
             "buffer_min": b,
             "reason": reason,
             "unverified_terms": unverified,
+            "allow_term_assumption": allow_term_assumption,
+            "term_assumption_required": assumed_excluded,
         }
-    payload = {"schema": SCHEMA_NEXT_CLASS, "at": at.isoformat(timespec="seconds")}
+    payload = {"schema": SCHEMA_NEXT_CLASS, "at": at.isoformat(timespec="seconds"),
+               "allow_term_assumption": allow_term_assumption}
     payload.update(nc.to_dict())
     return payload
 
@@ -1337,7 +1453,8 @@ def remove_from_schedule(
             continue
         removed.append(crn)
 
-    not_in = [c for c in valid if c not in removed]
+    ambiguous_set = set(ambiguous)
+    not_in = [c for c in valid if c not in removed and c not in ambiguous_set]
     for u in sorted(want_uids):
         if u not in removed:
             not_in.append(u)
@@ -1403,13 +1520,13 @@ def _ics_record_to_text(rec: dict) -> str:
         return f"{name}:{raw}"
 
     lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT",
-             f"UID:{rec.get('uid', '')}",
+             f"UID:{_escape_ics_text(str(rec.get('uid', '')))}",
              dt_line("DTSTART", rec.get("raw_start", "")),
              dt_line("DTEND", rec.get("raw_end", ""))]
     if rec.get("summary"):
-        lines.append(f"SUMMARY:{rec['summary']}")
+        lines.append("SUMMARY:" + _escape_ics_text(str(rec["summary"])))
     if rec.get("location"):
-        lines.append(f"LOCATION:{rec['location']}")
+        lines.append("LOCATION:" + _escape_ics_text(str(rec["location"])))
     rrule = rec.get("rrule") or {}
     if rrule and rec.get("recurring"):
         parts = [f"{k}={v}" for k, v in rrule.items() if not k.startswith("_")]
@@ -1426,11 +1543,17 @@ def schedule_occurrences(
     start: date | None = None,
     end: date | None = None,
     tz: ZoneInfo | None = None,
+    allow_term_assumption: bool = False,
 ) -> list[ClassOccurrence]:
-    """Dated occurrences for a stored schedule: Banner sections + ICS events."""
+    """Dated occurrences for a stored schedule: Banner sections + ICS events.
+
+    Banner (term-assumed) recurrences are excluded unless
+    ``allow_term_assumption=True``; ICS dated occurrences are always included.
+    """
     resolved = resolve_schedule(schedule, sections or ())
     ics = resolve_ics_schedule(schedule)
-    return combined_occurrences(resolved, ics, start=start, end=end, tz=tz)
+    return combined_occurrences(resolved, ics, start=start, end=end, tz=tz,
+                                allow_term_assumption=allow_term_assumption)
 
 
 # ---------------------------------------------------------------------------
@@ -1556,14 +1679,12 @@ def crosswalk_contract(crosswalk: dict[str, Building] | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Final-exam page: RAW CAPTURE ONLY
+# Final exams: NOT SUPPORTED
 # ---------------------------------------------------------------------------
 # The public HZSKEXAM page is a date x time matrix with year-less column
-# headers. The previous "best effort" parser guessed the year and dropped
-# codes with no header context, which risked returning WRONG exam dates. It has
-# been removed rather than shipped: scripts/fetch_classes.py --exams still
-# captures the raw HTML for a future, verified parser, but no exam data is
-# exported from this module today.
+# headers. A previous "best effort" parser guessed the year and dropped codes
+# with no header context, which risked returning WRONG exam dates. There is no
+# exam parser and no raw-capture option -- exam data is out of scope here.
 
 
 # ---------------------------------------------------------------------------
@@ -1663,27 +1784,39 @@ def _split_prop(line: str) -> tuple[str, dict[str, str], str] | None:
 
 def _parse_ics_dt(value: str, params: dict[str, str], default_tz: ZoneInfo,
                   warnings: list[str]) -> tuple[datetime, bool, str | None]:
-    """Return (aware dt, all_day, tzid). Raises ValueError on a malformed value."""
+    """Return (aware dt, all_day, tzid). Raises ValueError on a malformed value.
+
+    ``VALUE=DATE`` requires EXACTLY 8 digits (YYYYMMDD); anything else is
+    rejected rather than truncated into a plausible date.
+    """
     value = value.strip()
-    is_date = params.get("VALUE", "").upper() == "DATE" or re.match(r"^\d{8}$", value)
+    value_type = params.get("VALUE", "").upper()
     tzid = params.get("TZID")
-    if is_date:
-        d = datetime.strptime(value[:8], "%Y%m%d")
+    if value_type == "DATE":
+        if not re.fullmatch(r"\d{8}", value):
+            raise ValueError(f"VALUE=DATE requires exactly YYYYMMDD, got {value!r}")
+        d = datetime.strptime(value, "%Y%m%d")
         return d.replace(tzinfo=default_tz), True, tzid
+    if value_type not in ("", "DATE-TIME"):
+        raise ValueError(f"unsupported DTSTART/DTEND VALUE={value_type!r}")
     m = re.match(r"^(\d{8})T(\d{6})(Z?)$", value)
-    if not m:
-        raise ValueError(f"unsupported DTSTART/DTEND value {value!r}")
-    base = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
-    if m.group(3) == "Z":
-        return base.replace(tzinfo=timezone.utc).astimezone(default_tz), False, tzid
-    if tzid:
-        try:
-            return base.replace(tzinfo=ZoneInfo(tzid)), False, tzid
-        except ZoneInfoNotFoundError as exc:
-            # Unknown TZID is REJECTED, never silently shifted to campus time.
-            raise ValueError(f"unknown TZID {tzid!r}") from exc
-    warnings.append("floating time with no TZID; assuming campus time")
-    return base.replace(tzinfo=default_tz), False, tzid
+    if m:
+        base = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+        if m.group(3) == "Z":
+            return base.replace(tzinfo=timezone.utc).astimezone(default_tz), False, tzid
+        if tzid:
+            try:
+                return base.replace(tzinfo=ZoneInfo(tzid)), False, tzid
+            except ZoneInfoNotFoundError as exc:
+                # Unknown TZID is REJECTED, never silently shifted to campus time.
+                raise ValueError(f"unknown TZID {tzid!r}") from exc
+        warnings.append("floating time with no TZID; assuming campus time")
+        return base.replace(tzinfo=default_tz), False, tzid
+    # A bare 8-digit value is a DATE only when no VALUE parameter was given.
+    if value_type == "" and re.fullmatch(r"\d{8}", value):
+        d = datetime.strptime(value, "%Y%m%d")
+        return d.replace(tzinfo=default_tz), True, tzid
+    raise ValueError(f"unsupported DTSTART/DTEND value {value!r}")
 
 
 _RRULE_SUPPORTED = {"FREQ", "INTERVAL", "COUNT", "UNTIL", "BYDAY"}
@@ -1780,6 +1913,19 @@ def _decode_ics_text(value: str) -> str:
     return "".join(out)
 
 
+def _escape_ics_text(value: str) -> str:
+    """Encode a value for an RFC 5545 TEXT property (inverse of decode).
+
+    Backslash FIRST, then CR/LF -> ``\\n``, then comma/semicolon. This is what
+    makes a schedule record round-trip through storage without a comma or a
+    newline corrupting the property structure (or injecting a fake line).
+    """
+    out = str(value).replace("\\", "\\\\")
+    out = out.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
+    out = out.replace(",", "\\,").replace(";", "\\;")
+    return out
+
+
 def parse_ics(text: str, *, tz: ZoneInfo | None = None) -> IcsParse:
     """Parse an ICS calendar into a bounded, useful VEVENT subset.
 
@@ -1811,6 +1957,8 @@ def parse_ics(text: str, *, tz: ZoneInfo | None = None) -> IcsParse:
         errors.append("calendar is truncated: missing END:VCALENDAR")
 
     in_event = False
+    sub_depth = 0
+    sub_name = ""
     props: dict[str, tuple[dict[str, str], str]] = {}
     event_warnings: list[str] = []
     for line in lines:
@@ -1822,12 +1970,22 @@ def parse_ics(text: str, *, tz: ZoneInfo | None = None) -> IcsParse:
             if in_event:
                 errors.append("nested BEGIN:VEVENT; previous event discarded")
             in_event = True
+            sub_depth = 0
+            sub_name = ""
             props = {}
             event_warnings = []
             continue
         if upper == "END:VEVENT":
             if not in_event:
                 errors.append("END:VEVENT with no BEGIN:VEVENT")
+                continue
+            if sub_depth > 0:
+                errors.append(
+                    f"VEVENT has unterminated sub-component {sub_name!r}; "
+                    "event discarded")
+                in_event = False
+                sub_depth = 0
+                sub_name = ""
                 continue
             in_event = False
             if len(events) >= MAX_ICS_EVENTS:
@@ -1847,10 +2005,23 @@ def parse_ics(text: str, *, tz: ZoneInfo | None = None) -> IcsParse:
             warnings.append(f"unparseable ICS line skipped: {line[:60]!r}")
             continue
         name, params, value = parsed
-        if name in ("BEGIN", "END"):
-            # Sub-components (VALARM, STANDARD, ...) are ignored.
-            if value.strip().upper() not in ("VALARM",):
-                warnings.append(f"ignored sub-component {value.strip()}")
+        # Nested components (VALARM, STANDARD, ...) are TRACKED. Their inner
+        # properties are ignored so a malicious ``SUMMARY``/``DTSTART`` inside
+        # a VALARM can never overwrite a VEVENT property.
+        if name == "BEGIN":
+            sub_depth += 1
+            sub_name = value.strip().upper() or sub_name
+            warnings.append(f"ignored sub-component {sub_name}")
+            continue
+        if name == "END":
+            if sub_depth > 0:
+                sub_depth -= 1
+                if sub_depth == 0:
+                    sub_name = ""
+            else:
+                warnings.append(f"END:{value.strip()} with no matching BEGIN")
+            continue
+        if sub_depth > 0:
             continue
         props[name] = (params, value)
 
@@ -1957,24 +2128,26 @@ def _expand_ics_event_impl(event: IcsEvent, *, start: date | None = None,
             term="", crn=event.uid, subject="", course_number="",
             title=event.summary, date=first, start=event.dtstart,
             end=event.dtend, meeting=meeting, title_extra="ics",
+            source="ics", term_assumed=False, provenance="ics_dated",
         )]
 
     interval = int(rrule.get("INTERVAL", "1") or 1)
     if interval < 1:
         return []
     count = int(rrule["COUNT"]) if rrule.get("COUNT", "").isdigit() else None
-    until: date | None = None
+    # UNTIL is an INSTANT, not a date: keep the aware datetime and compare
+    # candidate start instants, so a same-day-but-later UNTIL is respected.
+    until_dt: datetime | None = None
     if rrule.get("UNTIL"):
         try:
             until_dt, _, _ = _parse_ics_dt(rrule["UNTIL"], {}, tz, [])
-            until = until_dt.date()
         except ValueError:
             return []                     # parser flags invalid UNTIL already
     win_start = max(start or first, first)
     default_end = first + timedelta(days=MAX_ICS_WINDOW_DAYS)
-    win_end = end or until or default_end
-    if until:
-        win_end = min(win_end, until)
+    win_end = end or (until_dt.date() if until_dt else default_end)
+    if until_dt:
+        win_end = min(win_end, until_dt.date())
     if (win_end - win_start).days > MAX_ICS_WINDOW_DAYS:
         win_end = win_start + timedelta(days=MAX_ICS_WINDOW_DAYS)
 
@@ -2000,11 +2173,17 @@ def _expand_ics_event_impl(event: IcsEvent, *, start: date | None = None,
                 continue
             start_dt = datetime(d.year, d.month, d.day, event.dtstart.hour,
                                 event.dtstart.minute, tzinfo=event.dtstart.tzinfo)
+            if until_dt is not None and start_dt > until_dt:
+                # UNTIL is inclusive: the first candidate AFTER the instant ends
+                # the series (all later candidates are later too).
+                out.sort(key=lambda o: o.start)
+                return out
             out.append(ClassOccurrence(
                 term="", crn=event.uid, subject="", course_number="",
                 title=event.summary, date=d, start=start_dt,
                 end=start_dt + duration, meeting=event.to_meeting(),
                 title_extra="ics",
+                source="ics", term_assumed=False, provenance="ics_dated",
             ))
             if len(out) >= MAX_ICS_OCCURRENCES:
                 out.sort(key=lambda o: o.start)
@@ -2207,6 +2386,10 @@ UI_STATES: dict[str, str] = {
     "conflict": "two selected occurrences overlap; show both + overlap minutes",
     "stale_snapshot": "snapshot older than the freshness window; show as-of time",
     "malformed_ics": "ICS had unsupported/malformed parts; list warnings/errors",
+    "recurrence_unavailable": "Banner recurrence is a whole-term inference; "
+                            "pass allow_term_assumption or import ICS",
+    "bounds_exceeded": "combined schedule exceeded the occurrence/conflict caps; "
+                      "narrow the window or selection",
 }
 
 
@@ -2259,12 +2442,15 @@ def schedule_json(
     max_age_s: float = 6 * 3600,
     snapshot: TimetableSnapshot | None = None,
     ics_events: Iterable[IcsEvent] | None = None,
+    allow_term_assumption: bool = False,
 ) -> dict:
-    """Schedule response with conflict + stale + state info.
+    """Schedule response with conflict + stale + bounds + term-provenance info.
 
-    Conflicts are computed from DATED occurrences: Banner sections expanded by
-    their verified term window plus ICS events expanded by their own dated
-    recurrence. ICS records are never turned into Banner sections.
+    Conflicts come from DATED occurrences. Banner recurrences are whole-term
+    inferences and are excluded unless ``allow_term_assumption=True``; ICS
+    dated occurrences are always used. A schedule that exceeds the global
+    occurrence/conflict caps returns ``state="bounds_exceeded"`` instead of a
+    partial or unbounded result.
     """
     schedule_list = list(schedule or [])
     section_list = list(sections or ())
@@ -2274,9 +2460,9 @@ def schedule_json(
     if ics_list:
         by_uid = {e.uid: e for e in ics_list}
         resolved_ics = [by_uid.get(e.uid, e) for e in resolved_ics]
-    occ = combined_occurrences(resolved, resolved_ics, start=start, end=end)
-    conflicts = find_conflicts(occ)
-    stale = snapshot_is_stale(snapshot, max_age_s=max_age_s, now=now) if snapshot else False
+
+    stale = snapshot_is_stale(snapshot, max_age_s=max_age_s,
+                              now=now) if snapshot else False
     known_crn = {(s.term, s.crn) for s in section_list}
     known_uid = {e.uid for e in (ics_list or resolved_ics)}
     unresolved: list[str] = []
@@ -2289,17 +2475,37 @@ def schedule_json(
             key = (str(rec.get("term", "")), str(rec.get("crn", "")))
             if key not in known_crn:
                 unresolved.append(str(rec.get("crn", "")))
-    return {
+
+    has_timed_banner = any(m.has_time for s in resolved for m in s.meetings)
+    term_assumption_required = has_timed_banner and not allow_term_assumption
+    base = {
         "schema": SCHEMA_SCHEDULE,
         "schedule": schedule_list,
         "count": len(schedule_list),
-        "occurrence_count": len(occ),
-        "conflicts": [c.to_dict() for c in conflicts],
-        "state": "conflict" if conflicts else (
-            "stale_snapshot" if stale else "ready"),
         "unresolved": unresolved,
         "snapshot": snapshot.meta_dict() if snapshot else None,
+        "allow_term_assumption": allow_term_assumption,
+        "term_assumption_required": term_assumption_required,
     }
+    try:
+        occ = combined_occurrences(
+            resolved, resolved_ics, start=start, end=end,
+            allow_term_assumption=allow_term_assumption)
+        conflicts = find_conflicts(occ)
+    except BoundsExceeded as exc:
+        return {**base, "occurrence_count": None, "conflicts": [],
+                "state": "bounds_exceeded", "bounds": exc.to_dict(),
+                "reason": str(exc)}
+    if conflicts:
+        state = "conflict"
+    elif term_assumption_required and not resolved_ics:
+        state = "recurrence_unavailable"
+    elif stale:
+        state = "stale_snapshot"
+    else:
+        state = "ready"
+    return {**base, "occurrence_count": len(occ),
+            "conflicts": [c.to_dict() for c in conflicts], "state": state}
 
 
 def section_state(section: ClassSection) -> list[str]:
@@ -2316,10 +2522,11 @@ def section_state(section: ClassSection) -> list[str]:
 
 __all__ = [
     "BANNER_BASE", "BANNER_FORM_URL", "BANNER_PROC_URL", "BANNER_BUILDINGS_URL",
-    "BANNER_EXAMS_URL", "DEFAULT_CAMPUS", "DEFAULT_CORE_CODE",
+    "DEFAULT_CAMPUS", "DEFAULT_CORE_CODE",
     "SCHEMA_SNAPSHOT", "SCHEMA_SEARCH", "SCHEMA_NEXT_CLASS", "SCHEMA_SCHEDULE",
     "MAX_ICS_BYTES", "MAX_ICS_LINES", "MAX_ICS_EVENTS", "MAX_ICS_OCCURRENCES",
-    "MAX_ICS_WINDOW_DAYS", "MAX_BUFFER_MIN",
+    "MAX_ICS_WINDOW_DAYS", "MAX_BUFFER_MIN", "MAX_TOTAL_OCCURRENCES",
+    "MAX_CONFLICTS", "BoundsExceeded",
     "TERM_FALL_2026", "SUPPORTED_TERMS", "TERM_WINDOWS", "HOLIDAYS",
     "TermWindow", "term_name", "term_window", "term_expandability",
     "Meeting", "ClassSection",
