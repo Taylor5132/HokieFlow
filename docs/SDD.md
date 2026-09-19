@@ -1,6 +1,6 @@
-# SDD — HokieDay: Unified Campus-Life Agent
+# SDD — HokieFlow: Unified Campus-Life Agent
 
-**Project:** HokieDay · **Event:** VTHacks 14 (Virginia Tech, Sep 18–20 2026)
+**Project:** HokieFlow · **Event:** VTHacks 14 (Virginia Tech, Sep 18–20 2026)
 **Sponsor track:** Deloitte × Databricks — Campus life intelligence hub
 **Doc status:** v1.0 draft · **Author:** team · **Last updated:** 2026-09-19
 
@@ -15,7 +15,7 @@
 
 Virginia Tech students currently answer ordinary logistics questions — *"can I eat and still make my 1:25 lecture?"* — by hand, across four or more disconnected systems (dining menus, dining hours, bus schedules, live bus positions, weather, events). Each system is individually fine. **The integration layer does not exist**, and it is where student time is actually lost.
 
-HokieDay is an AI agent that sits **above** those systems as an orchestration layer. It answers multi-constraint questions in one shot, and — the part that matters — it **re-plans when reality changes**, because a bus that is 4 minutes late invalidates the answer.
+HokieFlow is an AI agent that sits **above** those systems as an orchestration layer. It answers multi-constraint questions in one shot, and — the part that matters — it **re-plans when reality changes**, because a bus that is 4 minutes late invalidates the answer.
 
 **Design thesis:** *squeeze every guarantee into code and structure, and leave the model only the fuzzy part it is actually good at.* The language model chooses tools and narrates results; it never invents a number.
 
@@ -160,7 +160,7 @@ flowchart TD
 
 > ⚠️ **Implementation trap.** With no `calendar.txt`, determining "which trips run today" *must* be done by filtering `calendar_dates` on the date and `exception_type`, then joining to `trips.service_id`. Any code that expects `calendar.txt` will silently return nothing.
 
-Verified sampling: nearest stop to Burruss Hall (37.22957, -80.41394) is **stop 1600 "Main/Roanoke Sbnd" at 37 m (0.5 min walk)**.
+**Correction (v1.6):** the spike point `(37.22957, -80.41394)` is 37 m from stop 1600, but VT's official GIS places Burruss Hall near `(37.22925, -80.42396)`. The earlier draft mislabeled the spike point as Burruss. Existing place coordinates are now marked unverified and will be recalibrated in the post-push GIS integration; the GTFS stop-distance calculation itself remains valid for the stated point.
 
 > ⚠️ **Correction (v1.1).** An earlier draft claimed "next departures after 11:22 were SME 11:23:29, HDG 11:31:10, SMA 11:36:50". **That was wrong.** It was produced by a spike that filtered `stop_times` by stop and time but **not by service date**, so it reported the earliest rows in the entire feed as if they fell on 2026-09-19. Verified: the `11:23:29` SME trip belongs to service `406882a3`, whose only service date in the whole feed is **2026-09-12**; the `11:31:10` HDG rows belong to a weekday service and a Friday service. **None of them ran on 9/19.** Service-filtered, the true departures from stop 1600 on 2026-09-19 after 11:22 are **SME 11:48:29, HDG 11:50:21, SME 12:18:29, HDG 12:20:21**. Corroboration: all 13 live vehicles join to services that *are* active on 9/19 (`091ff308`, `a3af698d`).
 >
@@ -249,6 +249,15 @@ Items format is `recipeId*portionSize*quantity`, comma-joined; values come back 
 
 **Allergen taxonomy** (verified, 10): Milk, Eggs, Fish, Crustacean Shellfish, Tree Nuts, Peanuts, Wheat, Soybeans, Gluten, Sesame.
 **Diet codes** (verified, 4): `wcveg` Vegan, `wcvtn` Vegetarian, `wcha` Halal, `wcal` Alcohol.
+
+> ⚠️ **Source-consistency finding (v1.5).** The snapshot labels *Whole Wheat
+> Penne Pasta* `vegan` while its own allergen field declares **Eggs** (the same
+> recipe appears once at lunch and once at dinner). Neither field may silently
+> overrule the other. Raw bronze/silver data preserves the contradiction, while
+> `eat_options` and the UC `find_food` function reject a requested vegan or
+> vegetarian row when its declared allergens directly contradict that diet.
+> The UI shows the selected item's diet tag and allergen declaration so the
+> applied constraint is inspectable.
 
 ### 5.5 D9 — Hours (verified)
 
@@ -446,9 +455,9 @@ sequenceDiagram
 
 The obvious target is *"predict dining wait time."* **We reject it: there is no ground truth for dining wait time in any available dataset.** Training a model to predict something nobody measures produces a number we cannot defend, and a Deloitte judge will find that in one question.
 
-**We predict something we can actually measure: bus lateness.**
+**The production roadmap predicts something we can actually measure: bus lateness.**
 
-`silver.bus_positions.sched_delta_min` is a *real label*, derived by joining live positions to the static schedule (verified working, 13/13 joins). By the time we need it, we will have been sampling it all night.
+`silver.bus_positions.sched_delta_min` is a *real label*, derived by joining live positions to the static schedule (verified working, 13/13 joins). **Current implementation status:** no bus time-series dataset is committed (`data/` is an ignored runtime store), no model has been trained, and `predict_bus_delay` returns `basis="no_model"`. The demo acts on observed deviation directly.
 
 ### 9.2 Model
 
@@ -467,9 +476,9 @@ The obvious target is *"predict dining wait time."* **We reject it: there is no 
 - Poll at 60 s → ~1,440 samples/vehicle/day at ~13 vehicles ⇒ **tens of thousands of rows by morning**.
 - **Gate:** if fewer than ~2,000 labelled rows exist, mark the model `insufficient_data` and let the UI fall back to raw observed delay. Do not present a model we cannot stand behind.
 
-### 9.4 What we will say about it
+### 9.4 What we say about it now
 
-> "The model is small on purpose. Its job isn't to be impressive — it's to convert observed lateness into a decision the student can act on. We trained it on data our own pipeline generated overnight, and we report its confidence next to every prediction."
+> "The measurable target is bus lateness, but we have not crossed our 2,000-row training gate, so no prediction is shown. Today's re-plan uses observed schedule deviation directly. With enough polling data, the same label supports a small, explainable model tracked in MLflow."
 
 ---
 
@@ -488,18 +497,24 @@ The obvious target is *"predict dining wait time."* **We reject it: there is no 
 ### 10.2 UI requirements
 
 - One input box, one answer area, plus a compact **itinerary card** (leave at, walk, arrive, eat).
-- Per-number provenance tags (live / scheduled / estimated).
-- A visible **"inject 6-minute bus delay"** control — clearly labelled as a demo control.
-- A **cause line** whenever a re-plan happens: `re-planned: SME is 6 min late`.
+- Put the recommendation and any re-plan cause **before the map**; action comes before decoration on a phone.
+- Per-number provenance tags (live / scheduled / estimated), plus the diet/allergen constraints actually applied.
+- Human place names and clock times in the primary view; internal stop/profile IDs remain in JSON only.
+- A **cause line** whenever a re-plan happens, with Plan A retained beside Plan B.
+- Route controls must re-run the current request rather than silently reverting to the default scenario.
 - Degraded-data banner when any source is stale.
 
-### 10.3 The one demo control, and how we label it
+### 10.3 Deterministic re-plan scenario
 
-The UI includes **"simulate bus delay"**. Label it in-product, not mumbled:
+The shipped UI does **not** inject a made-up delay. The **"Same trip, but I want
+the bus"** preset selects the bus candidate, then the planner re-checks the real
+captured vehicle snapshot. In that snapshot route CAS is 1.4 minutes early,
+which leaves only 1.5 minutes to board against the declared 2-minute buffer, so
+Plan A is invalidated every time the offline demo is replayed.
 
-> *"Live buses were on time when we rehearsed. This control injects a synthetic delay so you can see the re-planning loop regardless of what BT is doing this morning. In production the trigger comes from the live feed."*
-
-Real live data plus one honestly-labelled control is a stronger position than either a fully scripted demo or an unverifiable "trust us, it replans."
+The product labels this as an **offline replay of a snapshot captured live**.
+That gives the stage demo deterministic behavior without presenting synthetic
+state as real; in live mode the identical trigger reads the current feed.
 
 ---
 
@@ -699,10 +714,11 @@ route is drawn in dashed grey *underneath* the chosen plan, the bbox covers both
 (so the abandoned loop is not cropped), and the legend names it *"plan A route
 (abandoned)"*. Two stacked maps would have been worse on a phone.
 
-**The handoff.** "We plan the trip; the maps app navigates it." Four keyless
-links (Apple/Google × walk/transit) built from the plan's **own** origin and
-destination, with commas percent-encoded and `api=1` present (Google ignores all
-parameters without it). Turn-by-turn is deliberately not built.
+**The handoff.** "We plan the trip; the maps app navigates it." Each movement
+leg gets an Apple Maps and Google Maps link using that leg's **own** endpoints
+and mode, with commas percent-encoded and `api=1` present (Google ignores all
+parameters without it). A single origin→destination link was rejected because
+it silently skipped the dining waypoint. Turn-by-turn is deliberately not built.
 
 **Failure isolation:** a map exception is caught and reported as `_map_error`
 while the plan is still returned. The plan is the product; the map is a view, and
@@ -779,6 +795,7 @@ script and as `app.server` under test. Pyflakes was clean throughout.
 | R7 | Team exhaustion | broken demo | sleep rotation; cut Tier 2 without regret |
 | **R9** | **Edge ingestion is a demo scaffold that could be mistaken for production architecture** | A judge reads it as a gap rather than a constraint-driven choice | Disclose it proactively alongside the Free Edition egress restriction, and pair it with the production path (scheduled job + Auto Loader under a workspace with egress). §12.4 |
 | **R10** | **Free Edition quota overrun shuts compute down for the rest of the day** (data survives) | Platform work or the live demo stops mid-flight | Keep jobs tiny and short-lived; heavy polling stays on the laptop; never depend on platform compute during the live demo |
+| **R11** | A source's diet tag contradicts its declared allergens (observed: vegan + Eggs) | The UI presents a recommendation that visibly disproves its own constraint | Preserve the raw row, reject provable diet/allergen contradictions in both Python and UC SQL, and display the selected row's source fields. |
 
 ---
 
@@ -804,7 +821,7 @@ script and as `app.server` under test. Pyflakes was clean throughout.
 | Time | Content |
 |---|---|
 | 0:00–0:30 | The problem, with a measured number. "Answering this takes four apps and six minutes." |
-| 0:30–2:30 | **Live.** A judge asks a real question. Show the itinerary. Then hit **simulate delay** → the agent re-plans, and states *why*. This is the moment they remember. |
+| 0:30–2:30 | **Live.** A judge asks a real question. Show the itinerary. Then choose **"Same trip, but I want the bus"** → the captured vehicle state invalidates Plan A, and the planner states *why*. This is the moment they remember. |
 | 2:30–3:15 | Databricks, 20 seconds of lineage: UC → medallion → MLflow → Agent Framework → Lakebase. Then the governance sentence (§11.1). |
 | 3:15–4:00 | 180-day roadmap, shadow mode first. Value case. |
 
@@ -814,11 +831,11 @@ script and as `app.server` under test. Pyflakes was clean throughout.
 |---|---|
 | "How is this different from Google Maps or the dining app?" | We're not a map or a menu — we're the orchestration layer across systems, and we re-plan rather than inform. |
 | "Where's the Deloitte part?" | Strategy framing: baseline, value case, phased roadmap, governance. §14, §2.3. |
-| "Is this real data?" | Yes for BT GTFS, BT live buses, menus, nutrition, hours, weather. **One honestly-labelled exception:** the delay-injection demo control. Events is scraped HTML. |
+| "Is this real data?" | Yes: BT GTFS, a BT vehicle snapshot captured live, and VT menus, nutrition, allergens, and hours. Offline mode replays that snapshot; weather and events are roadmap integrations, not current demo claims. |
 | "What if the bus API breaks?" | We degrade to schedule-only and label it in the UI. §8.3. |
 | "How do you handle student privacy?" | No academic records enter the lakehouse; Unity Catalog enforcement. §11. |
-| "Why an LLM at all — why not just a script?" | Because the questions are open-vocabulary and multi-constraint. The LLM does the fuzzy part; the tools do the exact part. §4.3. |
-| "What's the model predicting?" | Bus lateness, trained on data our own pipeline generated overnight. §9. |
+| "Why an LLM at all — why not just a script?" | The offline demo uses a bounded parser today. The agent layer is for open-vocabulary clarification and tool choice; deterministic tools still own every exact fact. §4.3. |
+| "What's the model predicting?" | Nothing yet: the current re-plan uses observed schedule deviation directly. Bus-lateness prediction stays gated until the poller has at least 2,000 labelled rows. §9.3. |
 
 ---
 
@@ -841,5 +858,8 @@ script and as `app.server` under test. Pyflakes was clean throughout.
 |---|---|
 | v1.0 | Initial SDD. Records live verification of D1–D10 (2026-09-19), documents the corrected D2 ⚠️→✅ keystone join, corrects D2 dining location number, records the absence of `calendar.txt` and of a public GTFS-RT feed, and **replaces the unverifiable dining-wait ML target with bus lateness**. |
 | v1.1 | **Corrects a false "verified" claim in §5.2.** The stop-1600 departure times were computed without service-date filtering and were therefore another day's trips. True 2026-09-19 departures recorded; the no-`calendar.txt` trap restated as "wrong day's trips", which is worse than "no trips". Caught by worker `hokieday-build1`, verified independently by the integrator. |
-| v1.2 | **Two more numeric errors corrected, both caught by worker `hokieday-build3` and confirmed by the integrator with live API calls.** (1) The nutrition "529.6 kcal" was the **3-item** query (with bacon) mispaired with the **2-item** items string; the fixture's true value is **479.616**. (2) The "240 nut-safe" count came from a spike condition that silently excluded the 188 items with blank allergen fields; the honest figure is **428 of 470**. This surfaced a real safety risk — blank allergen data must never be read as allergen-free (**R8**). || v1.3 | **R8 corrected to a three-way policy, and the implementation brought in line with it.** Two findings, both from checking a source rather than trusting reasoning: (a) the *code* treated a blank allergen field as **safe**, passing all 188 blank items — the dangerous direction, contradicting R8's own text; (b) dining.vt.edu documents D2's **Viridian** kitchen as free from the top nine allergens with separate preparation space, and **all 48 Viridian items have a blank field**. The first fix (exclude all blanks) would have hidden the safest food on the menu; the shipped rule excludes the 140 genuinely-unknown items and preserves the 48 documented ones. Also records the UC-function layer (§12.5) and the platform limits found by running it. |
+| v1.2 | **Two more numeric errors corrected, both caught by worker `hokieday-build3` and confirmed by the integrator with live API calls.** (1) The nutrition "529.6 kcal" was the **3-item** query (with bacon) mispaired with the **2-item** items string; the fixture's true value is **479.616**. (2) The "240 nut-safe" count came from a spike condition that silently excluded the 188 items with blank allergen fields; the honest figure is **428 of 470**. This surfaced a real safety risk — blank allergen data must never be read as allergen-free (**R8**). |
+| v1.3 | **R8 corrected to a three-way policy, and the implementation brought in line with it.** Two findings, both from checking a source rather than trusting reasoning: (a) the *code* treated a blank allergen field as **safe**, passing all 188 blank items — the dangerous direction, contradicting R8's own text; (b) dining.vt.edu documents D2's **Viridian** kitchen as free from the top nine allergens with separate preparation space, and **all 48 Viridian items have a blank field**. The first fix (exclude all blanks) would have hidden the safest food on the menu; the shipped rule excludes the 140 genuinely-unknown items and preserves the 48 documented ones. Also records the UC-function layer (§12.5) and the platform limits found by running it. |
 | v1.4 | **Form factor and origin.** The UI is now mobile-first (§10) — a campus-life agent is a phone product — and the plan's origin can come from the **device position** (§12.6), so distances are measured from where the student actually is. Records the secure-context limit on geolocation, the Wi-Fi-geolocation rejection guard, and the origin picker fallback. Mobile-first also changes the pitch framing, not just the CSS. |
+| v1.5 | **Trustworthy student journey.** Recommendation/re-plan now precedes the map; time/place copy is human-readable; route changes preserve the active request; diet/allergen evidence is visible; contradictory source rows are excluded; navigation follows each itinerary leg instead of skipping the meal; the 1:25 PM ambiguity is surfaced. The demo and Q&A now describe the real captured-snapshot re-plan and explicitly state that no delay model is trained yet. |
+| v1.6 | **Official GIS correction.** VT GIS disproved the spike's Burruss label: `(37.22957, -80.41394)` is near GTFS stop 1600 but is not Burruss Hall. Burruss is approximately `(37.22925, -80.42396)`. Static place coordinates are no longer presented as verified pending the dedicated GIS calibration/routing integration. |

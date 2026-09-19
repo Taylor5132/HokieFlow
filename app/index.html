@@ -10,7 +10,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/icon.svg">
-<title>HokieDay</title>
+<title>HokieFlow</title>
 <style>
 :root{
   --bg:#0f1115; --card:#181b22; --card2:#1f232c; --ink:#e9edf3; --dim:#98a2b3;
@@ -66,7 +66,7 @@ h1 span{color:var(--accent)}
 .plan{border-radius:16px;padding:13px 14px;margin:0 0 12px;border:1px solid var(--line);
       background:var(--card)}
 .plan.chosen{border-color:#2f6b3c;background:#141a16}
-.plan.invalid{opacity:.72;border-style:dashed}
+.plan.invalid{border-style:dashed;background:#17191f}
 .plan .title{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .plan .badge{font-size:11px;padding:3px 8px;border-radius:999px;border:1px solid var(--line);
              color:var(--dim)}
@@ -103,8 +103,10 @@ h1 span{color:var(--accent)}
 .scen button{flex:0 0 auto;font:15px/1.2 inherit;min-height:40px;padding:9px 13px;
              border-radius:999px;border:1px solid var(--line);background:var(--card2);
              color:var(--ink);white-space:nowrap}
-.scen button.hot{border-color:var(--maroon);background:#2a1620}
+.scen button.featured{border-color:var(--maroon);background:#2a1620}
+.scen button.active{border-color:var(--accent);background:#352214;box-shadow:inset 0 0 0 1px var(--accent)}
 .scen button:active{transform:scale(.98)}
+.scen button:disabled,.send:disabled{opacity:.55;cursor:wait}
 .inputrow{display:flex;gap:8px}
 input[type=text]{
   flex:1;min-width:0;font:16px inherit;   /* 16px: anything smaller makes iOS zoom on focus */
@@ -115,15 +117,16 @@ input[type=text]:focus{outline:none;border-color:var(--accent)}
       background:#2a1620;color:var(--ink);font:16px inherit;font-weight:600}
 .send:active{transform:scale(.98)}
 
-/* location row: thumb-reachable, with a fallback when GPS is unavailable */
-.locrow{display:flex;gap:8px;align-items:center;padding-top:8px}
-.locbtn{min-height:40px;padding:0 13px;border-radius:999px;border:1px solid var(--line);
+/* route context: thumb-reachable, with a fallback when GPS is unavailable */
+.locrow{display:grid;grid-template-columns:auto minmax(0,1fr) minmax(0,1fr);
+        gap:8px;align-items:center;padding-top:8px}
+.locbtn{min-height:40px;padding:0 12px;border-radius:999px;border:1px solid var(--line);
         background:var(--card2);color:var(--ink);font:14px inherit;white-space:nowrap}
 .locbtn.on{border-color:var(--ok);color:var(--ok)}
 .locbtn.warn{border-color:var(--warn);color:var(--warn)}
-.locrow select{flex:1;min-width:0;min-height:40px;font:14px inherit;border-radius:999px;
-        border:1px solid var(--line);background:var(--card2);color:var(--ink);padding:0 10px}
-.origin-note{font-size:12.5px;color:var(--warn);margin-top:6px}
+.locrow select{width:100%;min-width:0;min-height:40px;font:14px inherit;border-radius:999px;
+        border:1px solid var(--line);background:var(--card2);color:var(--ink);padding:0 9px}
+.origin-note,.interpretation-note{font-size:12.5px;color:var(--warn);margin-top:7px}
 
 /* map: an inline SVG drawn from OUR GTFS geometry, so it works offline */
 .mapwrap{background:#12151b;border:1px solid var(--line);border-radius:16px;
@@ -136,19 +139,22 @@ input[type=text]:focus{outline:none;border-color:var(--accent)}
 .maplink:active{transform:scale(.98)}
 
 details{margin-top:4px}
-summary{color:var(--dim);font-size:13px;cursor:pointer;list-style:none;padding:6px 0}
+summary{color:var(--dim);font-size:13px;cursor:pointer;list-style:none;padding:8px 0}
 summary::-webkit-details-marker{display:none}
-summary::before{content:" "}
-details[open] summary::before{content:" "}
+summary::before{content:"▸ ";color:var(--accent)}
+details[open] summary::before{content:"▾ "}
 .notes{color:var(--dim);font-size:12.5px;padding:2px 0 10px}
 .notes code{background:var(--card2);padding:1px 5px;border-radius:5px;font-size:12px}
 .err{color:#ff7b72}
 .muted{color:var(--dim);font-size:13px}
+button:focus-visible,a:focus-visible,select:focus-visible,input:focus-visible,summary:focus-visible{
+  outline:2px solid var(--accent);outline-offset:2px}
 
 /* ---------- wider screens: laptop demo ---------- */
 @media (min-width:760px){
   .shell{max-width:1000px;padding-top:28px}
   .plans{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:start}
+  .mapwrap svg{height:320px;width:100%}
   body{padding-bottom:188px}
   .ask .inner{max-width:1000px}
 }
@@ -159,11 +165,11 @@ details[open] summary::before{content:" "}
 <body>
 <div class="shell">
   <header>
-    <h1>Hokie<span>Day</span></h1>
+    <h1>Hokie<span>Flow</span></h1>
     <div class="tag">One question across dining, transit and hours — and it re-plans when reality moves.</div>
     <div class="chips" id="chips"></div>
   </header>
-  <main id="out"></main>
+  <main id="out" aria-live="polite" aria-busy="false"></main>
   <details id="notes">
     <summary>assumptions, provenance and limits</summary>
     <div class="notes" id="notesBody"></div>
@@ -175,34 +181,111 @@ details[open] summary::before{content:" "}
     <div class="scen" id="scen"></div>
     <div class="inputrow">
       <input type="text" id="q" inputmode="text" enterkeyhint="send"
-             placeholder="Ask in your own words…">
-      <button class="send" onclick="ask()">Ask</button>
+             aria-label="Ask HokieFlow" placeholder="Ask in your own words…">
+      <button type="button" class="send" onclick="ask()">Ask</button>
     </div>
     <div class="locrow">
-      <button class="locbtn" id="locbtn" onclick="useLocation()">📍 Use my location</button>
+      <button type="button" class="locbtn" id="locbtn" onclick="useLocation()"
+              aria-label="Use my device location">📍 Locate</button>
       <select id="from" aria-label="starting point"></select>
+      <select id="to" aria-label="destination"></select>
     </div>
   </div>
 </div>
 
 <script>
 const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const ICON = {walk:"🚶", bus:"🚌", eat:"🍽️"};
-const hhmm = s => (s || "").slice(11,16);
+const CAUSE = {bus_early:"bus arrived early", bus_late:"bus delay", bus_full:"bus is full",
+               dining_closing:"dining is closing"};
+const clock = value => {
+  const m = String(value || "").match(/(?:T|^)(\d{1,2}):(\d{2})/);
+  if(!m) return String(value || "");
+  const h = Number(m[1]);
+  return `${h % 12 || 12}:${m[2]} ${h < 12 ? "AM" : "PM"}`;
+};
+const whole = value => value == null ? "—" : String(Math.round(Number(value)));
 
-// Device position (when the browser will give one) and the fallback origin.
-// Geolocation requires a SECURE CONTEXT: it works on localhost and over HTTPS,
-// but NOT over plain-HTTP LAN, which is why the picker exists as a fallback.
-let ORIGIN = null;              // {lat, lon, accuracy}
+// Device position and route context. Geolocation needs localhost or HTTPS;
+// the place picker is the deliberate plain-HTTP fallback.
+let ORIGIN = null;
 let FROM_PLACE = "auto";
+let TO_OVERRIDE = null;       // null lets a free-text "to Hahn" survive parsing
+let APP_STATUS = {};
+let LAST_QUERY = {scenario_id:"eat"};
+let REQUEST_SEQ = 0;
+// Campus clock: the SERVER is the authority. The browser only advances the last
+// synced server instant by locally elapsed time, and only in live mode.
+let TIME_STATE = null;        // last /api/time payload
+let TIME_BASE_MS = 0;         // server epoch ms at last sync
+let TIME_SYNC_AT = 0;         // client epoch ms at last sync
+let TIME_TICK = null;         // 1s ticker (live mode only)
+let TIME_RESYNC = null;       // 30s re-sync ticker (lightweight /api/time)
+
+function setBusy(busy){
+  $("#out").setAttribute("aria-busy", String(busy));
+  $$(".scen button,.send").forEach(el => { el.disabled = busy; });
+}
+
+function setActiveScenario(id){
+  $$(".scen button").forEach(b => b.classList.toggle("active", b.dataset.scenario === id));
+}
+
+// ---- campus time chip -----------------------------------------------------
+// Synchronized from GET /api/time. Ticks locally each second ONLY in live mode;
+// in replay mode it stays visibly paused and pinned to the snapshot instant.
+// Re-syncs every 30s from /api/time, never from the heavy /api/status.
+const campusClock = () => new Intl.DateTimeFormat("en-US", {
+  timeZone: TIME_STATE.timezone, hour:"numeric", minute:"2-digit",
+  second:"2-digit", hour12:true});
+
+function renderTimeChip(){
+  const el = document.getElementById("timechip");
+  if(!el || !TIME_STATE) return;
+  if(TIME_STATE.is_replay){
+    el.className = "chip";
+    el.title = `replay pinned to ${TIME_STATE.evaluated_at} (${TIME_STATE.timezone})`;
+    el.textContent = `\u23f8 pinned ${TIME_STATE.human} \u00b7 replay`;
+    return;
+  }
+  const ms = TIME_BASE_MS + (Date.now() - TIME_SYNC_AT);
+  el.className = "chip ok";
+  el.title = `synced ${new Date(TIME_SYNC_AT).toLocaleTimeString()} · ${TIME_STATE.timezone}`;
+  el.textContent = `● ${campusClock().format(new Date(ms))}`;
+}
+
+function applyTime(t){
+  if(!t || !t.iso) return;
+  TIME_STATE = t;
+  TIME_BASE_MS = Date.parse(t.iso);
+  TIME_SYNC_AT = Date.now();
+  renderTimeChip();
+  if(t.is_replay){
+    if(TIME_TICK){ clearInterval(TIME_TICK); TIME_TICK = null; }
+  }else if(!TIME_TICK){
+    TIME_TICK = setInterval(renderTimeChip, 1000);
+  }
+}
+
+async function syncTime(){
+  try{
+    applyTime(await (await fetch("/api/time")).json());
+  }catch(e){ /* keep the last known server clock; never fabricate one */ }
+}
+
+function startTimeSync(){
+  syncTime();
+  if(!TIME_RESYNC) TIME_RESYNC = setInterval(syncTime, 30000);
+}
 
 function useLocation(){
   const b = $("#locbtn");
-  if(!navigator.geolocation){ b.className = "locbtn warn"; b.textContent = "no geolocation here"; return; }
+  if(!navigator.geolocation){ b.className = "locbtn warn"; b.textContent = "no location"; return; }
   if(!window.isSecureContext){
     b.className = "locbtn warn";
-    b.textContent = "📍 needs https or localhost";
+    b.textContent = "📍 needs HTTPS";
     return;
   }
   b.className = "locbtn"; b.textContent = "locating…";
@@ -211,139 +294,235 @@ function useLocation(){
       ORIGIN = {lat:p.coords.latitude, lon:p.coords.longitude, accuracy:p.coords.accuracy};
       b.className = "locbtn on";
       b.textContent = "📍 ±" + Math.round(p.coords.accuracy) + " m";
-      ask();
+      ask(null, true);
     },
     err => {
       b.className = "locbtn warn";
-      b.textContent = "📍 " + (err.code === 1 ? "permission denied"
-                                             : (err.message || "unavailable"));
+      b.textContent = "📍 " + (err.code === 1 ? "denied" : "unavailable");
     },
     {enableHighAccuracy:true, timeout:8000, maximumAge:30000}
   );
 }
 
 function provenance(l){
-  if(l.type === "bus")  return '<div class="ptag sched">scheduled · service-filtered</div>';
-  if(l.type === "walk") return '<div class="ptag est">estimated · straight-line × factor</div>';
-  if(l.type === "eat"){
-    let t = '<div class="ptag sched">from the menu API</div>';
-    if(l.allergens_known === false && l.venue_allergen_free)
-      t += '<div class="ptag safe">documented allergen-free kitchen</div>';
-    else if(l.allergens_known === false)
-      t += '<div class="ptag est">allergens UNKNOWN</div>';
-    return t;
-  }
-  return "";
+  if(l.type === "bus")
+    return `<div class="ptag sched">${l.is_realtime ? "live vehicle" : "scheduled · service-filtered"}</div>`;
+  if(l.type === "walk")
+    return '<div class="ptag est">estimated · straight-line × factor</div>';
+  if(l.type !== "eat") return "";
+
+  let t = '<div class="ptag sched">VT menu API</div>';
+  if(l.requested_diet)
+    t += `<div class="ptag safe">VT menu tag: ${esc(l.requested_diet)}</div>`;
+  if((l.avoid || []).length)
+    t += `<div class="ptag safe">hard filter: excludes ${esc(l.avoid.join(", "))}</div>`;
+  if(l.allergens_known && (l.allergens || []).length)
+    t += `<div class="ptag">allergens listed: ${esc(l.allergens.join(", "))}</div>`;
+  else if(l.allergens_known === false && l.venue_allergen_free)
+    t += '<div class="ptag safe">documented allergen-free kitchen</div>';
+  else if(l.allergens_known === false)
+    t += '<div class="ptag est">allergens UNKNOWN</div>';
+  return t;
 }
 
 function leg(l){
-  const what = l.place
-    ? `${esc(l.place)}${l.item ? ` — <b>${esc(l.item)}</b>` : ""}`
-    : `${esc(l.from)} → ${esc(l.to)}`;
-  const sub = l.type === "bus"
-      ? `route ${esc(l.route_id)} · wait ${esc(l.wait_min)} min`
-      : (l.item && l.kcal != null ? `${esc(l.kcal)} kcal` : "");
+  let what;
+  if(l.type === "bus"){
+    what = `<b>Route ${esc(l.route_id)}</b>: ${esc(l.from_stop_name || l.from)} → ${esc(l.to_stop_name || l.to)}`;
+  }else if(l.place){
+    what = `${esc(l.place)}${l.item ? ` — <b>${esc(l.item)}</b>` : ""}`;
+  }else{
+    what = `${esc(l.from)} → ${esc(l.to)}`;
+  }
+
+  const bits = [];
+  if(l.type === "bus"){
+    if(l.dep_time) bits.push(`departs ${clock(l.dep_time)}`);
+    if(l.wait_min != null) bits.push(`${whole(l.wait_min)} min wait`);
+    if(l.ride_min != null) bits.push(`${whole(l.ride_min)} min ride`);
+  }else if(l.type === "eat"){
+    if(l.kcal != null) bits.push(`${whole(l.kcal)} kcal`);
+    if(l.protein_g != null) bits.push(`${whole(l.protein_g)} g protein`);
+    if(l.portion) bits.push(String(l.portion));
+  }
   return `<div class="leg">
-    <div class="ic">${ICON[l.type] || "•"}</div>
-    <div><div class="what">${what}</div>${sub ? `<div class="sub">${sub}</div>` : ""}${provenance(l)}</div>
-    <div class="mins">${esc(l.minutes)} min</div>
+    <div class="ic" aria-hidden="true">${ICON[l.type] || "•"}</div>
+    <div><div class="what">${what}</div>${bits.length ? `<div class="sub">${bits.map(esc).join(" · ")}</div>` : ""}${provenance(l)}</div>
+    <div class="mins">${whole(l.minutes)} min</div>
   </div>`;
 }
 
 function plan(it, title, state){
   if(!it) return "";
+  const timing = it.arrives_in_window
+      ? `${whole(it.slack_min)} min to spare`
+      : `${whole(Math.abs(it.slack_min))} min late`;
   return `<section class="plan ${state}">
     <div class="title"><span class="k" style="margin:0">${esc(title)}</span>
       <span class="badge">${it.used_bus ? "bus" : "walk"}</span></div>
-    <div class="times">${hhmm(it.leave_time)} → ${hhmm(it.arrive_time)}
-      <small>${esc(it.total_min)} min · slack ${esc(it.slack_min)} min${
-        it.arrives_in_window ? "" : " · MISSES THE WINDOW"}</small></div>
+    <div class="times">${clock(it.leave_time)} → ${clock(it.arrive_time)}
+      <small>${whole(it.total_min)} min total · ${timing} · deadline ${clock(it.window_end)}</small></div>
     ${(it.legs||[]).map(leg).join("")}
   </section>`;
 }
 
+function infeasibleCopy(r){
+  const ir = r.infeasible_reason || {};
+  if(ir.code === "unknown_place"){
+    const which = ir.field === "from_place" ? "starting place" : "destination";
+    const known = (ir.known_places || []).join(", ");
+    return `I don't know that ${which}${ir.value ? ` (${ir.value})` : ""}. ` +
+           (known ? `Known places: ${known}. ` : "") +
+           "Pick one of those and I'll plan it.";
+  }
+  if(ir.code === "deadline_missed")
+    return "No plan makes that deadline \u2014 the closest option arrives about " +
+           `${whole(ir.late_by_min)} min late. Move the deadline later or drop the meal.`;
+  if(ir.code === "no_legs" || ir.code === "no_route")
+    return "I couldn't build a usable route between those places. " +
+           "Check the starting point and destination.";
+  return r.rationale || "No feasible plan for that request.";
+}
+
 function render(r){
-  if(r.error){ $("#out").innerHTML = `<div class="card err">Error: ${esc(r.error)}</div>`; return; }
+  if(r.error){
+    $("#out").innerHTML = `<div class="card err"><div class="k">I need a correction</div>${esc(r.rationale || r.error)}</div>`;
+    return;
+  }
+  if(r.clarification){
+    const cl = r.clarification;
+    $("#out").innerHTML = `<div class="card">
+      <div class="k">I need one detail</div>
+      <div>${esc(cl.question || r.rationale || "")}</div>
+      <div class="muted" style="margin-top:8px">${esc(cl.detail || "")}</div>
+    </div>`;
+    return;
+  }
+  const infeasible = r.feasible === false;
+  if(infeasible && !r.itinerary){
+    // No usable plan at all (e.g. unknown place). Say so plainly and give the
+    // corrective action; never render an empty plan as if it worked.
+    $("#out").innerHTML = `<div class="card err"><div class="k">No plan fits</div>
+      <div class="answer">${esc(infeasibleCopy(r))}</div>
+      ${r.rationale ? `<div class="muted" style="margin-top:8px">${esc(r.rationale)}</div>` : ""}
+    </div>`;
+    return;
+  }
   const it = r.itinerary, trg = r.replan_trigger;
-  const og = r._origin || {};
+  const og = r._origin || {}, req = r._request || {}, c = r.constraints || {};
   const where = og.source === "device"
       ? `from your location${og.accuracy_m ? " ±" + Math.round(og.accuracy_m) + " m" : ""}`
-      : (og.label ? `from ${og.label}` : "from the default origin");
-  let h = "";
-
-  h += `<div class="card"><div class="k">answer</div>
-     <div class="answer">${esc(r.rationale)}</div>
+      : `from ${og.label || c.from_place || "Burruss Hall"}`;
+  const answerTiming = it.arrives_in_window
+      ? `with ${whole(it.slack_min)} min to spare`
+      : `${whole(Math.abs(it.slack_min))} min after your deadline`;
+  const answer = infeasible
+      ? infeasibleCopy(r)
+      : (trg
+        ? `Take Plan B and reach ${c.to_place || "your destination"} at ${clock(it.arrive_time)}, ${answerTiming}.`
+        : r.rationale);
+  const destinationPicker = $("#to");
+  if(destinationPicker && [...destinationPicker.options].some(o => o.value === c.to_place))
+    destinationPicker.value = c.to_place;
+  let h = `<div class="card"><div class="k">answer</div>
+     <div class="answer">${esc(answer)}</div>
      <div class="pill-row">
        <span class="metric">${esc(where)}</span>
-       <span class="metric">profile ${esc(r.student_ref)}</span>
-       <span class="metric">${esc((r._request||{}).start)}–${esc((r._request||{}).end)}</span>
+       <span class="metric">to ${esc(c.to_place || "McBryde Hall")}</span>
+       <span class="metric">deadline ${clock(req.end)}</span>
+       ${c.diet ? `<span class="metric">${esc(c.diet)}</span>` : ""}
+       ${(c.avoid||[]).length ? `<span class="metric">avoids ${esc(c.avoid.join(", "))}</span>` : ""}
      </div>
-     ${og.note ? `<div class="origin-note">⚠ ${esc(og.note)}</div>` : ""}</div>`;
+     ${og.note ? `<div class="origin-note">⚠ ${esc(og.note)}</div>` : ""}
+     ${(r._interpretation_notes||[]).map(n => `<div class="interpretation-note">↳ ${esc(n)}</div>`).join("")}
+     </div>`;
 
   const planA = (r.alternatives||[]).find(a => a.type === "previous_itinerary_a");
+  if(trg){
+    const evidence = APP_STATUS.offline
+      ? "The vehicle snapshot was captured live and is replayed here so the demo works offline."
+      : "The live vehicle state was checked again after Plan A was built.";
+    h += `<div class="banner">
+      <div class="head"><span class="dot" aria-hidden="true"></span>RE-PLANNED — ${esc(CAUSE[trg.cause] || trg.cause)}</div>
+      <div class="why">${esc(trg.detail)}</div>
+      <div class="foot">${evidence} Plan A remains visible so the change is inspectable.</div>
+    </div>`;
+  }
+
+  // Action before decoration: on a phone the recommendation must precede the map.
+  h += `<div class="plans">
+      ${plan(it, planA ? "PLAN B — recommended" : "RECOMMENDED PLAN", "chosen")}
+      ${planA ? plan(planA.itinerary, "PLAN A — invalidated", "invalid") : ""}
+    </div>`;
 
   if(r._map_svg){
-    h += `<div class="mapwrap">${r._map_svg}</div>`;
-  } else if(r._map_error){
-    h += `<div class="card err">map unavailable: ${esc(r._map_error)}</div>`;
+    h += `<div class="k" style="margin:2px 2px 6px">route overview</div><div class="mapwrap">${r._map_svg}</div>`;
+  }else if(r._map_error){
+    h += `<div class="card err">Map unavailable; the plan above still works.</div>`;
   }
-
-  if(trg){
-    h += `<div class="banner">
-      <div class="head"><span class="dot"></span>RE-PLANNED — ${esc(trg.cause)}</div>
-      <div class="why">${esc(trg.detail)}</div>
-      <div class="foot">Plan A was built, then live state was re-checked and invalidated it.
-        Both plans are below so the change is inspectable, not asserted.</div>
-    </div>`;
-  }
-
-  h += `<div class="plans">
-      ${planA ? plan(planA.itinerary, "PLAN A — invalidated", "invalid") : ""}
-      ${plan(it, planA ? "PLAN B — what we recommend" : "PLAN", "chosen")}
-    </div>`;
 
   const walk = (r.alternatives||[]).find(a => a.type === "walk_direct");
   if(walk){
+    const hasMeal = (it.legs||[]).some(l => l.type === "eat");
     h += `<div class="card"><div class="k">alternative</div>
-      <div>Walk the whole way: <b>${esc(walk.minutes)} min</b>
-        <span class="muted">(${esc(walk.meters)} m straight-line)</span></div></div>`;
+      <div>${hasMeal ? "Direct walk if you skip the meal" : "Walk directly"}: <b>${whole(walk.minutes)} min</b>
+        <span class="muted">(${whole(walk.meters)} m path estimate)</span></div></div>`;
   }
 
   if((r._links||[]).length){
-    h += `<div class="card"><div class="k">navigate it</div>
-      <div class="links">` +
+    h += `<div class="card"><div class="k">navigate each leg</div><div class="links">` +
       r._links.map(l => `<a class="maplink" href="${esc(l.url)}" target="_blank"
-         rel="noopener">${esc(l.label)} · ${esc(l.app)}</a>`).join("") +
-      `</div><div class="muted" style="margin-top:10px">Opens your maps app for
-        turn-by-turn. We plan the trip; the maps app navigates it. No API key needed.</div></div>`;
+         rel="noopener">${esc(l.app)} — ${esc(l.label)}</a>`).join("") +
+      `</div><div class="muted" style="margin-top:10px">Each link matches one leg above, including the dining stop. Your maps app supplies turn-by-turn navigation.</div></div>`;
   }
   $("#out").innerHTML = h;
 }
 
-async function ask(id){
-  const body = id ? {scenario_id:id} : {text:$("#q").value};
-  body.from_place = FROM_PLACE;
-  if(ORIGIN){ body.lat = ORIGIN.lat; body.lon = ORIGIN.lon; body.accuracy = ORIGIN.accuracy; }
+async function ask(id=null, repeat=false){
+  let query;
+  if(repeat){
+    query = {...LAST_QUERY};
+  }else if(id){
+    query = {scenario_id:id};
+  }else{
+    const text = $("#q").value.trim();
+    if(!text){ $("#q").focus(); return; }
+    query = {text};
+  }
+  LAST_QUERY = {...query};
+  setActiveScenario(query.scenario_id || null);
+
+  const body = {...query, from_place:FROM_PLACE};
+  if(TO_OVERRIDE) body.to_place = TO_OVERRIDE;
+  if(ORIGIN) Object.assign(body, {lat:ORIGIN.lat, lon:ORIGIN.lon, accuracy:ORIGIN.accuracy});
   if(id) $("#q").value = "";
-  $("#out").innerHTML = '<div class="card muted">planning…</div>';
+
+  const seq = ++REQUEST_SEQ;
+  setBusy(true);
+  $("#out").innerHTML = '<div class="card muted">Checking dining, transit, and the latest vehicle snapshot…</div>';
   try{
     const res = await fetch("/api/ask", {method:"POST",
       headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
-    render(await res.json());
-    $("#out").scrollIntoView({block:"start", behavior:"smooth"});
+    const payload = await res.json();
+    if(seq !== REQUEST_SEQ) return;
+    render(payload);
+    $(".shell").scrollIntoView({block:"start", behavior:"smooth"});
   }catch(e){
-    $("#out").innerHTML = `<div class="card err">request failed: ${esc(e)}</div>`;
+    if(seq === REQUEST_SEQ)
+      $("#out").innerHTML = `<div class="card err">Request failed. The offline data is still available; please try again.</div>`;
+  }finally{
+    if(seq === REQUEST_SEQ) setBusy(false);
   }
 }
 
 async function boot(){
   try{
-    const s = await (await fetch("/api/status")).json();
+    APP_STATUS = await (await fetch("/api/status")).json();
+    const s = APP_STATUS;
     $("#chips").innerHTML =
-      `<span class="chip ${s.offline?"ok":""}">${s.offline?"OFFLINE · frozen snapshot":"MODE "+s.mode}</span>
-       <span class="chip">now ${esc(s.campus_now)}</span>
-       <span class="chip">${esc(s.live_vehicles)} live buses</span>
-       <span class="chip ${s.live_stale?"warn":""}">${esc(s.fixtures)} fixtures</span>`;
+      `<span class="chip ${s.offline?"ok":""}">${s.offline?"OFFLINE REPLAY":"LIVE MODE"}</span>
+       <span class="chip" id="timechip">clock…</span>
+       <span class="chip ${s.live_stale?"warn":""}">${s.live_stale?"STALE · ":""}${esc(s.live_vehicles)} vehicle observations</span>`;
     $("#notesBody").innerHTML =
       s.caveats.map(c => "• " + esc(c)).join("<br>") +
       `<div style="margin-top:10px">assumed constants: eat ${esc(s.assumptions.eat_minutes)} min ·
@@ -352,31 +531,45 @@ async function boot(){
         bus "full" at ${esc(s.assumptions.bus_full_pct)}%</div>
        <div style="margin-top:8px">meal choice: ${esc(s.assumptions.meal_ranking)}
         — a demo convenience, not dietary advice.</div>
-       <div style="margin-top:8px">The map is drawn from the GTFS shape geometry we ingested — no basemap, no
-        tiles, no API key, and it renders with networking off. Dashed lines are straight-line walk
-        estimates, because that is what our walk model actually computes.</div>
-       <div style="margin-top:8px">The text box uses a small rule-based parser offline; with a
-        Databricks workspace the text→parameters step is the agent's job, calling these same
-        tools as governed Unity Catalog functions.</div>`;
-
-    const sc = await (await fetch("/api/scenarios")).json();
-    $("#scen").innerHTML = sc.map((x,i) =>
-      `<button class="${i===1?"hot":""}" onclick="ask('${esc(x.id)}')">${esc(x.label)}</button>`).join("");
-
-    try{
-      const os = await (await fetch("/api/origins")).json();
-      const sel = $("#from");
-      sel.innerHTML = '<option value="auto">default origin</option>' +
-        os.map(o => `<option value="${esc(o.key)}">${esc(o.key)}${o.verified ? " ✓" : ""}</option>`).join("");
-      sel.onchange = () => { FROM_PLACE = sel.value; ORIGIN = null;
-        $("#locbtn").className = "locbtn"; $("#locbtn").textContent = "📍 Use my location"; ask(); };
-    }catch(e){ /* picker is optional */ }
+       <div style="margin-top:8px">The map uses our GTFS geometry and works offline. Dashed walk lines are straight-line estimates, not routed paths.</div>
+       <div style="margin-top:8px">The text box uses a bounded rule parser offline. In a Databricks workspace, the agent maps language to these same governed tools.</div>`;
   }catch(e){
-    $("#chips").innerHTML = `<span class="chip warn">status unavailable</span>`;
+    $("#chips").innerHTML = `<span class="chip warn" id="timechip">status unavailable</span>`;
   }
-  ask("eat");
+
+  // The clock chip is independent of /api/status and always syncs.
+  startTimeSync();
+
+  let scenarios = [];
+  try{
+    scenarios = await (await fetch("/api/scenarios")).json();
+    $("#scen").innerHTML = scenarios.map((x,i) =>
+      `<button type="button" data-scenario="${esc(x.id)}" class="${i===1?"featured":""}"
+         onclick="ask('${esc(x.id)}')">${esc(x.label)}</button>`).join("");
+  }catch(e){ /* presets are optional */ }
+
+  try{
+    const places = await (await fetch("/api/origins")).json();
+    const options = places.map(o =>
+      `<option value="${esc(o.key)}">${esc(o.key)}${o.verified ? " ✓" : ""}</option>`).join("");
+    $("#from").innerHTML = '<option value="auto">From: Burruss</option>' + options;
+    $("#to").innerHTML = options;
+    $("#to").value = "McBryde Hall";
+    $("#from").onchange = () => {
+      FROM_PLACE = $("#from").value; ORIGIN = null;
+      $("#locbtn").className = "locbtn"; $("#locbtn").textContent = "📍 Locate";
+      ask(null, true);
+    };
+    $("#to").onchange = () => { TO_OVERRIDE = $("#to").value; ask(null, true); };
+  }catch(e){ /* route pickers are optional */ }
+
+  const requested = new URLSearchParams(location.search).get("scenario");
+  const initial = scenarios.some(s => s.id === requested) ? requested : "eat";
+  await ask(initial);
 }
-$("#q").addEventListener("keydown", e => { if(e.key === "Enter") ask(); });
+$("#q").addEventListener("keydown", e => {
+  if(e.key === "Enter"){ e.preventDefault(); ask(); }
+});
 boot();
 </script>
 </body>

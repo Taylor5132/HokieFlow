@@ -1,4 +1,4 @@
-# HokieDay — Locked Data, Stack & Architecture
+# HokieFlow — Locked Data, Stack & Architecture
 
 **Verified live on 2026-09-19 ~11:20 ET.** All endpoints below were actually called and returned usable data.
 Submission deadline: **Sun 2026-09-20 08:00 ET.** Judging 10:30–13:00, 4-minute pitch.
@@ -45,31 +45,38 @@ bus 6411 route UCB  trip 771cf92b stop 1323 sched 11:30:00 -> 8 min early   (loa
 
 ---
 
-## 2. LOCKED TECH STACK
+## 2. TARGET TECH STACK AND SHIPPED STATUS
 
-No options below — decisions made. Change only if blocked.
+This section records the **production target**, not a claim that every box is
+implemented. The shipped demo currently uses edge ingestion, five Unity Catalog
+gold tables, four governed UC functions, deterministic `plan_day`, and a local
+stdlib web app. It does **not** yet ship an LLM tool loop, trained ML model,
+weather/events ingestion, Lakebase state, Genie, or a Databricks App deployment.
 
 | Layer | Decision | Why (say this to judges) |
 |-------|----------|--------------------------|
 | Platform | **Databricks Free Edition** (serverless) unless the VTHacks Discord gives a sponsor workspace + token | Free Edition still includes **Lakebase, Model Serving, Apps**; quotas are the only limiter |
 | Storage | **Delta Lake** in **Unity Catalog**, catalog `hokieday`, schemas `bronze` / `silver` / `gold` | Medallion = the consulting-standard data architecture; lineage is auto-captured for the deck |
-| Ingestion | Python notebooks run as **Databricks Jobs** (15-min realtime job, daily static job). **Append snapshots with `INSERT INTO`**, no Kafka | ⚠️ *Architectural honesty:* you can't cleanly stream an HTTP JSON endpoint into Databricks without a landing zone. Notebook-append is reliable in 20 hours. **Production path (slide it):** write JSON to a **UC Volume** → **Auto Loader** picks it up → Structured Streaming |
+| Ingestion | **Shipped:** laptop edge scripts fetch and upload JSONL because Free Edition blocks required outbound hosts. **Target:** scheduled egress-capable job → UC Volume → Auto Loader / Structured Streaming | Constraint-driven demo scaffold with an explicit production path |
 | Query compute | **Serverless SQL warehouse** | Chat needs sub-second reads, not cluster startup |
-| ML | **scikit-learn** GBM for dining wait-time + arrival correction; **MLflow** tracking & registry; **batch scoring into gold** | Batch scoring is enough for a demo. **Model Serving** as the production path |
-| Agent | **Mosaic AI Agent Framework** (ResponsesAgent ChatAgent) with **Unity Catalog functions as tools** | UC functions = governed, reusable, versioned tools. This is the single most "Databricks-native" choice available |
+| ML | **Not shipped.** Target: small bus-lateness model after ≥2,000 labelled observations, tracked in MLflow and batch-scored into gold | Current demo acts on observed schedule deviation; `predict_bus_delay` returns `basis=no_model` |
+| Agent | **Not shipped.** Target: provider-independent LLM/HokieAI layer selecting governed Unity Catalog tools | Current offline text input is a bounded parser; deterministic tools own all facts and arithmetic |
 | Semantic search | **Vector Search** (Delta-synced index) + Foundation Model API embeddings — **Tier 2 only** | Justified use: "something warm and filling" over dish descriptions. Skip if structured filters suffice |
-| Serving UI | **Databricks Apps** (Streamlit or FastAPI+static) | Sponsor-native, appears in the architecture story |
-| State / OLTP | **Lakebase** (Postgres) for student profile, preferences, chat session state | Textbook Lakebase justification: real writes, not analytics |
-| Staff analytics | **Genie** space over gold tables | Cheap to build (point at tables + sample questions), huge on the slide |
+| Serving UI | **Shipped:** local stdlib HTTP app. **Target:** Databricks App or another HTTPS host | Keep deployment claims separate from the working demo |
+| State / OLTP | **Not shipped.** Target: Lakebase (Postgres) for profile, preferences, and session state | State must live outside the model |
+| Staff analytics | **Not shipped.** Target: Genie over governed gold tables | Roadmap capability only |
 | LLM | Whatever the workspace serves via **Foundation Model APIs** — **do not hardcode a model name** | Portability; also lets you swap to **Gemini via AI Gateway** to double-enter the MLH Gemini track |
-| Demo safety | `cache/*.json` for every external call + `DEMO_MODE=cache` env flag | **Non-negotiable.** Expo = walk-up judging on unknown Wi-Fi |
+| Demo safety | Committed `fixtures/` replay store + `DEMO_MODE=cache`; live `cache/` remains separate and ignored | **Non-negotiable.** Expo = walk-up judging on unknown Wi-Fi |
 
 ---
 
 ## 3. ARCHITECTURE
 
+The diagram below is the **target architecture**. Weather, model scores, the LLM
+agent runtime, Lakebase, Genie, and Databricks App hosting are roadmap boxes.
+
 ```
-                 EXTERNAL SOURCES (all verified live)
+                 EXTERNAL SOURCES (source endpoints verified)
   ┌────────────┬───────────────┬─────────────┬──────────────┬──────────┐
   │ BT GTFS    │ BT live buses │ VT dining   │ VT nutrition │ NWS      │
   │ (static)   │ (15-min job)  │ menu API    │ + hours API  │ weather  │
@@ -79,7 +86,7 @@ No options below — decisions made. Change only if blocked.
   ╔══════════════════════════════════════════════════════════════════════╗
   ║  BRONZE  · raw landing (Unity Catalog Volumes + Delta)               ║
   ║  gtfs_stops · gtfs_trips · gtfs_stop_times · gtfs_shapes             ║
-  ║  bus_pings · menu_items_snapshot · hours_snapshot · weather_raw      ║
+  ║  bus_pings · menu_items_snapshot · hours_snapshot · weather_raw [future] ║
   ╚═══════════════════════════════┬══════════════════════════════════════╝
                                   │  Lakeflow / notebooks
   ╔═══════════════════════════════▼══════════════════════════════════════╗
@@ -93,24 +100,24 @@ No options below — decisions made. Change only if blocked.
   ║  GOLD  · decision-ready                                              ║
   ║  next_departures · bus_reliability · crowding_now                    ║
   ║  eat_options (diet + allergen + macro filters)                       ║
-  ║  wait_forecast (MLflow model) · open_now                             ║
+  ║  delay_model_scores [future; no model today] · open_now              ║
   ╚═══════┬═══════════════════════════════════════════════════┬══════════╝
           │                                                   │
           ▼                                                   ▼
   ╔═══════════════════════════════╗                 ╔═════════════════╗
-  ║ Mosaic AI AGENT               ║                 ║ GENIE (staff)   ║
+  ║ Mosaic AI AGENT [target]      ║                 ║ GENIE [target]  ║
   ║ UC functions as tools:        ║                 ║ NL analytics    ║
   ║  get_next_departures          ║                 ╚═════════════════╝
   ║  get_live_bus (+adherence)    ║
   ║  walk_time                    ║                 ╔═════════════════╗
   ║  find_food (diet/allergen/kcal)║                ║ LAKEBASE        ║
-  ║  get_hours · get_events       ║◀───────────────▶║ profile/prefs   ║
-  ║  predict_dining_wait          ║                 ║ chat state      ║
+  ║  get_hours · get_events(stub) ║◀───────────────▶║ profile/prefs   ║
+  ║  predict_bus_delay(no_model)  ║                 ║ chat state      ║
   ║  plan_day  (orchestrator)     ║                 ╚═════════════════╝
   ╚═══════════┬═══════════════════╝
               ▼
   ╔═══════════════════════════════╗
-  ║ DATABRICKS APP (chat UI)      ║
+  ║ DATABRICKS APP [target]       ║
   ╚═══════════════════════════════╝
 ```
 
@@ -121,7 +128,7 @@ No options below — decisions made. Change only if blocked.
 ```
 get_next_departures(stop_id:str, route:str|None, horizon_min:int=180) -> [{route, dep_time, in_min}]
 get_live_bus(route:str|None) -> [{bus_id, route, lat, lon, load_pct, at_stop, sched_delta_min}]
-walk_time(from_place:str, to_place:str) -> {minutes, meters}          # haversine x1.25 @1.35 m/s
+walk_time(from_place:str, to_place:str) -> {minutes, meters}          # haversine x1.30 @1.35 m/s
 find_food(location_num:str, date:str, diet:str|None, avoid:[str], min_kcal:int|None,
           max_kcal:int|None) -> [{name, section, kcal, protein_g, allergens, diet_tags}]
 get_hours(foodpro_id:str, date:str) -> [{open_time, close_time}]

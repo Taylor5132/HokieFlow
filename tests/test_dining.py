@@ -92,7 +92,7 @@ class TestMenu(unittest.TestCase):
         DEMO_MODE=cache there is no fixture for an ISO dtdate key)."""
         from unittest.mock import patch
         silent_empty = {"locationNum": "15", "date": "", "meals": []}
-        with unittest.mock.patch.object(cache, "get_json", return_value=silent_empty):
+        with patch.object(cache, "get_json", return_value=silent_empty):
             with self.assertRaises(dining.MenuError) as cm:
                 dining.menu(LOC, "2026-09-19")     # ISO: wrong format on purpose
         self.assertIn("MM/DD/YYYY", str(cm.exception))

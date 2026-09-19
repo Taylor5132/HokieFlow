@@ -31,7 +31,6 @@ class GtfsFixtureTests(unittest.TestCase):
 
     def test_no_calendar_txt_needed(self):
         # explicit: only calendar_dates.txt drives service resolution
-        import pathlib
         self.assertFalse((config.GTFS_DIR / "calendar.txt").exists())
 
     # ------------------------------------------------------- service
@@ -50,9 +49,9 @@ class GtfsFixtureTests(unittest.TestCase):
         self.assertTrue(trips.issubset(self.g.trips.keys()))
 
     # ------------------------------------------------------- geometry
-    def test_stop_1600_is_nearest_to_burruss_within_5m(self):
-        # SDD: nearest stop to Burruss Hall (37.22957, -80.41394) is stop
-        # 1600 "Main/Roanoke Sbnd" at ~37 m.
+    def test_stop_1600_is_nearest_to_legacy_spike_point_within_5m(self):
+        # The legacy spike point (37.22957, -80.41394) is near stop 1600,
+        # but official VT GIS proved it is not Burruss Hall (SDD v1.6).
         scored = gtfs.nearest_stops(self.g, 37.22957, -80.41394, k=1)
         dist_m, stop = scored[0]
         self.assertEqual(stop.stop_id, "1600")

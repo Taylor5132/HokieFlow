@@ -57,8 +57,18 @@ class BusLive(BusObs):
 
 # ----------------------------------------------------------------- fetch
 def fetch_vehicles(force: bool = False) -> list[dict]:
-    """Fetch the live-vehicle payload via the cache layer; return payload["data"]."""
-    payload = cache.get_json("bt_buses", config.ENDPOINTS["bt_buses"], force=force)
+    """Fetch the live-vehicle payload via the cache layer; return payload["data"].
+
+    Freshness honors config.LIVE_BUS_POLL_SECONDS: a cached snapshot younger
+    than that is reused, so every live-map/state consumer sees at most one new
+    observed snapshot per politeness window. `force=True` still bypasses the
+    cache for an explicit tap sample. In DEMO_MODE=cache the freshness argument
+    is inert -- the frozen fixture is returned verbatim.
+    """
+    payload = cache.get_json(
+        "bt_buses", config.ENDPOINTS["bt_buses"], force=force,
+        max_age_s=config.LIVE_BUS_POLL_SECONDS,
+    )
     if not isinstance(payload, dict):
         return []
     data = payload.get("data")
@@ -191,16 +201,26 @@ def schedule_delta(obs: BusObs, g: "Gtfs", now: datetime | None = None) -> float
 
 
 # ----------------------------------------------------------------- live
-def _is_stale(observed_at: datetime) -> bool:
-    # config.now() is the PINNED replay clock in DEMO_MODE=cache. Using the raw
+def _is_stale(observed_at: datetime, now: datetime | None = None) -> bool:
+    # `now` is the captured request clock when the caller supplies it, else
+    # config.now() -- the PINNED replay clock in DEMO_MODE=cache. Using the raw
     # wall clock here would mark every replayed snapshot stale during a demo,
     # because a fixture is by definition older than the 10-minute threshold.
-    age_s = (config.now() - observed_at).total_seconds()
+    ref = now if now is not None else config.now()
+    if ref.tzinfo is None:
+        ref = ref.replace(tzinfo=timezone.utc)
+    age_s = (ref - observed_at).total_seconds()
     return age_s > config.STALE_LIVE_MINUTES * 60
 
 
-def live(force: bool = False) -> list[BusLive]:
+def live(force: bool = False, now: datetime | None = None) -> list[BusLive]:
     """One snapshot: fetch -> normalize -> join to the static schedule -> label staleness.
+
+    `now` (optional) is the captured request clock; when given it is used for
+    the schedule-delta and staleness arithmetic so a plan and its live evidence
+    share one instant. The static GTFS feed is ALWAYS loaded with force=False:
+    a bus poll must never re-download or re-extract the schedule. The bus
+    payload itself honors config.LIVE_BUS_POLL_SECONDS via fetch_vehicles().
 
     hokieday.gtfs is imported lazily (not at module top level) so this module
     stays usable when the static-feed module is absent or mid-write.
@@ -208,16 +228,16 @@ def live(force: bool = False) -> list[BusLive]:
     obs_list = normalize(fetch_vehicles(force=force))
     try:
         from . import gtfs as gtfs_mod
-        g = gtfs_mod.load_gtfs(force=force)
+        g = gtfs_mod.load_gtfs(force=False)
     except Exception:
         g = None
     out: list[BusLive] = []
     for obs in obs_list:
-        delta = schedule_delta(obs, g) if g is not None else None
+        delta = schedule_delta(obs, g, now=now) if g is not None else None
         out.append(BusLive(
             **{f: getattr(obs, f) for f in obs.__dataclass_fields__},
             sched_delta_min=delta,
-            is_stale=_is_stale(obs.observed_at),
+            is_stale=_is_stale(obs.observed_at, now=now),
         ))
     return out
 

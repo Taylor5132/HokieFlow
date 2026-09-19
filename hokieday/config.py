@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -145,12 +146,14 @@ DEPARTURE_HORIZON_MIN = 180
 CAMPUS_TZ = "America/New_York"
 
 # ---------------------------------------------------------------- places
-# Coordinates for walk_time(). 'verified' means confirmed against a live source
-# during the data spike; everything else MUST be calibrated before the demo.
+# Coordinates for walk_time(). 'verified' means confirmed against an official
+# source. The VT GIS audit disproved the legacy Burruss coordinate below, so it
+# remains an explicitly UNVERIFIED placeholder until the post-push GIS route
+# integration recalibrates every place together. Stop 1600 comes from BT GTFS.
 PLACES: dict[str, dict] = {
-    "Burruss Hall":        {"lat": 37.22957, "lon": -80.41394, "verified": True},
+    "Burruss Hall":        {"lat": 37.22957, "lon": -80.41394, "verified": False},
     "Stop 1600":           {"lat": 37.22924, "lon": -80.41366, "verified": True},
-    # --- UNVERIFIED: calibrate from vt.edu/maps before presenting -----------
+    # --- UNVERIFIED: replace from official VT GIS before presenting --------
     "McBryde Hall":        {"lat": 37.22903, "lon": -80.41905, "verified": False},
     "Hahn Hall":           {"lat": 37.23230, "lon": -80.41838, "verified": False},
     "D2 at Dietrick Hall": {"lat": 37.22543, "lon": -80.41633, "verified": False},
@@ -168,10 +171,19 @@ PLACES: dict[str, dict] = {
 #
 # Coordinates from a device are NOT survey-grade: 'verified' stays False and the
 # reported accuracy is carried through so the UI can disclose it.
-CAMPUS_REFERENCE = (37.22957, -80.41394)     # Burruss Hall, verified
+# Official VT GIS Burruss centroid; used only for the 5 km on-campus guard.
+# PLACES coordinates are recalibrated separately in the GIS integration.
+CAMPUS_REFERENCE = (37.22924778, -80.42396247)
 MAX_ORIGIN_KM = 5.0                          # beyond this the position is not campus
 MAX_DYNAMIC_PLACES = 64                      # bounded; evict oldest
 _DYNAMIC_ORDER: list[str] = []
+
+# The demo server is threaded, so the check/insert/evict sequence below is a
+# critical section: without this lock two requests can both see `key not in
+# PLACES`, both append to _DYNAMIC_ORDER, and the eviction loop can pop an
+# entry that another thread is reading. The lock makes the "concurrent requests
+# never race" claim in the comment above actually true.
+_DYNAMIC_LOCK = threading.Lock()
 
 
 def register_dynamic_place(lat: float, lon: float,
@@ -180,27 +192,92 @@ def register_dynamic_place(lat: float, lon: float,
     """Register a device position as a place and return its lookup key.
 
     Returns a stable key per (rounded) coordinate pair. Raises ValueError for
-    coordinates that are not on Earth.
+    coordinates that are not on Earth. Thread-safe: the registration and the
+    bounded eviction run under a single lock, so concurrent requests share an
+    entry (same coordinates) instead of racing on it.
     """
     lat, lon = float(lat), float(lon)
     if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
         raise ValueError(f"coordinate out of range: lat={lat}, lon={lon}")
     key = f"{label} ({lat:.5f}, {lon:.5f})"
-    if key not in PLACES:
-        PLACES[key] = {
-            "lat": lat, "lon": lon, "verified": False,
-            "dynamic": True, "accuracy_m": accuracy_m,
-        }
-        _DYNAMIC_ORDER.append(key)
-        while len(_DYNAMIC_ORDER) > MAX_DYNAMIC_PLACES:
-            PLACES.pop(_DYNAMIC_ORDER.pop(0), None)
-    else:
-        PLACES[key]["accuracy_m"] = accuracy_m
+    with _DYNAMIC_LOCK:
+        if key not in PLACES:
+            PLACES[key] = {
+                "lat": lat, "lon": lon, "verified": False,
+                "dynamic": True, "accuracy_m": accuracy_m,
+            }
+            _DYNAMIC_ORDER.append(key)
+            while len(_DYNAMIC_ORDER) > MAX_DYNAMIC_PLACES:
+                PLACES.pop(_DYNAMIC_ORDER.pop(0), None)
+        else:
+            PLACES[key]["accuracy_m"] = accuracy_m
     return key
 
 
+def _snapshot_row(row: dict) -> dict:
+    """Copy a registry row so callers never share mutable state with the lock."""
+    return dict(row)
+
+
+def lookup_place(place_key: str) -> dict | None:
+    """Thread-safe copy of one place row, or None. Never returns the live row."""
+    with _DYNAMIC_LOCK:
+        row = PLACES.get(place_key)
+        return _snapshot_row(row) if row is not None else None
+
+
+def find_place(name: str | None) -> dict | None:
+    """Case-insensitive lookup in PLACES, returning a row COPY (or None).
+
+    The runtime equivalent of ``tools._place``: callers must not iterate or
+    index ``PLACES`` directly while another thread may be registering/evicting
+    dynamic entries.
+    """
+    if name is None:
+        return None
+    want = str(name).strip().lower()
+    with _DYNAMIC_LOCK:
+        for k, v in PLACES.items():
+            if k.lower() == want:
+                return _snapshot_row(v)
+    return None
+
+
+def place_snapshot() -> dict[str, dict]:
+    """Thread-safe copy of the whole registry with copied rows.
+
+    Safe to iterate at any time: the caller owns the returned dict and rows,
+    so a concurrent registration/eviction cannot raise "dictionary changed
+    size during iteration" or mutate a row mid-read.
+    """
+    with _DYNAMIC_LOCK:
+        return {k: _snapshot_row(v) for k, v in PLACES.items()}
+
+
+def static_places() -> list[tuple[str, dict]]:
+    """Ordered static (key, row-copy) pairs, taken under the dynamic lock."""
+    with _DYNAMIC_LOCK:
+        return [(k, _snapshot_row(v)) for k, v in PLACES.items()
+                if not v.get("dynamic")]
+
+
+def static_place_keys() -> list[str]:
+    """Sorted keys of the STATIC campus places only.
+
+    Dynamic device places are session-scoped and their keys embed the rounded
+    coordinates of wherever a student actually is. Listing them in an error
+    payload ("known places: ...") would leak one request's position to every
+    other client, so user-facing place lists must use this helper, never
+    `sorted(PLACES)`. Runs under the dynamic lock so a concurrent eviction
+    cannot mutate the mapping mid-iteration.
+    """
+    with _DYNAMIC_LOCK:
+        return sorted(k for k, v in PLACES.items() if not v.get("dynamic"))
+
+
 def is_dynamic(place_key: str) -> bool:
-    return bool(PLACES.get(place_key, {}).get("dynamic"))
+    with _DYNAMIC_LOCK:
+        return bool(PLACES.get(place_key, {}).get("dynamic"))
 
 # ---------------------------------------------------------------- dining ids
 # Verified from Locations.aspx and the hours API on 2026-09-19.

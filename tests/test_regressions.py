@@ -248,6 +248,24 @@ class TestMealChoice(unittest.TestCase):
             tools.section_rank(str(top.get("section")), str(top.get("name"))), 0,
             f"top pick {top['name']!r} from {top.get('section')!r} is not a meal section")
 
+    def test_self_contradictory_vegan_row_is_not_recommended(self):
+        """The source tags Whole Wheat Penne Pasta vegan while declaring Eggs.
+
+        Preserve that source-quality finding, but never turn it into a student
+        recommendation merely because one of the two source fields says vegan.
+        """
+        raw = [i for i in dining.menu("15", date(2026, 9, 19))
+               if i.name == "Whole Wheat Penne Pasta"]
+        self.assertTrue(raw, "fixture should retain the upstream contradiction")
+        self.assertTrue(all("vegan" in i.diet_tags and "Eggs" in i.allergens
+                            for i in raw))
+
+        filtered = dining.eat_options("15", date(2026, 9, 19),
+                                      diet="vegan", avoid=("Sesame",))
+        self.assertNotIn("Whole Wheat Penne Pasta", {i.name for i in filtered})
+        for item in filtered:
+            self.assertEqual(dining.diet_allergen_conflicts(item, "vegan"), ())
+
 
 class TestCacheKeyLength(unittest.TestCase):
     """BUG: a 40-item nutrition query produced a filename past the 255-byte

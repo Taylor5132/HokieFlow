@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HokieDay demo server — stdlib only, no dependencies, works offline.
+"""HokieFlow demo server — stdlib only, no dependencies, works offline.
 
 WHY STDLIB, NOT STREAMLIT
 Streamlit/pandas are not installed on this machine, and more importantly the
@@ -13,6 +13,7 @@ Run:
 
 Endpoints:
     GET  /                  the UI
+    GET  /api/time          lightweight campus clock (no GTFS/dining/live buses)
     GET  /api/status        clock, mode, data freshness, provenance
     GET  /api/scenarios     the preset demo buttons
     POST /api/ask           {"text": "..."} -> plan_day(...) result
@@ -50,21 +51,21 @@ SCENARIOS: list[dict] = [
     {
         "id": "eat",
         "label": "Can I eat and still make my 1:25?",
-        "text": "I've got from 11:22 to 13:00, I'm hungry, and I need to get from Burruss to McBryde",
-        "student_ref": "demo-student-1", "start": "11:22", "end": "13:00", "prefs": {},
+        "text": "I've got from 11:22 to 13:25, I'm hungry, and I need to get from Burruss to McBryde",
+        "student_ref": "demo-student-1", "start": "11:22", "end": "13:25", "prefs": {},
     },
     {
         "id": "bus_replan",
         "label": "Same trip, but I want the bus",
         "text": "Same trip but I'd rather take the bus than walk",
-        "student_ref": "demo-student-1", "start": "11:22", "end": "13:00",
+        "student_ref": "demo-student-1", "start": "11:22", "end": "13:25",
         "prefs": {"prefer": "bus"},
     },
     {
         "id": "vegan",
         "label": "Vegan, and no sesame",
         "text": "I'm vegan and I can't have sesame. Same window.",
-        "student_ref": "demo-student-2", "start": "11:22", "end": "13:00", "prefs": {},
+        "student_ref": "demo-student-2", "start": "11:22", "end": "13:25", "prefs": {},
     },
     {
         "id": "tight",
@@ -74,12 +75,237 @@ SCENARIOS: list[dict] = [
     },
 ]
 
-TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})\b")
+TIME_RE = re.compile(
+    r"\b(\d{1,2}):(\d{2})(?:\s*([ap])\.?m\.?)?\b", re.IGNORECASE
+)
+
+# Common student phrasing mapped to the source's official allergen names.
+# "nuts" deliberately expands to both categories; an avoid filter should err
+# toward exclusion, never silently narrow what the student asked for.
+_ALLERGEN_ALIASES: dict[str, tuple[str, ...]] = {
+    "Milk": ("milk", "dairy"),
+    "Eggs": ("egg", "eggs"),
+    "Fish": ("fish",),
+    "Crustacean Shellfish": ("shellfish", "crustacean shellfish"),
+    "Tree Nuts": ("tree nut", "tree nuts", "nuts"),
+    "Peanuts": ("peanut", "peanuts", "nuts"),
+    "Wheat": ("wheat",),
+    "Soybeans": ("soy", "soybean", "soybeans"),
+    "Gluten": ("gluten",),
+    "Sesame": ("sesame",),
+}
+
+# alias -> every official name it stands for. "nuts" maps to BOTH Tree Nuts and
+# Peanuts so an avoid filter always errs toward exclusion, never toward serving
+# something the student named.
+_ALIAS_TO_OFFICIALS: dict[str, tuple[str, ...]] = {}
+for _official, _aliases in _ALLERGEN_ALIASES.items():
+    for _alias in _aliases:
+        _ALIAS_TO_OFFICIALS[_alias] = _ALIAS_TO_OFFICIALS.get(_alias, ()) + (_official,)
+
+# Longest alias first so "tree nuts" wins over "nuts", "soybeans" over "soy".
+_ALIAS_ALT = "|".join(
+    sorted((re.escape(a) for a in _ALIAS_TO_OFFICIALS), key=len, reverse=True))
+_ALLERGEN_WORD_RE = re.compile(rf"\b(?:{_ALIAS_ALT})\b", re.IGNORECASE)
+
+# A list separator: comma/slash/ampersand/plus (optionally followed by and/or)
+# or a bare "and"/"or".
+_ALLERGEN_SEP_RE = re.compile(
+    r"(?:\s*(?:,|/|&|\+)\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+)",
+    re.IGNORECASE,
+)
+
+# Negation/avoidance cues are split into two TRIGGER CLASSES, because they
+# carry different evidence:
+#
+#   EXPLICIT -- "allergic to", "can't have": the sentence itself asserts a
+#   dietary restriction, so an unmappable list member is always worth a
+#   clarification, even when no known allergen was captured ("allergic to
+#   poultry").
+#
+#   BARE -- "no", "avoid", "without": these are overwhelmingly transport or
+#   environment language ("no parking", "avoid traffic", "no rain route"), so
+#   they only denote an allergen list when a RECOGNISED allergen anchors the
+#   same joined list ("no milk and poultry"). This is a trigger-class rule, not
+#   a growing keyword stoplist.
+_EXPLICIT_AVOID_TRIGGER_RE = re.compile(
+    r"\b(?:allergic\s+to|allergy\s+to|allergies\s+to|"
+    r"can(?:no|'|\u2019)t\s+have|cannot\s+have)\b",
+    re.IGNORECASE,
+)
+_BARE_AVOID_TRIGGER_RE = re.compile(
+    r"\b(?:avoid(?:ing)?|without|no)\b",
+    re.IGNORECASE,
+)
+
+# Only an explicit allergy/restriction phrase warrants a clarification when no
+# known allergen can be parsed: a bare "no" is far too common ("no bus") to
+# fire a dietary question.
+_ALLERGY_MENTION_RE = re.compile(
+    r"\ballerg(?:y|ies|ic)\b|can(?:no|'|\u2019)t\s+have|cannot\s+have",
+    re.IGNORECASE,
+)
+
+# Reverse phrasing: "a milk and eggs allergy". Requires at least one allergen.
+_REVERSE_ALLERGY_RE = re.compile(
+    rf"(?P<list>(?:\b(?:{_ALIAS_ALT})\b)"
+    rf"(?:(?:\s*(?:,|/|&|\+)\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+)"
+    rf"(?:\b(?:{_ALIAS_ALT})\b))*)"
+    rf"\s+allerg(?:y|ies|ic)\b",
+    re.IGNORECASE,
+)
+
+
+# Clause furniture that can follow a list separator. An unrecognised token
+# only counts as a dropped list member when it is NOT one of these, so normal
+# prose ("allergic to milk and I need lunch", "no bus, but I can have eggs")
+# is never mistaken for an ingredient. Without a food ontology a stoplist is
+# the honest way to distinguish "milk and poultry" from "milk and want".
+_LIST_STOPWORDS = frozenset({
+    "i", "im", "we", "we're", "you", "you're", "he", "she", "it", "they",
+    "them", "my", "me", "our", "us", "your", "a", "an", "the", "this",
+    "that", "these", "those", "and", "or", "but", "so", "then", "also",
+    "to", "for", "by", "at", "on", "in", "of", "with", "from", "as",
+    "is", "are", "was", "were", "be", "been", "being", "can", "cant",
+    "cannot", "could", "would", "should", "will", "shall", "may", "might",
+    "must", "have", "has", "had", "need", "needs", "want", "wants",
+    "like", "please", "only", "just", "really", "very", "too", "not", "no",
+    "yes", "if", "when", "while", "because", "before", "after", "around",
+    "about", "between", "get", "getting", "going", "go", "know", "think",
+    "say", "said", "tell", "give", "take", "make", "find", "show", "help",
+    "eat", "eating", "lunch", "dinner", "breakfast", "food", "menu", "plan",
+    "walk", "bus", "transit", "ride", "tickets", "ticket", "time", "day",
+    "today", "tomorrow", "please", "thanks", "thank", "problem", "homework",
+    "money", "idea", "way", "doubt", "rush", "hurry", "location", "place",
+    "grab", "meet", "meeting", "head", "attend", "class", "study", "work",
+    "leave", "arrive", "come", "came", "send", "put", "keep", "let", "look",
+    "feel", "become", "turn", "start", "begin", "stop", "finish", "end", "use",
+    "used", "using", "try", "trying", "call", "ask", "answer", "follow", "move",
+    "run", "sit", "stand", "wait", "waiting", "stay", "drive", "catch", "bring",
+    "buy", "order", "pick", "choose", "decide", "schedule", "check", "confirm",
+    "book", "reserve", "pay", "cost", "free", "busy", "open", "closed", "available",
+    "right", "now", "later", "soon", "first", "next", "last", "again", "still",
+    "actually", "maybe", "probably", "sure", "ok", "okay", "alright", "great",
+    "good", "fine", "better", "best", "quick", "quickly", "fast", "early", "late",
+    "exam", "test", "project", "job", "lecture", "library", "dorm", "room",
+    "building", "hall", "campus", "calendar", "reminder", "note", "email",
+    "message", "phone", "laptop", "charger", "wifi", "internet", "signal", "service",
+})
+
+
+def _scan_constraint_list(text: str, pos: int) -> tuple[list[str], bool]:
+    """Walk one joined constraint list starting at `pos`.
+
+    Grammar: [any|the] MEMBER (SEP MEMBER)*, where a member is either a known
+    allergen or one plausible but unmappable word. The scan stops at the first
+    NON-member token -- clause furniture such as "I", "need", "bus" -- so
+    ordinary prose after the list is never mistaken for an ingredient.
+
+    Returns (known officials, saw_unmappable_member). The flag is True when a
+    separator-joined member could not be mapped, e.g. "milk and poultry" or
+    "poultry and milk". It does NOT fire for a separator followed by ordinary
+    prose ("milk and I need lunch") or for a leading non-member ("no bus").
+    """
+    lead = re.match(r"\s+(?:any\s+|the\s+)?", text[pos:])
+    if not lead:
+        return [], False
+    i = pos + lead.end()
+    officials: list[str] = []
+    unmappable = False
+    while True:
+        word = _ALLERGEN_WORD_RE.match(text, i)
+        if word:
+            officials.extend(_ALIAS_TO_OFFICIALS[word.group(0).lower()])
+            i = word.end()
+        else:
+            m = re.match(r"([A-Za-z][A-Za-z'\-]*)", text[i:])
+            if not m:
+                return officials, unmappable
+            token = m.group(1).lower().replace("'", "")
+            if token in _LIST_STOPWORDS:
+                return officials, unmappable
+            unmappable = True
+            i += m.end()
+        sep = _ALLERGEN_SEP_RE.match(text, i)
+        if not sep:
+            # A known alias followed immediately by another content word is a
+            # multiword member we cannot map safely ("milk powder", "dairy
+            # products", "tree nut products"). Do not silently keep only the
+            # known prefix: force clarification. Clause furniture such as
+            # "today", "before class", or "I need" remains a clean stop.
+            residue = re.match(r"\s+([A-Za-z][A-Za-z'\-]*)", text[i:])
+            if residue:
+                token = residue.group(1).lower().replace("'", "")
+                if token not in _LIST_STOPWORDS:
+                    unmappable = True
+            return officials, unmappable
+        i = sep.end()
+
+
+def _extract_avoids(text: str) -> tuple[list[str], bool]:
+    """Known allergens named by avoidance phrases, plus an unparsed flag.
+
+    Forward triggers ("allergic to a, b and c") and reverse phrasing
+    ("a, b allergy") both feed the same set. Results are deduplicated in the
+    source's official allergen order, and aliases like "nuts" expand to every
+    category they cover.
+
+    The boolean is True whenever a restriction clause contained a list member
+    that could not be mapped. Explicit allergy/cannot-have phrases fire on any
+    unmappable member; bare no/avoid/without phrases fire only once a known
+    allergen anchors the list, so transport/weather language is not mistaken
+    for a dietary constraint.
+    """
+    found: list[str] = []
+    unparsed = False
+    for m in _EXPLICIT_AVOID_TRIGGER_RE.finditer(text):
+        officials, unmappable = _scan_constraint_list(text, m.end())
+        found.extend(officials)
+        unparsed = unparsed or unmappable
+    for m in _BARE_AVOID_TRIGGER_RE.finditer(text):
+        officials, unmappable = _scan_constraint_list(text, m.end())
+        found.extend(officials)
+        if officials:
+            unparsed = unparsed or unmappable
+    for m in _REVERSE_ALLERGY_RE.finditer(text):
+        for am in _ALLERGEN_WORD_RE.finditer(m.group("list")):
+            found.extend(_ALIAS_TO_OFFICIALS[am.group(0).lower()])
+    avoids = [official for official in _ALLERGEN_ALIASES if official in found]
+    return avoids, unparsed
+
+
+def _has_unparsed_allergy(text: str) -> bool:
+    """An explicit allergy/restriction phrase that named no known allergen."""
+    return bool(_ALLERGY_MENTION_RE.search(text))
+
+
+def _clock_match(match: re.Match) -> tuple[int, bool] | None:
+    """Return minute-of-day and whether AM/PM was explicit."""
+    hour, minute = int(match.group(1)), int(match.group(2))
+    suffix = (match.group(3) or "").lower()
+    if minute > 59 or hour > (12 if suffix else 23):
+        return None
+    if suffix:
+        hour = hour % 12 + (12 if suffix == "p" else 0)
+    return hour * 60 + minute, bool(suffix)
+
+
+def _clock_text(total_min: int) -> str:
+    total_min %= 24 * 60
+    return f"{total_min // 60:02d}:{total_min % 60:02d}"
+
+
+def _clock_label(total_min: int) -> str:
+    total_min %= 24 * 60
+    hour, minute = divmod(total_min, 60)
+    return f"{hour % 12 or 12}:{minute:02d} {'AM' if hour < 12 else 'PM'}"
+
+
 
 # Served inline so the app has no asset files to lose.
 MANIFEST = {
-    "name": "HokieDay",
-    "short_name": "HokieDay",
+    "name": "HokieFlow",
+    "short_name": "HokieFlow",
     "description": "Campus-life agent: one question across dining, transit and hours.",
     "start_url": "/",
     "display": "standalone",
@@ -93,7 +319,7 @@ MANIFEST = {
 ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <rect width="512" height="512" rx="112" fill="#861f41"/>
   <text x="256" y="330" font-family="-apple-system,Helvetica,Arial,sans-serif"
-        font-size="210" font-weight="700" text-anchor="middle" fill="#ffffff">HD</text>
+        font-size="210" font-weight="700" text-anchor="middle" fill="#ffffff">HF</text>
   <circle cx="388" cy="124" r="36" fill="#e87722"/>
 </svg>
 """
@@ -125,29 +351,400 @@ def lan_ips() -> list[str]:
     return sorted(ips)
 
 
-def parse_free_text(text: str) -> dict:
-    """A deliberately SMALL rule-based parser.
+def _iso_campus(dt: datetime) -> str:
+    """Campus-local ISO text for a request-bound window bound."""
+    return dt.astimezone(TZ).isoformat(timespec="seconds")
+
+
+def _clock_minutes(value) -> int | None:
+    """Parse a bare "HH:MM" to minute-of-day, or None."""
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", str(value or ""))
+    if not m:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    return hour * 60 + minute
+
+
+def time_meta(now: datetime | None = None, live: bool | None = None) -> dict:
+    """Structured clock metadata attached to every /api/ask response.
+
+    `evaluated_at` is the ONE campus-local timestamp captured at the request
+    boundary; planning and every displayed time are derived from it, never from
+    the browser clock. `time_source` says whether it came from the pinned
+    replay snapshot or the live wall clock.
+    """
+    if live is None:
+        live = not config.CACHE_ONLY
+    if now is None:
+        now = config.now(TZ)
+    return {
+        "mode": config.DEMO_MODE,
+        "evaluated_at": now.astimezone(TZ).isoformat(timespec="seconds"),
+        "time_source": "wall_clock" if live else "snapshot",
+        "is_replay": not live,
+    }
+
+
+def time_endpoint(now: datetime | None = None, live: bool | None = None) -> dict:
+    """Lightweight campus clock for the UI chip (GET /api/time).
+
+    Deliberately touches nothing but the clock abstraction: no GTFS load, no
+    dining read, no live-bus fetch. The chip re-syncs against this periodically
+    while the heavier /api/status is fetched once at boot.
+    """
+    if live is None:
+        live = not config.CACHE_ONLY
+    if now is None:
+        now = config.now(TZ)
+    now = now.astimezone(TZ)
+    return {
+        "mode": config.DEMO_MODE,
+        "is_replay": not live,
+        "time_source": "wall_clock" if live else "snapshot",
+        "timezone": config.CAMPUS_TZ,
+        "iso": now.isoformat(timespec="seconds"),
+        "evaluated_at": now.isoformat(timespec="seconds"),
+        "clock": now.strftime("%H:%M:%S"),
+        "human": now.strftime("%I:%M %p").lstrip("0"),
+        "weekday": now.strftime("%a %d %b %Y"),
+        "pinned": not live,
+        "ticking": live,
+    }
+
+
+def _preset_deadline_guard(call: dict, now: datetime, live: bool) -> dict | None:
+    """In live mode, refuse to replay a preset whose deadline already passed.
+
+    The preset keeps its explicit window, but a passed deadline is a correction
+    the student must see -- silently rolling it to tomorrow would fabricate a
+    plan for a time they never asked about.
+    """
+    if not live:
+        return None
+    end_min = _clock_minutes(call.get("end"))
+    if end_min is None:
+        return None
+    now_min = now.hour * 60 + now.minute
+    if end_min <= now_min:
+        return {
+            "kind": "deadline_passed",
+            "question": (f"This scenario's {_clock_label(end_min)} deadline has "
+                         f"already passed today. What time should I plan for?"),
+            "detail": (f"Now is {_clock_label(now_min)}; the preset deadline "
+                       f"{_clock_label(end_min)} is in the past. I will not "
+                       f"silently move it to tomorrow \u2014 give me a later "
+                       f"time today."),
+            "now": _clock_label(now_min),
+            "deadline": _clock_label(end_min),
+        }
+    return None
+
+
+def _materialize_live_preset(call: dict, now: datetime) -> None:
+    """In live mode, replace a preset's frozen `start` with the captured request
+    time, keeping the preset's explicit deadline on the same campus date.
+
+    A preset's window (11:22-13:25) is a replay artifact. If the request arrives
+    at 12:00, reusing 11:22 as the start hands the student a plan that left an
+    hour ago. The deadline is the student's real constraint, so it is preserved;
+    only the start moves to the captured `now`.
+    """
+    end_min = _clock_minutes(call.get("end"))
+    if end_min is None:
+        return
+    now_min = now.hour * 60 + now.minute
+    call["start"] = _iso_campus(now)
+    call["end"] = _iso_campus(now.replace(hour=end_min // 60,
+                                          minute=end_min % 60,
+                                          second=0, microsecond=0))
+    call.setdefault("_interpretation_notes", []).append(
+        f"Planning from now ({_clock_label(now_min)}) to your "
+        f"{_clock_label(end_min)} deadline.")
+
+
+def _resolve_live_window(call: dict, parsed: list, now: datetime) -> None:
+    """Resolve a free-text window in DEMO_MODE=live.
+
+    Live planning starts at the captured request time, never at the frozen
+    11:22-13:25 demo window. No deadline -> a structured clarification, because
+    borrowing the demo window would silently invent a deadline the student never
+    gave. One explicit deadline becomes now -> deadline; a deadline already in
+    the past is corrected, never rolled to tomorrow.
+    """
+    now_min = now.hour * 60 + now.minute
+    if not parsed:
+        call["end"] = None
+        call["_clarification"] = {
+            "kind": "need_deadline",
+            "question": "What time do you need to arrive by?",
+            "detail": ("I can plan from right now, but I need a deadline. "
+                       "Tell me a time such as \u201c1:25 PM\u201d and I'll work "
+                       "backwards from it."),
+            "now": _clock_label(now_min),
+        }
+        return
+    if len(parsed) == 1:
+        match, (end_min, explicit) = parsed[0]
+        if not explicit and end_min <= now_min and end_min < 12 * 60:
+            end_min += 12 * 60
+            call["_interpretation_notes"].append(
+                f"Interpreted {match.group(0)} as {_clock_label(end_min)}.")
+        if end_min <= now_min:
+            call["end"] = _clock_text(end_min)
+            call["_clarification"] = {
+                "kind": "deadline_passed",
+                "question": (f"{_clock_label(end_min)} has already passed today. "
+                             f"Do you mean a later time, or tomorrow?"),
+                "detail": (f"Now is {_clock_label(now_min)} and your deadline "
+                           f"{_clock_label(end_min)} is in the past. I will not "
+                           f"silently move it to tomorrow \u2014 give me a later "
+                           f"time today."),
+                "now": _clock_label(now_min),
+                "deadline": _clock_label(end_min),
+            }
+            return
+        call["start"] = _iso_campus(now)
+        call["end"] = _iso_campus(now.replace(hour=end_min // 60,
+                                               minute=end_min % 60,
+                                               second=0, microsecond=0))
+        call["_interpretation_notes"].append(
+            f"Planning from now ({_clock_label(now_min)}) to your "
+            f"{_clock_label(end_min)} deadline.")
+        return
+    # Two or more explicit times: honor them, anchored to the request date.
+    (m1, (start_min, start_explicit)), (m2, (end_min, end_explicit)) = parsed[:2]
+    if not end_explicit and end_min <= start_min and end_min < 12 * 60:
+        end_min += 12 * 60
+        call["_interpretation_notes"].append(
+            f"Interpreted {m2.group(0)} as {_clock_label(end_min)}.")
+    if (not start_explicit and not end_explicit
+            and start_min < 8 * 60 and end_min < 8 * 60):
+        start_min += 12 * 60
+        end_min += 12 * 60
+        call["_interpretation_notes"].append(
+            "Interpreted both unsuffixed times as PM.")
+    call["start"] = _iso_campus(now.replace(hour=start_min // 60,
+                                            minute=start_min % 60,
+                                            second=0, microsecond=0))
+    call["end"] = _iso_campus(now.replace(hour=end_min // 60,
+                                          minute=end_min % 60,
+                                          second=0, microsecond=0))
+
+
+# Words that cannot belong to a place name and therefore TERMINATE a bounded
+# `from`/`to` phrase. Without this, "I want to know" invents a place named
+# "know" and "from 11:22" invents "11".
+_PLACE_BOUNDARY_WORDS = frozenset({
+    "a", "an", "the", "my", "your", "his", "her", "their", "our",
+    "and", "or", "then", "but", "so", "please",
+    "by", "at", "before", "after", "around", "until", "till", "on", "in",
+    "for", "with", "without", "via", "near", "from", "to",
+    "get", "go", "going", "come", "eat", "eating", "take", "taking",
+    "walk", "walking", "ride", "riding", "bus", "transit", "drive",
+    "know", "see", "ask", "check", "find", "make", "plan", "leave",
+    "arrive", "meet", "need", "want", "class", "meeting", "lunch",
+    "dinner", "breakfast", "food",
+})
+
+# An unknown place phrase is accepted only when it looks like a proper name
+# (every word capitalised) or names a kind of campus venue. This keeps ordinary
+# grammar -- "to know", "to eat" -- from being mistaken for a destination.
+_PLACE_SUFFIX_WORDS = frozenset({
+    "hall", "center", "centre", "library", "market", "court", "building",
+    "gym", "stadium", "theatre", "theater", "auditorium", "commons",
+    "cafeteria", "dining", "arena", "field", "park", "lot", "garage",
+    "institute", "lab", "laboratory", "complex", "pavilion", "chapel",
+    "church", "school", "inn", "house",
+})
+
+
+# Deictic / filler words that must never become a place name when a lowercase
+# from/to route phrase is accepted. Unlike _PLACE_BOUNDARY_WORDS these are only
+# consulted on the lowercase fallback path, so a capitalised unknown name
+# ("New Building") or a venue suffix ("duck pond" for the pond word) still
+# works through the proper-noun / venue checks above.
+_ROUTE_PLACE_STOPWORDS = frozenset({
+    "here", "there", "home", "now", "then", "somewhere", "anywhere",
+    "everywhere", "everyplace",
+})
+
+
+def _bounded_place_phrase(raw: str, start: int,
+                          *, allow_lowercase: bool = False) -> str | None:
+    """Read at most four words from `start`, stopping at a boundary word.
+
+    Returns the phrase only when it looks like a place: proper-noun casing or a
+    campus-venue suffix. When `allow_lowercase` is set (a strong bounded
+    from/to route phrase), an all-lowercase unknown name is also accepted
+    provided no word is a deictic stopword, so "from burruss to narnia" keeps
+    narnia while "from here to there" does not become place names.
+    """
+    words: list[str] = []
+    pos = start
+    while len(words) < 4:
+        m = re.match(r"\s*([A-Za-z][A-Za-z'.\-]*)", raw[pos:])
+        if not m:
+            break
+        word = m.group(1)
+        if word.lower() in _PLACE_BOUNDARY_WORDS:
+            break
+        words.append(word)
+        pos += m.end()
+        tail = raw[pos:]
+        space = re.match(r"\s*", tail)
+        nxt = tail[space.end():space.end() + 1]
+        if nxt in ",.;:!?()":
+            break
+    if not words:
+        return None
+    proper = all(w[:1].isupper() for w in words)
+    venue = any(w.lower() in _PLACE_SUFFIX_WORDS for w in words)
+    if proper or venue:
+        return " ".join(words)
+    if allow_lowercase and not any(
+            w.lower() in _ROUTE_PLACE_STOPWORDS for w in words):
+        return " ".join(words)
+    return None
+
+
+def _extract_explicit_places(raw: str, text: str) -> tuple[str | None, str | None]:
+    """Return (from_place, to_place) for EXPLICIT from/to phrases.
+
+    Known configured places win and keep their canonical key. An unknown but
+    clearly place-like phrase is preserved verbatim so the planner reports
+    `unknown_place` instead of silently defaulting to a different building.
+    Lowercase unknown names are only accepted when the request is a strong
+    bounded from/to route phrase (both cues present), so ordinary grammar --
+    "to know", "to eat", "from 11:22" -- is never promoted to a place.
+    """
+    from_place: str | None = None
+    to_place: str | None = None
+    # A from/to PAIR bounds the unknown-name risk: the phrase sits between two
+    # routing cues instead of floating in prose. A lone lowercase cue does not.
+    route_phrase = bool(re.search(r"\bfrom\b", text)
+                        and re.search(r"\bto\b", text))
+    for place, row in config.static_places():
+        aliases = {place.lower(), place.lower().removesuffix(" hall")}
+        for alias in aliases:
+            a = re.escape(alias)
+            if re.search(rf"\bfrom\s+(?:the\s+)?{a}\b", text):
+                from_place = place
+            if re.search(rf"\bto\s+(?:the\s+)?{a}\b", text):
+                to_place = place
+    for cue, current in (("from", from_place), ("to", to_place)):
+        if current is not None:
+            continue
+        for m in re.finditer(rf"\b{cue}\s+(?:the\s+)?", raw, re.IGNORECASE):
+            phrase = _bounded_place_phrase(
+                raw, m.end(), allow_lowercase=route_phrase)
+            if phrase is not None:
+                if cue == "from":
+                    from_place = phrase
+                else:
+                    to_place = phrase
+                break
+    return from_place, to_place
+
+
+def parse_free_text(text: str, *, now: datetime | None = None,
+                    live: bool | None = None) -> dict:
+    """A deliberately SMALL, honest offline parser.
 
     It is NOT presented as the language model. With a Databricks workspace the
-    text->parameters step is the agent's job (Mosaic AI calls these same tools);
-    this exists so the behaviour is demonstrable with no network at all. The UI
-    labels it as such rather than implying an LLM is running.
+    text->parameters step is the agent's job; this fallback only handles the
+    demo's bounded vocabulary and carries every time inference back to the UI.
+
+    In DEMO_MODE=cache (the default for tests) the frozen demo window is kept
+    exactly as before. In live mode the window is anchored to `now` and a
+    missing/passed deadline yields a structured clarification instead of a
+    silently borrowed window.
     """
-    t = (text or "").lower()
-    call = dict(SCENARIOS[0])
-    call["prefs"] = {}
-    if any(w in t for w in ("bus", "transit", "ride ")):
+    raw = text or ""
+    t = raw.lower()
+    if live is None:
+        live = not config.CACHE_ONLY
+    if now is None:
+        now = config.now(TZ)
+    call = {
+        "id": "free_text",
+        "label": "Free-text request",
+        "text": raw,
+        "student_ref": "demo-free-text",
+        "start": (SCENARIOS[0]["start"] if not live
+                  else _clock_text(now.hour * 60 + now.minute)),
+        "end": SCENARIOS[0]["end"] if not live else None,
+        "prefs": {},
+        "_interpretation_notes": [],
+    }
+
+    if any(p in t for p in ("no bus", "without the bus", "walk only",
+                            "only walk", "skip the bus", "don't take the bus",
+                            "do not take the bus", "prefer walking")):
+        call["prefs"]["prefer"] = "walk"
+    elif re.search(r"\b(?:bus|transit|ride)\b", t):
         call["prefs"]["prefer"] = "bus"
+
     if "vegan" in t:
-        call["student_ref"] = "demo-student-2"
+        call["prefs"]["diet"] = "vegan"
     elif "vegetarian" in t:
-        call["student_ref"] = "demo-student-1"
-    times = TIME_RE.findall(text or "")
-    if len(times) >= 2:
-        call["start"] = f"{int(times[0][0]):02d}:{times[0][1]}"
-        call["end"] = f"{int(times[1][0]):02d}:{times[1][1]}"
-    elif len(times) == 1:
-        call["end"] = f"{int(times[0][0]):02d}:{times[0][1]}"
+        call["prefs"]["diet"] = "vegetarian"
+    avoids, avoid_unparsed = _extract_avoids(t)
+    if avoids:
+        call["prefs"]["avoid"] = avoids
+    if avoid_unparsed or (not avoids and _has_unparsed_allergy(t)):
+        # SAFETY: an explicit restriction listed an ingredient we could not
+        # map, or named no known allergen at all. Never plan as if the dropped
+        # constraint did not exist -- ask instead.
+        call["_clarification"] = {
+            "kind": "allergen_unparsed",
+            "question": "Which ingredient should I avoid?",
+            "detail": ("You mentioned an allergy, but I couldn't match it to a "
+                       "known allergen. Tell me the ingredient (for example "
+                       "milk, eggs, peanuts, tree nuts, sesame, soy, wheat, "
+                       "fish, shellfish, or gluten) and I'll filter the menu."),
+        }
+
+    # Recognise explicit from/to phrases. Known configured places keep their
+    # canonical key; a clear but unknown phrase is preserved so plan_day returns
+    # `unknown_place` rather than silently substituting the default building.
+    from_place, to_place = _extract_explicit_places(raw, t)
+    if from_place is not None:
+        call["prefs"]["from_place"] = from_place
+    if to_place is not None:
+        call["prefs"]["to_place"] = to_place
+
+    matches = list(TIME_RE.finditer(raw))
+    parsed = [(m, _clock_match(m)) for m in matches]
+    parsed = [(m, value) for m, value in parsed if value is not None]
+    if live and not call.get("_clarification"):
+        _resolve_live_window(call, parsed, now)
+    elif len(parsed) >= 2:
+        (m1, (start_min, start_explicit)), (m2, (end_min, end_explicit)) = parsed[:2]
+        # In a daytime campus-planning question, "11:22 to 1:25" means the
+        # next 1:25, not thirteen hours backwards. Preserve explicit AM/PM.
+        if not end_explicit and end_min <= start_min and end_min < 12 * 60:
+            end_min += 12 * 60
+            call["_interpretation_notes"].append(
+                f"Interpreted {m2.group(0)} as {_clock_label(end_min)}.")
+        # "1:00 to 2:00" during the daytime gets the same next-occurrence rule.
+        if (not start_explicit and not end_explicit
+                and start_min < 8 * 60 and end_min < 8 * 60):
+            start_min += 12 * 60
+            end_min += 12 * 60
+            call["_interpretation_notes"].append(
+                "Interpreted both unsuffixed times as PM.")
+        call["start"], call["end"] = _clock_text(start_min), _clock_text(end_min)
+    elif len(parsed) == 1:
+        match, (end_min, explicit) = parsed[0]
+        start_h, start_m = (int(p) for p in call["start"].split(":"))
+        start_min = start_h * 60 + start_m
+        if not explicit and end_min <= start_min and end_min < 12 * 60:
+            end_min += 12 * 60
+            call["_interpretation_notes"].append(
+                f"Interpreted {match.group(0)} as {_clock_label(end_min)}.")
+        call["end"] = _clock_text(end_min)
     return call
 
 
@@ -159,7 +756,7 @@ def _static_or_none(payload: dict, info: dict) -> tuple[str | None, dict]:
     """
     sel = payload.get("from_place")
     if sel and str(sel) not in ("auto", "default"):
-        row = config.PLACES.get(str(sel))
+        row = config.lookup_place(str(sel))
         if row and not row.get("dynamic"):
             if info.get("note"):
                 info["note"] += f" \u2014 using {sel} instead"
@@ -217,43 +814,73 @@ def resolve_origin(payload: dict) -> tuple[str | None, dict]:
 
 
 def deep_links(result: dict) -> list[dict]:
-    """Keyless handoff URLs — "we plan it, your maps app navigates it".
+    """Keyless navigation handoff, one movement leg at a time.
 
-    Verified: Google states "You don't need a Google API key to use Maps URLs",
-    and Apple map links need no developer account either. Turn-by-turn is the
-    part we deliberately do NOT build, so we hand off to the app that does.
-    `dirflg`: d=car, w=foot, r=public transit. `travelmode`: walking|transit.
+    A single origin→destination link skipped the dining waypoint entirely. Each
+    walk/bus leg now gets its own Apple and Google link, so following the links
+    follows the itinerary the student was actually shown. `dirflg`: w=foot,
+    r=public transit. `travelmode`: walking|transit.
     """
     legs = ((result.get("itinerary") or {}).get("legs")) or []
-    origin = next((l.get("from_coords") for l in legs if l.get("from_coords")), None)
-    dest = next((l.get("to_coords") for l in reversed(legs) if l.get("to_coords")), None)
-    if not (origin and dest):
-        return []
-    # Commas must be percent-encoded in Maps URLs.
-    o = f"{origin[0]:.6f}%2C{origin[1]:.6f}"
-    d = f"{dest[0]:.6f}%2C{dest[1]:.6f}"
-    return [
-        {"label": "Walk it", "app": "Apple Maps",
-         "url": f"https://maps.apple.com/?saddr={o}&daddr={d}&dirflg=w"},
-        {"label": "Transit", "app": "Apple Maps",
-         "url": f"https://maps.apple.com/?saddr={o}&daddr={d}&dirflg=r"},
-        {"label": "Walk it", "app": "Google Maps",
-         "url": ("https://www.google.com/maps/dir/?api=1"
-                 f"&origin={o}&destination={d}&travelmode=walking")},
-        {"label": "Transit", "app": "Google Maps",
-         "url": ("https://www.google.com/maps/dir/?api=1"
-                 f"&origin={o}&destination={d}&travelmode=transit")},
-    ]
+    out: list[dict] = []
+    for leg in legs:
+        if leg.get("type") not in ("walk", "bus"):
+            continue
+        origin, dest = leg.get("from_coords"), leg.get("to_coords")
+        if not (origin and dest):
+            continue
+        # Commas must be percent-encoded in Maps URLs.
+        o = f"{origin[0]:.6f}%2C{origin[1]:.6f}"
+        d = f"{dest[0]:.6f}%2C{dest[1]:.6f}"
+        is_bus = leg.get("type") == "bus"
+        mode = "transit" if is_bus else "walking"
+        flag = "r" if is_bus else "w"
+        destination = str(leg.get("to") or leg.get("to_stop_name") or "next stop")
+        action = (f"Ride {leg.get('route_id')} to {destination}" if is_bus
+                  else f"Walk to {destination}")
+        common = {"label": action, "mode": mode, "leg_seq": leg.get("seq")}
+        out.extend([
+            {**common, "app": "Apple Maps",
+             "url": f"https://maps.apple.com/?saddr={o}&daddr={d}&dirflg={flag}"},
+            {**common, "app": "Google Maps",
+             "url": ("https://www.google.com/maps/dir/?api=1"
+                     f"&origin={o}&destination={d}&travelmode={mode}")},
+        ])
+    return out
 
 
-def run_plan(call: dict, origin: dict | None = None) -> dict:
-    result = tools.plan_day(call["student_ref"], call["start"], call["end"],
-                            call.get("prefs") or {})
+def run_plan(call: dict, origin: dict | None = None,
+             now: datetime | None = None) -> dict:
+    prefs = call.get("prefs") or {}
+    if call.get("_clarification"):
+        # A structured clarification is a first-class result: no itinerary, no
+        # map, no invented deadline. `now` is the captured request clock.
+        cl = dict(call["_clarification"])
+        result = {
+            "student_ref": call.get("student_ref"),
+            "itinerary": None,
+            "rationale": cl.get("detail") or cl.get("question") or "",
+            "feasible": False,
+            "infeasible_reason": {"code": "clarification_needed",
+                                   "kind": cl.get("kind")},
+            "alternatives": [],
+            "replan_trigger": None,
+            "clarification": cl,
+        }
+    else:
+        result = tools.plan_day(call["student_ref"], call["start"], call["end"],
+                                prefs, now=now)
     result["_request"] = {"student_ref": call["student_ref"],
-                          "start": call["start"], "end": call["end"],
-                          "prefs": call.get("prefs") or {}}
-    result["_origin"] = origin or {"source": "default", "label": None,
+                          "start": call.get("start"), "end": call.get("end"),
+                          "prefs": prefs}
+    default_label = str(prefs.get("from_place") or "Burruss Hall")
+    result["_origin"] = origin or {"source": "default", "label": default_label,
                                     "accuracy_m": None, "note": None}
+    result["_interpretation_notes"] = list(call.get("_interpretation_notes") or [])
+    if call.get("_clarification"):
+        result["_map_svg"] = ""
+        result["_links"] = []
+        return result
     # The map is drawn from OUR data (GTFS shapes) and inlined, so it renders with
     # networking off. Deep links are the keyless handoff for real navigation.
     try:
@@ -271,8 +898,74 @@ def run_plan(call: dict, origin: dict | None = None) -> dict:
     return result
 
 
+def handle_ask(payload: dict, now: datetime | None = None,
+               live: bool | None = None) -> tuple[dict, int]:
+    """The /api/ask pipeline, HTTP-free so it is directly testable.
+
+    Captures ONE campus-local request timestamp (or accepts the one the HTTP
+    handler already captured) and threads it through parsing and planning, so
+    every calculated time agrees with `_time.evaluated_at`. Returns
+    (result, http_status).
+    """
+    if live is None:
+        live = not config.CACHE_ONLY
+    if now is None:
+        now = config.now(TZ)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=TZ)
+    else:
+        now = now.astimezone(TZ)
+    meta = time_meta(now, live=live)
+
+    try:
+        origin_key, origin = resolve_origin(payload)
+    except Exception as exc:                                   # noqa: BLE001
+        return {"error": f"origin resolution failed: {exc}", "_time": meta}, 500
+
+    if payload.get("scenario_id"):
+        match = next((s for s in SCENARIOS
+                      if s["id"] == payload["scenario_id"]), None)
+        if match is None:
+            return {"error": "unknown scenario_id", "_time": meta}, 400
+        call = dict(match)
+        guard = _preset_deadline_guard(call, now, live)
+        if guard is not None:
+            call["_clarification"] = guard
+        elif live:
+            _materialize_live_preset(call, now)
+    else:
+        call = parse_free_text(payload.get("text", ""), now=now, live=live)
+
+    # Copy prefs rather than mutating the shared SCENARIOS entry.
+    call["prefs"] = dict(call.get("prefs") or {})
+    if origin_key:
+        call["prefs"]["from_place"] = origin_key
+    else:
+        # An explicit origin `resolve_origin` could not turn into a place is
+        # preserved instead of silently defaulting. Device precedence is intact:
+        # a valid lat/lon yields origin_key, so this branch only runs otherwise.
+        explicit_from = str(payload.get("from_place") or "").strip()
+        if explicit_from and explicit_from.lower() not in ("auto", "default"):
+            call["prefs"]["from_place"] = explicit_from
+    destination = str(payload.get("to_place") or "").strip()
+    if destination and destination.lower() not in ("auto", "default"):
+        destination_row = config.lookup_place(destination)
+        if destination_row and not destination_row.get("dynamic"):
+            call["prefs"]["to_place"] = destination
+        elif destination_row is None:
+            # An explicit unknown destination must not default to McBryde; the
+            # planner reports `unknown_place` and the UI can ask for a real one.
+            call["prefs"]["to_place"] = destination
+
+    try:
+        result = run_plan(call, origin, now=now)
+    except Exception as exc:                                   # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}", "_time": meta}, 500
+    result["_time"] = meta
+    return result, 200
+
+
 def status() -> dict:
-    import time as _time
     fixtures = cache.stats()
     ages = {}
     for name, params in (("bt_buses", {}), ("dining_menu",
@@ -292,7 +985,6 @@ def status() -> dict:
         "fixture_age_hours": ages,
         "live_vehicles": len(live.get("buses", live) or []),
         "live_stale": live.get("stale"),
-        "generated_in_ms": round(_time.perf_counter() * 0 + 0, 1),
         "assumptions": {
             "eat_minutes": tools.EAT_MINUTES,
             "meal_ranking": tools.MEAL_RANKING_RULE,
@@ -305,9 +997,15 @@ def status() -> dict:
         "caveats": [
             "blank allergen field means UNKNOWN, except in a documented "
             "allergen-free kitchen (Viridian) -- see venue_allergen_free",
-            "live bus positions are a replayed snapshot; sched_delta_min is "
-            "computed against the pinned snapshot clock",
-            "walk times use a straight-line path factor, not a routed path",
+            ("live bus positions are a replayed snapshot; sched_delta_min is "
+             "computed against the pinned snapshot clock"
+             if config.CACHE_ONLY else
+             "live bus positions come from the upstream poll; sched_delta_min "
+             "is computed against the live wall clock"),
+            "walk times use a straight-line path factor, not a routed path; "
+            "most configured place coordinates still need field verification",
+            "diet tags are cross-checked against declared allergens; "
+            "self-contradictory rows are not recommended",
         ],
     }
 
@@ -337,6 +1035,10 @@ class Handler(BaseHTTPRequestHandler):
             html = (Path(__file__).parent / "index.html").read_bytes()
             self._send(200, html, "text/html; charset=utf-8")
             return
+        if path == "/api/time":
+            # Lightweight: the clock only -- no GTFS, dining, or live-bus load.
+            self._json(time_endpoint())
+            return
         if path == "/api/status":
             self._json(status())
             return
@@ -345,10 +1047,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/origins":
             # Static campus places, for when the device will not give a position
-            # (geolocation needs a SECURE CONTEXT: localhost or HTTPS).
+            # (geolocation needs a SECURE CONTEXT: localhost or HTTPS). Read
+            # through the locked snapshot so a concurrent device registration
+            # cannot leak another session's coordinates or race the iteration.
             self._json([{"key": k, "verified": bool(v.get("verified"))}
-                        for k, v in config.PLACES.items()
-                        if not v.get("dynamic")])
+                        for k, v in config.static_places()])
             return
         if path == "/manifest.webmanifest":
             self._send(200, json.dumps(MANIFEST).encode("utf-8"),
@@ -365,9 +1068,11 @@ class Handler(BaseHTTPRequestHandler):
             n = int((parse_qs(urlparse(self.path).query).get("n", ["1"])[0]))
             idx = max(0, min(len(SCENARIOS) - 1, n - 1))
             try:
-                self._json(run_plan(dict(SCENARIOS[idx])))
+                result, code = handle_ask({"scenario_id": SCENARIOS[idx]["id"]})
+                self._json(result, code)
             except Exception as exc:                      # noqa: BLE001
-                self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+                self._json({"error": f"{type(exc).__name__}: {exc}",
+                            "_time": time_meta()}, 500)
             return
         self._json({"error": "not found"}, 404)
 
@@ -375,29 +1080,21 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split("?")[0] != "/api/ask":
             self._json({"error": "not found"}, 404)
             return
+        # Capture ONE campus-local timestamp at the request boundary, before the
+        # body is parsed or any planning runs. This is the authority for every
+        # time in the response; the browser clock is never consulted.
+        now = config.now(TZ)
         length = int(self.headers.get("Content-Length") or 0)
         try:
             payload = json.loads(self.rfile.read(length) or b"{}")
         except Exception:                                  # noqa: BLE001
             payload = {}
         try:
-            origin_key, origin = resolve_origin(payload)
-            if payload.get("scenario_id"):
-                match = next((s for s in SCENARIOS
-                              if s["id"] == payload["scenario_id"]), None)
-                if match is None:
-                    self._json({"error": "unknown scenario_id"}, 400)
-                    return
-                call = dict(match)
-            else:
-                call = parse_free_text(payload.get("text", ""))
-            # Copy prefs rather than mutating the shared SCENARIOS entry.
-            if origin_key:
-                call["prefs"] = {**(call.get("prefs") or {}),
-                                 "from_place": origin_key}
-            self._json(run_plan(call, origin))
+            result, code = handle_ask(payload, now=now)
+            self._json(result, code)
         except Exception as exc:                           # noqa: BLE001
-            self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+            self._json({"error": f"{type(exc).__name__}: {exc}",
+                        "_time": time_meta(now)}, 500)
 
 
 def main() -> int:
@@ -413,10 +1110,12 @@ def main() -> int:
 
     st = status()
     print("=" * 68)
-    print("HokieDay demo server")
+    print("HokieFlow demo server")
     print("=" * 68)
     print(f"  mode        : {st['mode']}   offline={st['offline']}")
-    print(f"  campus now  : {st['campus_now']}  (pinned to the snapshot)")
+    clock_note = ("pinned to the snapshot"
+                  if st["clock_pinned_to_snapshot"] else "live wall clock")
+    print(f"  campus now  : {st['campus_now']}  ({clock_note})")
     print(f"  fixtures    : {st['fixtures']}")
     print(f"  live buses  : {st['live_vehicles']}   stale={st['live_stale']}")
 
@@ -432,7 +1131,7 @@ def main() -> int:
         except OSError as exc:
             if exc.errno != errno.EADDRINUSE:
                 raise
-            print(f"  port {port} is busy (an older HokieDay server still "
+            print(f"  port {port} is busy (an older HokieFlow server still "
                   f"running?), trying {port + 1}")
     if httpd is None:
         print(f"\n  Could not bind any port in {args.port}-{args.port + 5}.\n"

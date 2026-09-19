@@ -75,6 +75,28 @@ class Nutrients:
     sodium_mg: float
 
 
+# A source row can contradict itself. The 2026-09-19 D2 snapshot labels Whole
+# Wheat Penne Pasta "vegan" while also declaring Eggs in its allergen list. VT's
+# nutrition page presents BOTH fields as decision aids, so a requested diet must
+# not trust one while hiding a direct contradiction in the other. These are only
+# contradictions we can prove from the available fields; this is not an attempt
+# to infer every ingredient from allergen data.
+_DIET_CONFLICT_ALLERGENS = {
+    "vegan": frozenset({"milk", "eggs", "fish", "crustacean shellfish"}),
+    "vegetarian": frozenset({"fish", "crustacean shellfish"}),
+}
+
+
+def diet_allergen_conflicts(item: MenuItem, diet: str | None) -> tuple[str, ...]:
+    """Declared allergens that directly contradict a requested diet tag.
+
+    An empty tuple means no contradiction is visible in the source fields; it
+    does NOT independently certify that the item satisfies the diet.
+    """
+    blocked = _DIET_CONFLICT_ALLERGENS.get(str(diet or "").strip().lower(), ())
+    return tuple(a for a in item.allergens if a.strip().lower() in blocked)
+
+
 # ------------------------------------------------------------------ helpers
 def _as_date(d: date | str) -> date:
     """Normalize a date-or-string (either verified format) to a `date`."""
@@ -448,7 +470,14 @@ def eat_options(
 
     if diet:
         want = diet.strip().lower()
-        items = [it for it in items if want in it.diet_tags]
+        # Require the upstream diet designation AND reject any row whose own
+        # declared allergens directly contradict that designation. This catches
+        # source-data conflicts without pretending allergen data is a complete
+        # ingredient list.
+        items = [
+            it for it in items
+            if want in it.diet_tags and not diet_allergen_conflicts(it, want)
+        ]
 
     if avoid:
         # HARD SAFETY FILTER — never a preference. Substring, case-insensitive.

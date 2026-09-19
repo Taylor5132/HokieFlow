@@ -23,6 +23,7 @@ call -- tests/test_integration.py's AST tripwire fails the suite if one appears.
 from __future__ import annotations
 
 import math
+from contextvars import ContextVar
 from datetime import datetime, time, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -30,6 +31,17 @@ from zoneinfo import ZoneInfo
 from . import config, dining, gtfs, livebus
 
 _CAMPUS_TZ = ZoneInfo(config.CAMPUS_TZ)
+
+# Per-request "now" override. The server captures ONE campus-local timestamp at
+# the /api/ask boundary and plan_day() pins it here, so every calculation inside
+# the request (window dates, dining hours date, live-bus deltas, re-plan margins)
+# agrees with the captured request context instead of re-reading the wall clock
+# a few milliseconds later. ContextVar, not a module global: the demo server is
+# threaded, and one request must never see another request's clock. When unset
+# (direct library calls, tests) the code falls back to config.now() exactly as
+# before, which keeps the AST clock tripwire and replay pinning intact.
+_REQUEST_NOW: ContextVar[datetime | None] = ContextVar(
+    "hokieday_request_now", default=None)
 
 # ---------------------------------------------------------------------------
 # Stated assumptions -- inputs to the arithmetic, not measurements. Each is
@@ -180,8 +192,9 @@ class LocalSource:
         return self._gtfs
 
     def _now_local(self) -> datetime:
-        # The pinned replay clock in DEMO_MODE=cache; never the wall clock.
-        return config.now(_CAMPUS_TZ)
+        # The captured request clock, or the pinned replay clock in
+        # DEMO_MODE=cache; never the raw wall clock.
+        return _now_campus()
 
     # ------------------------------------------------------------- transit
     def next_departures(self, stop_id: str, route_id: str | None,
@@ -208,7 +221,9 @@ class LocalSource:
 
     def live_buses(self, route_id: str | None) -> list[dict]:
         try:
-            rows = livebus.live()
+            # Pass the request clock explicitly so schedule deltas and staleness
+            # labels are measured against the SAME instant as the plan window.
+            rows = livebus.live(now=self._now_local())
         except Exception:                                    # noqa: BLE001
             return []
         out = []
@@ -387,14 +402,13 @@ def _clock(s: str) -> time:
 
 
 def _place(name: str) -> dict | None:
-    """Case-insensitive lookup in config.PLACES (the row, or None)."""
-    if name is None:
-        return None
-    want = str(name).strip().lower()
-    for k, v in config.PLACES.items():
-        if k.lower() == want:
-            return v
-    return None
+    """Case-insensitive lookup in config.PLACES (a COPY of the row, or None).
+
+    Delegates to config.find_place so the registry is read under its lock and
+    never iterated live: the demo server is threaded and a concurrent
+    registration/eviction must not race this read.
+    """
+    return config.find_place(name)
 
 
 def _haversine_m(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -416,7 +430,9 @@ def _walk_result(from_place: str, to_place: str) -> dict:
     a, b = _place(from_place), _place(to_place)
     if a is None or b is None:
         unknown = from_place if a is None else to_place
-        known = ", ".join(sorted(config.PLACES))
+        # STATIC only: a dynamic key embeds a device's rounded coordinates and
+        # must never be echoed back to other sessions (see config.static_place_keys).
+        known = ", ".join(config.static_place_keys())
         return {
             "error": f"unknown place {unknown!r}; known places: {known}",
             "from_place": str(from_place), "to_place": str(to_place),
@@ -450,11 +466,16 @@ def _walk_minutes(a: tuple[float, float], b: tuple[float, float]) -> float:
 
 
 def _now_campus() -> datetime:
+    """Campus-local 'now': the captured request clock when plan_day set one,
+    else config.now() (the pinned replay clock in DEMO_MODE=cache)."""
+    pinned = _REQUEST_NOW.get()
+    if pinned is not None:
+        return pinned.astimezone(_CAMPUS_TZ)
     return config.now(_CAMPUS_TZ)
 
 
 def _now_naive() -> datetime:
-    return config.now(_CAMPUS_TZ).replace(tzinfo=None)
+    return _now_campus().replace(tzinfo=None)
 
 
 def _naive(dt: datetime) -> datetime:
@@ -473,6 +494,14 @@ def _naive(dt: datetime) -> datetime:
 
 def _iso(dt: datetime) -> str:
     return dt.isoformat(timespec="seconds")
+
+
+def _human_time(value: datetime | str) -> str:
+    """Compact campus-local clock text for user-facing rationale."""
+    dt = value if isinstance(value, datetime) else datetime.fromisoformat(value)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(_CAMPUS_TZ)
+    return dt.strftime("%I:%M %p").lstrip("0")
 
 
 def _parse_campus(s: Any) -> datetime:
@@ -612,7 +641,9 @@ def find_food(location_num: str | None = None, diet: str | None = None,
     THE ALLERGEN RULE (SDD risk R8): `avoid` is a HARD filter applied
     upstream (case-insensitive substring). A BLANK allergen field means
     UNKNOWN, never allergen-free: such rows carry allergens_known=False and
-    are never presented as safe.
+    are never presented as safe. Requested diet tags are also cross-checked
+    against declared allergens so a self-contradictory source row is not
+    recommended (for example, a row tagged vegan that declares Eggs).
     """
     src = _src(source)
     if isinstance(avoid, str):
@@ -821,8 +852,14 @@ def _build_itinerary(src: Any, *, start_dt: datetime, end_dt: datetime,
                         "location_num": str(eat_loc), "place": eat_place,
                         "coords": _xy(eat_p),
                         "item": item["name"], "kcal": item.get("kcal"),
+                        "protein_g": item.get("protein_g"),
+                        "portion": item.get("portion"),
                         "allergens": item.get("allergens"),
                         "allergens_known": item.get("allergens_known"),
+                        "venue_allergen_free": item.get("venue_allergen_free"),
+                        "diet_tags": item.get("diet_tags") or [],
+                        "requested_diet": diet,
+                        "avoid": list(avoid),
                         "start_time": _iso(eat_start), "end_time": _iso(eat_end),
                         "minutes": EAT_MINUTES,
                         "method": (f"assumed eating time ({EAT_MINUTES:g} min); "
@@ -852,7 +889,7 @@ def _build_itinerary(src: Any, *, start_dt: datetime, end_dt: datetime,
                     if w2min > 0:
                         legs.append({"seq": len(legs) + 1, "type": "walk",
                                      "from": waypoint,
-                                     "to": f"stop {sa['stop_id']} ({sa['name']})",
+                                     "to": f"{sa['name']} bus stop",
                                      "from_coords": tuple(sa["place_coords"]),
                                      "to_coords": (sa["lat"], sa["lon"]),
                                      "start_time": _iso(t), "minutes": w2min,
@@ -866,8 +903,11 @@ def _build_itinerary(src: Any, *, start_dt: datetime, end_dt: datetime,
                         "seq": len(legs) + 1, "type": "bus",
                         "route_id": ride["route_id"],
                         "trip_id": ride["trip_id"],
+                        "from": sa["name"], "to": sd["name"],
                         "from_stop": ride["from_stop"],
                         "to_stop": ride["to_stop"],
+                        "from_stop_name": sa["name"],
+                        "to_stop_name": sd["name"],
                         "from_coords": (sa["lat"], sa["lon"]),
                         "to_coords": (sd["lat"], sd["lon"]),
                         "dep_time": _iso(ride["dep_time"]),
@@ -884,7 +924,7 @@ def _build_itinerary(src: Any, *, start_dt: datetime, end_dt: datetime,
                                                 (sd["place_coords"][0],
                                                  sd["place_coords"][1])), 1)
                     legs.append({"seq": len(legs) + 1, "type": "walk",
-                                 "from": f"stop {sd['stop_id']} ({sd['name']})",
+                                 "from": f"{sd['name']} bus stop",
                                  "to": to_place, "start_time": _iso(t),
                                  "from_coords": (sd["lat"], sd["lon"]),
                                  "to_coords": _xy(dest_p),
@@ -963,13 +1003,17 @@ def _replan_trigger(src: Any, itin: dict) -> dict | None:
                     # Buses here run EARLY (observed -7.5 .. +7.5 min), so the
                     # realistic failure is missing one, not waiting for it.
                     if -delta > tolerance:
+                        wait = float(bus_leg.get("wait_min") or 0.0)
+                        remaining = max(0.0, wait + float(delta))
+                        stop_name = (bus_leg.get("from_stop_name")
+                                     or f"stop {bus_leg.get('from_stop')}")
                         return {
                             "cause": "bus_early",
-                            "detail": (f"route {row['route_id']} is running "
-                                       f"{abs(delta):g} min EARLY and the plan "
-                                       f"only allows {tolerance:g} min of "
-                                       f"boarding buffer at "
-                                       f"stop {bus_leg.get('from_stop')}"),
+                            "detail": (f"Route {row['route_id']} is "
+                                       f"{abs(delta):.1f} min early, leaving "
+                                       f"only {remaining:.1f} min to board at "
+                                       f"{stop_name}; the plan requires a "
+                                       f"{MIN_BOARD_BUFFER_MIN:g} min buffer."),
                         }
                     arrives = (datetime.fromisoformat(bus_leg["arrive_time"])
                                + timedelta(minutes=delta))
@@ -1038,7 +1082,23 @@ def _alternative_eat_location(src: Any, current: str, eat_after: datetime,
 
 
 def plan_day(student_ref: str, start: str, end: str, prefs: dict | None = None,
-             source: Any = None) -> dict:
+             source: Any = None, now: datetime | None = None) -> dict:
+    """Public entry point. `now` pins ONE campus-local request timestamp for
+    every calculation inside the plan (see _REQUEST_NOW); when omitted the
+    library falls back to config.now() exactly as before."""
+    token = None
+    if now is not None:
+        aware = now if now.tzinfo is not None else now.replace(tzinfo=_CAMPUS_TZ)
+        token = _REQUEST_NOW.set(aware.astimezone(_CAMPUS_TZ))
+    try:
+        return _plan_day_impl(student_ref, start, end, prefs=prefs, source=source)
+    finally:
+        if token is not None:
+            _REQUEST_NOW.reset(token)
+
+
+def _plan_day_impl(student_ref: str, start: str, end: str, prefs: dict | None = None,
+                   source: Any = None) -> dict:
     """The orchestrator (SDD 7.3): interpret constraints, build itinerary A
     from walk_time + get_next_departures + find_food + get_hours, RE-CHECK
     live state via get_live_bus, and if reality moved build itinerary B and
@@ -1057,6 +1117,19 @@ def plan_day(student_ref: str, start: str, end: str, prefs: dict | None = None,
     eat_loc = None if eat is False else p.get("location_num", "15")
     route_hint = p.get("route_id")
 
+    # A bus is only the DEFAULT when it actually beats walking (see below), but a
+    # student may still prefer it (rain, luggage, injury). Parsed before the
+    # place check so every return carries the same `constraints` block.
+    prefer = str(((prefs or {}).get("prefer") or "fastest")).lower()
+    constraints = {
+        "diet": diet,
+        "avoid": list(avoid),
+        "max_kcal": max_kcal,
+        "prefer": prefer,
+        "from_place": str(p.get("from_place", "Burruss Hall")),
+        "to_place": str(p.get("to_place", "McBryde Hall")),
+    }
+
     try:
         start_dt = _parse_campus(start)
         end_dt = _parse_campus(end)
@@ -1064,18 +1137,62 @@ def plan_day(student_ref: str, start: str, end: str, prefs: dict | None = None,
         return {
             "student_ref": str(student_ref), "itinerary": None,
             "rationale": f"could not parse the time window: {exc}",
+            "constraints": constraints,
             "alternatives": [], "replan_trigger": None, "error": str(exc),
+            "feasible": False,
+            "infeasible_reason": {"code": "invalid_window",
+                                  "detail": str(exc)},
         }
     if end_dt <= start_dt:
         return {
             "student_ref": student_ref, "itinerary": None,
-            "rationale": "the window ends before it starts",
+            "rationale": ("That deadline is before the start time. If you mean "
+                          "the afternoon, write 1:25 PM or 13:25."),
+            "constraints": constraints,
             "alternatives": [], "replan_trigger": None,
             "error": "end must be after start",
+            "feasible": False,
+            "infeasible_reason": {"code": "invalid_window",
+                                  "detail": "the deadline is before the start"},
         }
 
-    from_place = str(p.get("from_place", "Burruss Hall"))
-    to_place = str(p.get("to_place", "McBryde Hall"))
+    from_place = constraints["from_place"]
+    to_place = constraints["to_place"]
+
+    # UNKNOWN PLACES ARE A HARD FAILURE, NOT AN EMPTY PLAN. `_walk_result` used
+    # to record an unknown place as a note and return no legs, which produced a
+    # 0-minute itinerary whose rationale still said a route "fits". An unknown
+    # origin or destination now yields no itinerary plus a structured reason a
+    # UI can bind to, and the never-raise contract is preserved.
+    unknown: list[tuple[str, str]] = []
+    if _place(from_place) is None:
+        unknown.append(("from_place", from_place))
+    if _place(to_place) is None:
+        unknown.append(("to_place", to_place))
+    if unknown:
+        field, value = unknown[0]
+        known = config.static_place_keys()
+        label = {"from_place": "starting place", "to_place": "destination"}
+        label = label.get(field, "place")
+        reason = {
+            "code": "unknown_place",
+            "field": field,
+            "value": value,
+            "known_places": known,
+        }
+        if len(unknown) > 1:
+            reason["unknown"] = [{"field": f, "value": v} for f, v in unknown]
+        return {
+            "student_ref": str(student_ref), "itinerary": None,
+            "rationale": (
+                f"I can't plan that: I don't know the {label} {value!r}. "
+                f"Known places: {', '.join(known)}. Pick one of those and "
+                f"I'll plan the trip."),
+            "constraints": constraints,
+            "alternatives": [], "replan_trigger": None,
+            "feasible": False,
+            "infeasible_reason": reason,
+        }
 
     errors: list[str] = []
 
@@ -1099,18 +1216,35 @@ def plan_day(student_ref: str, start: str, end: str, prefs: dict | None = None,
         return {
             "student_ref": student_ref, "itinerary": None,
             "rationale": f"could not build a plan: {detail}",
+            "constraints": constraints,
             "alternatives": [], "replan_trigger": None, "error": detail,
+            "feasible": False,
+            "infeasible_reason": {"code": "no_legs", "detail": detail},
         }
-    # A bus is only the DEFAULT when it actually beats walking (see below), but a
-    # student may still prefer it (rain, luggage, injury). Without an override the
-    # planner always walks on a compact campus, so the bus-late re-plan -- the
-    # centrepiece of the demo -- could never fire.
-    prefer = str(((prefs or {}).get("prefer") or "fastest")).lower()
-    if prefer == "bus":
-        bus_candidate = next((c for c in candidates if c["used_bus"]), None)
-        itin_a = bus_candidate or min(candidates, key=lambda c: c["total_min"])
+
+    def _usable(c: dict) -> bool:
+        return bool(c.get("legs"))
+
+    def _meets_deadline(c: dict) -> bool:
+        return bool(c.get("arrives_in_window")) and _usable(c)
+
+    # FEASIBILITY BEATS SPEED. A fast bus that lands after the deadline is not a
+    # plan; a slower walk that makes it is. Explicit bus/walk preference is
+    # honoured only among candidates that actually fit, so `prefer: bus` can
+    # still fall back to walking when the bus cannot make the deadline. When
+    # nothing fits, the least-late USEFUL candidate is kept for inspection.
+    meeting = [c for c in candidates if _meets_deadline(c)]
+    if meeting:
+        if prefer == "bus":
+            pool = [c for c in meeting if c["used_bus"]] or meeting
+        elif prefer in ("walk", "walking"):
+            pool = [c for c in meeting if not c["used_bus"]] or meeting
+        else:
+            pool = meeting
+        itin_a = min(pool, key=lambda c: c["total_min"])
     else:
-        itin_a = min(candidates, key=lambda c: c["total_min"])
+        useful = [c for c in candidates if _usable(c)] or candidates
+        itin_a = max(useful, key=lambda c: c["slack_min"])
 
     trigger = _replan_trigger(src, itin_a)
     itin_b = None
@@ -1134,20 +1268,66 @@ def plan_day(student_ref: str, start: str, end: str, prefs: dict | None = None,
                 max_kcal=max_kcal, route_id=route_hint, skip_bus=False)
 
     chosen = itin_b if itin_b is not None else itin_a
-    if trigger is not None:
+    # A zero-leg "plan" is not something to render as a valid itinerary: hand the
+    # UI no itinerary at all rather than a 0-minute card that reads as success.
+    itinerary_out = chosen if chosen.get("legs") else None
+
+    # TOP-LEVEL FEASIBILITY DESCRIBES THE CHOSEN PLAN. A re-planned Plan B can
+    # itself miss the deadline, so this is computed after `chosen` is fixed.
+    # `late_by_min` is derived from the rounded slack the card already shows --
+    # never a fresh guess.
+    feasible = True
+    infeasible_reason: dict | None = None
+    if not _usable(chosen):
+        feasible = False
+        infeasible_reason = {"code": "no_legs",
+                             "known_places": config.static_place_keys()}
+    elif not chosen.get("arrives_in_window"):
+        feasible = False
+        infeasible_reason = {
+            "code": "deadline_missed",
+            "late_by_min": round(-float(chosen["slack_min"]), 1),
+        }
+
+    spare = int(round(abs(float(chosen["slack_min"]))))
+    timing = (f"with {spare} min to spare" if chosen["arrives_in_window"]
+              else f"{spare} min after the deadline")
+    if not feasible and infeasible_reason["code"] == "deadline_missed":
+        # NEVER say "fits" or "to spare" for a plan that misses: state the miss
+        # and the size of it, and name what would have to change.
+        late = int(round(float(infeasible_reason["late_by_min"])))
+        lead = (f"Use Plan B. {trigger['detail']} " if trigger is not None else "")
         rationale = (
-            f"Plan A ({'bus' if itin_a['used_bus'] else 'walk'}-based, "
-            f"arriving {itin_a['arrive_time']}) was invalidated: "
-            f"{trigger['cause']} -- {trigger['detail']}. Re-planned: "
-            f"{'bus' if chosen['used_bus'] else 'walk'}-based itinerary "
-            f"arriving {chosen['arrive_time']}."
+            f"{lead}No plan makes that deadline. The closest option reaches "
+            f"{to_place} at {_human_time(chosen['arrive_time'])}, {late} min "
+            f"after the deadline. Move the deadline later or drop the meal "
+            f"to fit."
+        )
+    elif not feasible:
+        rationale = (
+            "I couldn't build a usable route between those places, so there "
+            "is nothing to recommend. Check the starting point and "
+            "destination and try again."
+        )
+    elif trigger is not None:
+        rationale = (
+            f"Use Plan B. {trigger['detail']} The revised "
+            f"{'bus' if chosen['used_bus'] else 'walking'} plan reaches "
+            f"{to_place} at {_human_time(chosen['arrive_time'])}, {timing}."
         )
     else:
+        eat_leg = next((l for l in chosen["legs"] if l["type"] == "eat"), None)
+        if eat_leg is not None:
+            opening = (f"Yes — {eat_leg['item']} at {eat_leg['place']} fits "
+                       f"your time window.")
+        else:
+            opening = "A route fits your time window."
+        check = (" ".join(chosen["notes"]) if chosen["notes"] else
+                 "The latest vehicle snapshot does not invalidate it.")
         rationale = (
-            f"Leave {itin_a['leave_time']}, arrive {itin_a['arrive_time']} "
-            f"({itin_a['total_min']:g} min, slack {itin_a['slack_min']:g} min). "
-            + ("; ".join(itin_a["notes"]) if itin_a["notes"] else
-               "Live re-check found no violation.")
+            f"{opening} Leave at {_human_time(chosen['leave_time'])} and reach "
+            f"{to_place} at {_human_time(chosen['arrive_time'])}, {timing}. "
+            f"{check}"
         )
 
     alternatives: list[dict] = []
@@ -1163,8 +1343,11 @@ def plan_day(student_ref: str, start: str, end: str, prefs: dict | None = None,
 
     return {
         "student_ref": student_ref,           # surrogate only -- never PII
-        "itinerary": chosen,
+        "itinerary": itinerary_out,
         "rationale": rationale,
+        "feasible": feasible,
+        "infeasible_reason": infeasible_reason,
+        "constraints": constraints,
         "alternatives": alternatives,
         "replan_trigger": trigger,
     }

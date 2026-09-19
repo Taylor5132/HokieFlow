@@ -195,7 +195,9 @@ def eat_options(location_num: str, d: date | str, diet: str | None = None,
   may be negative when already closed.
 - `eat_options` applies filters **in code**: diet tag match, `avoid` allergens
   (substring match against the allergen string, case-insensitive), kcal ceiling.
-  **Allergy filtering is a hard filter, never a preference.**
+  **Allergy filtering is a hard filter, never a preference.** A requested diet
+  also rejects a row whose declared allergens directly contradict its diet tag
+  (observed source conflict: `vegan` plus `Eggs`).
 - Join note: the hours API's `extra_data[key="foodpro_id"].value` equals the menu
   API's `locationNum` (verified for D2 = `15`). Keep this as a documented helper.
 - Verified expectations to assert:

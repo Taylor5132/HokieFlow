@@ -98,8 +98,10 @@ FUNCTIONS: list[tuple[str, str, str, str]] = [
         "excluded as UNKNOWN unless venue_allergen_free is true; (3) a blank "
         "field in a documented allergen-free kitchen (Viridian, which VT states "
         "is free from the top nine allergens with separate preparation space) "
-        "is treated as safe and IS returned. Never describe an item with "
-        "allergens_known=false as safe.",
+        "is treated as safe and IS returned. Diet tags are cross-checked against "
+        "declared allergens, so a vegan-tagged row declaring Eggs/Milk/Fish/"
+        "Shellfish is excluded as a source-data conflict. Never describe an item "
+        "with allergens_known=false as safe.",
         f"""
         SELECT COALESCE(to_json(collect_list(s)), '[]') FROM (
           SELECT named_struct(
@@ -118,6 +120,16 @@ FUNCTIONS: list[tuple[str, str, str, str]] = [
                  OR e.location_num = p_location_num)
             AND (p_diet IS NULL OR p_diet = ''
                  OR array_contains(e.diet_tags, lower(trim(p_diet))))
+            AND NOT (
+              lower(trim(COALESCE(p_diet, ''))) = 'vegan'
+              AND size(array_intersect(
+                    transform(e.allergens, x -> lower(trim(x))),
+                    array('milk', 'eggs', 'fish', 'crustacean shellfish'))) > 0)
+            AND NOT (
+              lower(trim(COALESCE(p_diet, ''))) = 'vegetarian'
+              AND size(array_intersect(
+                    transform(e.allergens, x -> lower(trim(x))),
+                    array('fish', 'crustacean shellfish'))) > 0)
             AND (p_avoid IS NULL OR p_avoid = ''
                  OR (
                    size(array_intersect(
@@ -168,6 +180,7 @@ CHECKS: list[tuple[str, str, str | None, str | None]] = [
     ("get_live_bus", "NULL", "sched_delta_min", None),
     ("get_live_bus", "'SME'", "SME", None),
     ("find_food", "'15', 'vegetarian', 'Peanuts,Tree Nuts', 800, false", "allergens_known", "Peanuts"),
+    ("find_food", "'15', 'vegan', 'Sesame', NULL, false", "diet_tags", "Whole Wheat Penne Pasta"),
     # The three-way safety policy, checked in BOTH directions:
     #  - a documented allergen-free kitchen must SURVIVE an avoid filter
     #    (all 48 Viridian items have a blank allergen field)

@@ -14,7 +14,14 @@ gold/
 # Derivable from fixtures/bt_gtfs.bin by hokieday.gtfs.ensure_extracted()
 fixtures/gtfs/
 
+# Local agent/session artifacts -- never commit
+.memory/
+
 # Credentials -- never commit
-.env
+.env*
+!.env.example
+.databrickscfg
 databrickscfg
+credentials.json
+credentials*.json
 token*

@@ -220,14 +220,22 @@ def build_map_svg(itinerary: dict | None, overlay: dict | None = None,
     parts.append(f'<text x="{PAD + bar_px + 8:.1f}" y="{by + 4}" fill="{DIM}" '
                  f'font-size="11" font-family="sans-serif">{html.escape(_fmt_m(nice))}</text>')
 
-    # ---- legend: says plainly what is real and what is an estimate
+    # ---- legend: include only geometry/markers that are actually drawn
     ly = 16
-    legend = [("walk (straight-line estimate)", WALK, True),
-              ("bus (GTFS shape geometry)", BUS, False)]
+    legend = []
+    if walk_lines:
+        legend.append(("walk (straight-line estimate)", WALK, True))
+    if bus_paths:
+        legend.append(("bus (GTFS shape geometry)", BUS, False))
     if overlay_paths:
         legend.append(("plan A route (abandoned)", "#4b5563", True))
-    legend += [("start", ORIGIN, False), ("eat", EAT, False),
-               ("destination", DEST, False)]
+    marker_kinds = {m["kind"] for m in markers}
+    if "origin" in marker_kinds:
+        legend.append(("start", ORIGIN, False))
+    if "eat" in marker_kinds:
+        legend.append(("eat", EAT, False))
+    if "dest" in marker_kinds:
+        legend.append(("destination", DEST, False))
     parts.append('<g font-size="11" font-family="sans-serif">')
     for i, (label, colour, dashed) in enumerate(legend):
         x = 12 + i * 0

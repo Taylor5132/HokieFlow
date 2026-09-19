@@ -42,6 +42,8 @@ class TestMapSvg(unittest.TestCase):
         svg = mapview.build_map_svg(itin)
         xml.dom.minidom.parseString(svg)              # must not raise
         self.assertNotIn("<polyline", svg, "a walk-only plan has no bus geometry")
+        self.assertNotIn("bus (GTFS shape geometry)", svg,
+                         "the legend must not advertise geometry that is absent")
         self.assertGreater(svg.count("stroke-dasharray"), 0, "walk legs must be drawn")
 
     def test_bus_plan_draws_the_gtfs_shape(self):
@@ -109,22 +111,37 @@ class TestMapSvg(unittest.TestCase):
 
 
 class TestDeepLinks(unittest.TestCase):
-    """Keyless handoff: verified that Google Maps URLs need no API key, and Apple
-    map links need none either (dirflg w=foot, r=transit)."""
+    """Keyless handoff, one pair of app links per movement leg.
+
+    This shape is load-bearing: the old one-link route went directly from the
+    origin to class and silently skipped the dining waypoint.
+    """
 
     def _links(self, prefs=None):
         return server.deep_links(_plan(prefs))
 
-    def test_four_links_for_both_apps_and_modes(self):
+    def test_each_walk_leg_gets_both_apps(self):
         links = self._links()
-        self.assertEqual(len(links), 4)
+        movement = [l for l in _plan()["itinerary"]["legs"]
+                    if l["type"] in ("walk", "bus")]
+        self.assertEqual(len(links), len(movement) * 2)
+        self.assertEqual({l["app"] for l in links}, {"Apple Maps", "Google Maps"})
         urls = " ".join(l["url"] for l in links)
         self.assertIn("maps.apple.com", urls)
         self.assertIn("google.com/maps", urls)
-        self.assertIn("dirflg=w", urls)          # Apple: by foot
-        self.assertIn("dirflg=r", urls)          # Apple: public transit
+        self.assertIn("dirflg=w", urls)
         self.assertIn("travelmode=walking", urls)
-        self.assertIn("travelmode=transit", urls)
+        self.assertTrue(any("D2 at Dietrick Hall" in l["label"] for l in links))
+        self.assertTrue(any("McBryde Hall" in l["label"] for l in links))
+
+    def test_bus_leg_uses_transit_mode(self):
+        result = _plan({"prefer": "bus"})
+        plan_a = _plan_a(result)
+        links = server.deep_links({"itinerary": plan_a})
+        bus_links = [l for l in links if l["mode"] == "transit"]
+        self.assertEqual(len(bus_links), 2)
+        self.assertTrue(any("dirflg=r" in l["url"] for l in bus_links))
+        self.assertTrue(any("travelmode=transit" in l["url"] for l in bus_links))
 
     def test_google_urls_keep_the_required_api_parameter(self):
         for link in self._links():
@@ -137,16 +154,19 @@ class TestDeepLinks(unittest.TestCase):
             self.assertIn("%2C", link["url"], "coordinate commas must be encoded")
             self.assertNotIn(",", link["url"].split("?")[1].split("&")[0])
 
-    def test_links_use_the_plans_own_origin_and_destination(self):
-        """The handoff must match the plan, or it sends the user elsewhere."""
+    def test_links_use_each_legs_own_endpoints(self):
+        """Each handoff must match its leg, including the dining waypoint."""
         result = _plan()
-        legs = result["itinerary"]["legs"]
-        origin = next(l["from_coords"] for l in legs if l.get("from_coords"))
-        dest = next(l["to_coords"] for l in reversed(legs) if l.get("to_coords"))
-        url = server.deep_links(result)[0]["url"]
-        self.assertIn(f"{origin[0]:.6f}", url)
-        self.assertIn(f"{origin[1]:.6f}".replace("-", "-"), url)
-        self.assertIn(f"{dest[0]:.6f}", url)
+        legs = [l for l in result["itinerary"]["legs"]
+                if l["type"] in ("walk", "bus")]
+        links = server.deep_links(result)
+        for index, leg in enumerate(legs):
+            for link in links[index * 2:index * 2 + 2]:
+                url = link["url"]
+                self.assertIn(f"{leg['from_coords'][0]:.6f}", url)
+                self.assertIn(f"{leg['from_coords'][1]:.6f}", url)
+                self.assertIn(f"{leg['to_coords'][0]:.6f}", url)
+                self.assertIn(f"{leg['to_coords'][1]:.6f}", url)
 
     def test_device_origin_flows_into_the_links(self):
         key = config.register_dynamic_place(37.22990, -80.41420, "your location", 9.0)

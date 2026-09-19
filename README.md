@@ -1,4 +1,4 @@
-# HokieDay
+# HokieFlow
 
 Unified campus-life agent for Virginia Tech. Built for VTHacks 14, Deloitte × Databricks challenge.
 
@@ -14,12 +14,13 @@ hokieday/
     gtfs.py            # static GTFS -> departures          [worker: gtfs]
     livebus.py         # live buses -> crowding + lateness   [worker: livebus]
     dining.py          # menu, nutrition, allergens, hours   [worker: dining]
-    tools.py           # the 8-tool contract (UC-function ready)
-    agent.py           # plan_day + the re-planning loop
+    tools.py           # deterministic tools + plan_day/re-planning loop
+    # agent.py         # NOT BUILT YET: future LLM tool-selection layer
   scripts/
-    seed_cache.py      # build cache/ from real captured payloads
-    poll_buses.py      # 60s poller -> appends the ML training dataset
-    ingest_gtfs.py
+    seed_cache.py      # build fixtures/ from known-good captured payloads
+    tap_buses.py       # 60s poller -> appends the ML training dataset
+    export_gold.py     # local decision-ready data -> JSONL handoff
+    load_to_databricks.py
   cache/               # LIVE cache. Refreshed whenever we hit the network.
   fixtures/            # FROZEN replay snapshot. ONLY scripts/seed_cache.py writes it.
   data/                # bronze JSONL (the ML dataset we generate ourselves)
@@ -60,7 +61,7 @@ mean **+0.96 min** — physically sensible. Override with `DEMO_NOW=<iso8601>`.
 
 ```bash
 export DEMO_MODE=cache
-python3 -m unittest discover -s tests -v     # 55 tests, no network
+python3 -m unittest discover -s tests -v     # 249 tests, no network
 ```
 
 With `DEMO_MODE=cache` nothing touches the network and the clock is pinned. If a

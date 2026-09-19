@@ -1,4 +1,4 @@
-# HokieDay — 4-minute pitch deck
+# HokieFlow — 4-minute pitch deck
 
 **8 slides.** Timings are targets for a 4:00 pitch with ~10s of slack.
 
@@ -12,7 +12,7 @@
 
 ## Slide 1 — Title · 15s
 
-> # HokieDay
+> # HokieFlow
 > ### Campus life, in one answer — and it re-plans when reality moves.
 >
 > Deloitte × Databricks · VTHacks 14 · [team names]
@@ -63,8 +63,8 @@ Three ordinary questions, each needing different systems:
    → plan appears: walk → **eat** (a real dish, with kcal) → walk. Origin shown.
 2. **"Same trip, but I want the bus."**
    → **PLAN A** built (bus route, boarding stop, wait)
-3. Live state is re-checked → **RE-PLANNED** banner with a real cause from the live feed:
-   *"route CAS is running 1.43 min EARLY and the plan only allows 0.9 min of boarding buffer at stop 1125"*
+3. The captured vehicle state is re-checked → **RE-PLANNED** banner with a real cause from the feed:
+   *"Route CAS is 1.4 min early, leaving only 1.5 min to board at Tennis Courts; the plan requires a 2 min buffer."*
 4. **PLAN B** appears beside PLAN A, dimmed, so the change is **inspectable, not asserted**
 
 **Say this, not more:** *"Plan A was built, then reality was re-checked, and plan A died. Both plans are on screen — you can see exactly what changed and why."*
@@ -166,10 +166,10 @@ Service utilisation ──▶ dining + transit ROI               (secondary)
 |---|---|
 | Different from Google Maps / the dining app? | We're the orchestration layer across systems, and we re-plan rather than inform. |
 | Where's the Deloitte part? | Strategy framing: baseline, value case, phased roadmap, governance. |
-| Is this real data? | Name the feeds. One locally-labelled demo control injects a bus delay; everything else is real, and events is the only scraped source. |
+| Is this real data? | Name the feeds: BT GTFS static schedule, a captured-live BT vehicle snapshot, and VT menu / nutrition / allergens / hours. The offline demo replays that frozen snapshot. Weather and events are roadmap, and there is no synthetic delay control — re-planning runs on the captured live state. |
 | How do you handle student privacy? | No academic records enter the lakehouse; Unity Catalog enforces it. |
-| Why an LLM rather than a script? | Questions are open-vocabulary and multi-constraint. The model does the fuzzy part; the tools do the exact part. |
-| What's the model predicting? | Bus lateness — trained on data our own pipeline generated overnight. |
+| Why an LLM rather than a script? | The offline demo uses a bounded parser today. The agent layer is for open-vocabulary clarification and tool choice; deterministic tools still own every exact fact. |
+| What's the model predicting? | Not deployed yet. Today we act on observed schedule deviation; prediction is gated until the poller produces at least 2,000 labelled rows. |
 
 # What we'd cut if we were short on time
 

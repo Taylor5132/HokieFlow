@@ -1,4 +1,4 @@
-"""HokieDay — unified campus-life agent for Virginia Tech.
+"""HokieFlow — unified campus-life agent for Virginia Tech.
 
 Core package is pure-stdlib so it runs identically:
   * locally (tests against cached fixtures, DEMO_MODE=cache)

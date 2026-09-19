@@ -13,13 +13,12 @@ All offline. DEMO_MODE=cache only.
 from __future__ import annotations
 
 import ast
-import os
 import unittest
 from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from hokieday import config, cache
+from hokieday import config
 
 REPO = Path(__file__).resolve().parent.parent
 LIB = REPO / "hokieday"

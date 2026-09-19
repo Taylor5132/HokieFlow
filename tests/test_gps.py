@@ -20,8 +20,9 @@ from hokieday import config, tools
 
 from app import server
 
-BURRUSS = (37.22957, -80.41394)
-NEAR_CAMPUS = (37.22990, -80.41420)          # ~40 m from Burruss
+# Official VT GIS centroid (legacy spike coordinates were ~0.87 km east).
+BURRUSS = (37.22924778, -80.42396247)
+NEAR_CAMPUS = (37.22950, -80.42380)          # ~30 m from Burruss
 FAR_AWAY = (38.90, -77.03)                   # Washington DC, ~350 km
 
 
