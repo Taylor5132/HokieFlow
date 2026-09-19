@@ -269,6 +269,28 @@ class LocalSource:
             nums = [str(location_num)]
             with_nutrition = True
 
+        # A kcal ceiling is a HARD constraint. Without per-location nutrition we
+        # cannot prove ANY item satisfies it, so an all-locations kcal query
+        # returns NO items -- never unproven ones -- with a typed skipped state.
+        if max_kcal is not None and not with_nutrition:
+            return {
+                "items": [],
+                "sources_ok": [],
+                "sources_skipped": [{
+                    "location_num": num,
+                    "location_name": config.DINING_LOCATIONS.get(num, ""),
+                    "status": "nutrition_unavailable",
+                    "reason": ("kcal ceiling requires per-location nutrition; "
+                               "a campus-wide search does not fetch it"),
+                } for num in nums],
+                "statuses": [],
+                "nutrition_attached": False,
+                "reason": ("max_kcal is a hard constraint but no campus-wide "
+                           "nutrition was fetched; refusing to return items "
+                           "whose calories are unverified. Query one location "
+                           "or omit max_kcal."),
+            }
+
         rows: list[dict] = []
         sources_ok: list[str] = []
         sources_skipped: list[dict] = []
@@ -279,10 +301,7 @@ class LocalSource:
             try:
                 items = dining.eat_options(
                     num, today, diet=diet, avoid=tuple(avoid or ()),
-                    # No nutrition fetch on a campus-wide search, so do not ask
-                    # eat_options to apply a kcal ceiling it cannot evaluate.
-                    max_kcal=(None if (max_kcal is not None
-                                       and not with_nutrition) else max_kcal),
+                    max_kcal=max_kcal,
                     open_only=open_only,
                 )
             except Exception as exc:                         # noqa: BLE001
@@ -318,10 +337,10 @@ class LocalSource:
                     # UNKNOWN, never allergen-free. The flag -- not the
                     # absence -- is what the agent must surface.
                     "allergens_known": bool(it.allergens),
-                    # True when the blank allergen field is EXPLAINED by a
-                    # documented allergen-free kitchen (Viridian), rather than
-                    # being genuinely unknown. The agent must surface which.
-                    "venue_allergen_free": config.is_venue_allergen_free(it.section),
+                    # True only for the documented D2 Viridian kitchen (location
+                    # + section bound together, never section text alone).
+                    "venue_allergen_free": config.is_venue_allergen_free(
+                        it.section, it.location_num),
                     "recipe_id": it.recipe_id,
                     "portion": f"{it.portion_size} {it.portion_unit}".strip(),
                 })
@@ -701,6 +720,7 @@ def find_food(location_num: str | None = None, diet: str | None = None,
     sources_ok: list[str] | None = None
     sources_skipped: list[dict] = []
     statuses: list[dict] = []
+    search_reason: str | None = None
     try:
         search = getattr(src, "food_search", None)
         if callable(search):
@@ -709,6 +729,7 @@ def find_food(location_num: str | None = None, diet: str | None = None,
             sources_ok = res.get("sources_ok")
             sources_skipped = res.get("sources_skipped") or []
             statuses = res.get("statuses") or []
+            search_reason = res.get("reason")
         else:
             # A Source that only implements the frozen protocol: partial-success
             # bookkeeping is unavailable, but the rows still work.
@@ -736,9 +757,10 @@ def find_food(location_num: str | None = None, diet: str | None = None,
 
     reason = None
     if not rows:
-        reason = ("no menu items matched (allergen filters are hard filters; "
-                  "a kcal ceiling needs nutrition data, which may be "
-                  "unavailable offline; open_only=True drops closed locations)")
+        reason = search_reason or (
+            "no menu items matched (allergen filters are hard filters; "
+            "a kcal ceiling needs nutrition data, which may be "
+            "unavailable offline; open_only=True drops closed locations)")
     return {
         "location_num": location_num, "diet": diet, "avoid": list(avoid),
         "max_kcal": max_kcal, "open_only": bool(open_only),

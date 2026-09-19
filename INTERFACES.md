@@ -234,6 +234,8 @@ STATUS_EMPTY = "empty"; STATUS_UNAVAILABLE = "unavailable"
 class LocationStatus:
     location_num: str; name: str; date: date; status: str
     open_now: bool | None; menu_count: int | None
+    menu_status: str | None      # ok | empty | unavailable (INDEPENDENT)
+    hours_status: str | None     # ok | closed | unavailable (INDEPENDENT)
     windows: tuple[HoursWindow, ...]; stale: bool | None
     source: str | None; fetched_at: str | None; reason: str | None
     def as_dict(self) -> dict
@@ -276,17 +278,33 @@ def window_span(w: HoursWindow) -> tuple[datetime, datetime]   # overnight roll
  reason: str | None}
 ```
 
-**Status semantics** (precedence): unreachable source -> `unavailable`; no
-published hours for the date -> `closed` (even when a menu exists); operating
-but zero recipes -> `empty`; otherwise `ok`. `stale` is orthogonal (served
+**Status semantics.** `menu_status` and `hours_status` are independent; the
+composite `status` follows a fixed precedence: **any unavailable source ->
+`unavailable`** (so a closed day with an unreachable menu is `unavailable`, and
+hours failure is never plain `ok`); else `hours_status == closed` -> `closed`;
+else `menu_status == empty` -> `empty`; else `ok`. `stale` is orthogonal (served
 copy older than `max_age_s`). `window_span` rolls `close <= open` to the next
-day, so an overnight window (e.g. DX 22:00:01 -> 02:00:00) reads correctly.
+day and `is_open` also considers the previous-day occurrence, so an overnight
+window (e.g. DX 22:00:01 -> 02:00:00) reads correctly at 01:00; with multiple
+units the close is the union's LAST close.
 
-**`tools.find_food(location_num=None)`** now searches every configured location
-and returns `sources_ok` / `sources_skipped` / `statuses` in addition to
-`items`; no location is ever silently dropped. Deterministic ranking is
-unchanged (meal-ish section, most filling, name). For an all-locations search
-kcal is left unknown on purpose (no campus-wide nutrition sweep).
+**Future capture is not data.** A menu/hour envelope whose `fetched_at` is
+after `config.now()` (the replay/request clock) is rejected: `menu_result`
+returns `unavailable` (`not_yet_available`) with no rows and `hours()` raises
+`NotYetAvailableError`. This is why replay only serves D2 menus: any promoted
+later capture would otherwise read as fresh.
+
+**Payload source-matching.** `menu_result` validates the payload's own
+`locationNum` and `date` against the normalized request; a mismatch returns
+`unavailable` (`source_mismatch`), never the wrong hall's rows.
+
+**`tools.find_food(location_num=None)`** searches every configured location and
+returns `sources_ok` / `sources_skipped` / `statuses`; no location is silently
+dropped. Deterministic ranking is unchanged (meal-ish section, most filling,
+name). A **kcal ceiling is a hard constraint**: an all-locations `max_kcal`
+query does not fetch campus-wide nutrition, so it returns **no items** with
+typed `nutrition_unavailable` skipped entries and an explicit reason. A single
+location still attaches real macros and honors the ceiling.
 
 ---
 

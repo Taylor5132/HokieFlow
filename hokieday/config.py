@@ -322,10 +322,22 @@ DIET_CODES = {"wcveg": "Vegan", "wcvtn": "Vegetarian", "wcha": "Halal Certified 
 # venue-level guarantee -- which makes these the safest items on the menu. A
 # blanket "blank means unknown, exclude it" rule would hide exactly the food a
 # peanut-allergic student needs.
+#
+# BOUND TO THE LOCATION, NOT THE SECTION TEXT ALONE. "Viridian" is only the
+# allergen-free kitchen inside D2 (`15`); a differently-named or spoofed section
+# at another hall must never inherit this exception. `location_num` is required.
+VENUE_ALLERGEN_FREE_LOCATIONS = ("15",)
 VENUE_ALLERGEN_FREE_SECTIONS = ("viridian",)
 
 
-def is_venue_allergen_free(section: str | None) -> bool:
-    """True when an item's section belongs to a documented allergen-free kitchen."""
+def is_venue_allergen_free(section: str | None,
+                           location_num: str | None = None) -> bool:
+    """True only for the documented D2 Viridian kitchen.
+
+    Both the location AND the section must match; section text alone is not
+    sufficient (a venue guarantee is tied to the physical kitchen).
+    """
+    if str(location_num or "").strip() not in VENUE_ALLERGEN_FREE_LOCATIONS:
+        return False
     s = (section or "").strip().lower()
     return any(s.startswith(p) for p in VENUE_ALLERGEN_FREE_SECTIONS)

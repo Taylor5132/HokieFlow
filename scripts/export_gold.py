@@ -132,7 +132,8 @@ def build_bundle() -> dict:
                     # in a documented allergen-free kitchen (Viridian), where the
                     # blank is explained by a venue-level guarantee (SDD risk R8).
                     "allergens_known": bool(it.allergens),
-                    "venue_allergen_free": config.is_venue_allergen_free(it.section),
+                    "venue_allergen_free": config.is_venue_allergen_free(
+                        it.section, it.location_num),
                 })
         except Exception as exc:                       # noqa: BLE001
             print(f"  WARN menu {loc}: {exc}")

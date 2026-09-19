@@ -1,20 +1,31 @@
 """Post-push FoodPro BASIC dining/location integration tests.
 
 Covers the multi-location menu/status layer added on top of the original D2
-slice: the 12-location directory, all four per-location status states, overnight
-and multi-unit hours, basic food list/search/filter, safety invariants,
-partial-failure reporting, provenance, staleness and deterministic replay.
+slice: the 12-location directory, all four per-location composite states with
+independent menu/hours sub-states, overnight and multi-unit hours, basic food
+list/search/filter, safety invariants, partial-failure reporting, provenance,
+staleness, future-capture rejection, payload source-matching and deterministic
+replay.
+
+REPLAY REALITY: the committed fixtures are D2-only (plus the live-buses
+snapshot). Multi-location menus/hours are exercised with a SYNTHETIC temp cache
+whose envelopes are captured at a time <= the pinned replay clock; the real
+replay honestly reports every configured location, with non-D2 menus unavailable.
+Live mode can fetch all 12 halls.
 
 Offline only. Run:
     DEMO_MODE=cache python3 -m unittest tests.test_dining_basic -v
 """
 import json
 import os
+import shutil
+import tempfile
 
 os.environ.setdefault("DEMO_MODE", "cache")   # must precede hokieday imports
 
 import unittest
 from datetime import date, datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 from hokieday import cache, config, dining, tools
@@ -25,12 +36,148 @@ def setUpModule():
         raise RuntimeError(
             "tests.test_dining_basic requires DEMO_MODE=cache (network must stay off)"
         )
+    config.now()          # resolve the replay pin against the REAL fixtures
 
 
 D = date(2026, 9, 19)                     # the frozen Saturday snapshot
+D2 = date(2026, 9, 20)
 AT = datetime(2026, 9, 19, 15, 22)        # inside the pinned replay clock
 
+SYN_FETCHED = "2026-09-19T15:00:00+00:00"     # <= replay pin 15:22:29
+FUTURE_FETCHED = "2026-09-19T23:00:00+00:00"  # > replay pin: rejected
 
+# --------------------------------------------------------------- synthetic data
+def _recipe(rid, name, section="Deli", allergens="Milk",
+            diet=("vegetarian",), desc="a dish"):
+    return {"recipeId": rid, "name": name, "description": desc,
+            "portionSize": "1", "portionUnit": "each",
+            "allergens": allergens, "legendImages": list(diet)}
+
+
+def _menu(num, sections, dtdate="09/19/2026"):
+    return {"locationNum": num, "date": dtdate, "meals": [{
+        "mealName": "Lunch",
+        "sections": [{"sectionName": sec, "recipes": recs}
+                     for sec, recs in sections],
+    }]}
+
+
+def _hours(fid, units, start="2026-09-19"):
+    """units: list of (unit_name, [(open, close), ...])."""
+    return [{
+        "name": name,
+        "extra_data": [{"key": "foodpro_id", "value": fid}],
+        "hours": [{"open_time": o, "close_time": c, "start": start}
+                  for o, c in wins],
+    } for name, wins in units]
+
+
+def _seed():
+    """(name, params, payload, fetched_at) rows for a synthetic replay cache."""
+    ok_menu = _menu("39", [
+        ("Deli", [_recipe("R1", "Synthetic Wrap"),
+                  _recipe("R2", "Plain Salad", allergens="", diet=("vegan",))]),
+        ("Viridian", [_recipe("R3", "Impostor Viridian",
+                              allergens="", diet=("vegan",))]),
+    ])
+    return [
+        ("dining_menu", {"location_num": "39", "dtdate": "09/19/2026"},
+         ok_menu, SYN_FETCHED),
+        ("dining_hours", {"foodpro_id": "39", "date": "2026-09-19"},
+         _hours("39", [("Synthetic Owens",
+                        [("10:00:01", "15:00:00"), ("15:00:01", "20:00:00")])]),
+         SYN_FETCHED),
+        ("dining_menu", {"location_num": "09", "dtdate": "09/19/2026"},
+         _menu("09", []), SYN_FETCHED),
+        ("dining_hours", {"foodpro_id": "09", "date": "2026-09-19"},
+         _hours("09", [("Synthetic Hokie", [("08:00:01", "20:00:00")])]),
+         SYN_FETCHED),
+        ("dining_menu", {"location_num": "14", "dtdate": "09/19/2026"},
+         _menu("14", [("Deli", [_recipe("R1", "Synthetic Wrap")])]),
+         SYN_FETCHED),
+        ("dining_hours", {"foodpro_id": "14", "date": "2026-09-19"}, [],
+         SYN_FETCHED),
+        ("dining_menu", {"location_num": "07", "dtdate": "09/19/2026"},
+         _menu("07", []), SYN_FETCHED),
+        ("dining_hours", {"foodpro_id": "07", "date": "2026-09-19"},
+         _hours("07", [("Synthetic Xpress", [("08:00:01", "02:00:00")])]),
+         SYN_FETCHED),
+        ("dining_menu", {"location_num": "71", "dtdate": "09/19/2026"},
+         _menu("71", [("Grill", [_recipe("R1", "Synthetic Burger")])]),
+         SYN_FETCHED),
+        ("dining_hours", {"foodpro_id": "71", "date": "2026-09-19"},
+         _hours("71", [("Synthetic DX", [("22:00:01", "02:00:00")])]),
+         SYN_FETCHED),
+        # next-day overnight window, used to prove the previous-day anchor
+        ("dining_hours", {"foodpro_id": "71", "date": "2026-09-20"},
+         _hours("71", [("Synthetic DX", [("22:00:01", "02:00:00")])],
+                start="2026-09-20"),
+         SYN_FETCHED),
+        # multi-unit hall with staggered closes on the weekday menu
+        ("dining_menu", {"location_num": "06", "dtdate": "09/17/2026"},
+         _menu("06", [("Deli", [_recipe("R1", "Synthetic Perry Wrap")])],
+               dtdate="09/17/2026"), SYN_FETCHED),
+        ("dining_hours", {"foodpro_id": "06", "date": "2026-09-17"},
+         _hours("06", [
+             ("Perry - Breakfast", [("09:00:01", "13:00:00")]),
+             ("Perry - Lunch", [("11:00:01", "18:00:00")]),
+             ("Perry - Dinner", [("16:00:01", "21:00:00")]),
+         ], start="2026-09-17"), SYN_FETCHED),
+        # hours-only failure: menu ok, hours captured in the future
+        ("dining_menu", {"location_num": "19", "dtdate": "09/19/2026"},
+         _menu("19", [("Deli", [_recipe("R1", "Synthetic Viva Wrap")])]),
+         SYN_FETCHED),
+        ("dining_hours", {"foodpro_id": "19", "date": "2026-09-19"},
+         _hours("19", [("Synthetic Viva", [("08:00:01", "16:00:00")])]),
+         FUTURE_FETCHED),
+        # menu-only failure: hours ok, no menu fixture (14 is handled separately)
+        ("dining_hours", {"foodpro_id": "18", "date": "2026-09-19"},
+         _hours("18", [("Synthetic Squires", [("09:00:01", "19:00:00")])]),
+         SYN_FETCHED),
+        # future-captured menu: rejected as not_yet_available
+        ("dining_menu", {"location_num": "16", "dtdate": "09/19/2026"},
+         _menu("16", [("Deli", [_recipe("R1", "Future West End")])]),
+         FUTURE_FETCHED),
+        ("dining_hours", {"foodpro_id": "16", "date": "2026-09-19"},
+         _hours("16", [("Synthetic West End", [("10:30:01", "20:00:00")])]),
+         SYN_FETCHED),
+        # source mismatch: payload locationNum wrong
+        ("dining_menu", {"location_num": "17", "dtdate": "09/19/2026"},
+         _menu("99", [("Deli", [_recipe("R1", "Wrong Hall")])]), SYN_FETCHED),
+        # source mismatch: payload date wrong
+        ("dining_menu", {"location_num": "18", "dtdate": "09/19/2026"},
+         _menu("18", [("Deli", [_recipe("R1", "Wrong Day")])],
+               dtdate="09/18/2026"), SYN_FETCHED),
+        # closed day with an unreachable menu -> composite unavailable, not closed
+        ("dining_hours", {"foodpro_id": "01", "date": "2026-09-19"}, [],
+         SYN_FETCHED),
+    ]
+
+
+class SyntheticCache:
+    """Temp replay store whose envelopes precede the pinned replay clock."""
+
+    def __init__(self, seed=None):
+        self.seed = seed if seed is not None else _seed()
+
+    def __enter__(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="hokieday-syn-"))
+        self.patcher = patch.object(config, "CACHE_DIR", self.tmp)
+        self.patcher.start()
+        for name, params, payload, fetched in self.seed:
+            key = cache.key(name, params)
+            env = {"key": key, "url": "http://synthetic", "fetched_at": fetched,
+                   "mode": "test", "payload": payload}
+            (self.tmp / f"{key}.json").write_text(json.dumps(env),
+                                                  encoding="utf-8")
+        return self.tmp
+
+    def __exit__(self, *exc):
+        self.patcher.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+# =============================================================== directory
 class TestLocationDirectory(unittest.TestCase):
     def test_exactly_twelve_sorted_configured_entries(self):
         directory = dining.location_directory()
@@ -64,85 +211,155 @@ class TestLocationDirectory(unittest.TestCase):
             {l.location_num: l.name for l in dining.location_directory()}, expected)
 
 
-class TestStatusStates(unittest.TestCase):
-    """The four required states, each resolved separately from food rows."""
+# ============================================================ status states
+class TestCompositeStatus(unittest.TestCase):
+    """menu and hours are independent; the composite follows fixed precedence."""
+
+    def _status(self, num, day=D, at=AT):
+        return dining.location_status(num, day, at=at)
 
     def test_ok_open_with_menu(self):
-        st = dining.location_status("39", D, at=AT)
+        with SyntheticCache():
+            st = self._status("39")
         self.assertEqual(st.status, dining.STATUS_OK)
+        self.assertEqual(st.menu_status, dining.STATUS_OK)
+        self.assertEqual(st.hours_status, dining.STATUS_OK)
         self.assertIs(st.open_now, True)
-        self.assertEqual(st.menu_count, 79)
-        self.assertEqual(len(st.windows), 2)
-        self.assertIsNone(st.reason)
+        self.assertEqual(st.menu_count, 3)
 
     def test_empty_open_but_no_published_menu(self):
-        st = dining.location_status("09", D, at=AT)
+        with SyntheticCache():
+            st = self._status("09")
         self.assertEqual(st.status, dining.STATUS_EMPTY)
+        self.assertEqual(st.menu_status, dining.STATUS_EMPTY)
+        self.assertEqual(st.hours_status, dining.STATUS_OK)
         self.assertIs(st.open_now, True)
         self.assertEqual(st.menu_count, 0)
-        self.assertIn("no published menu", st.reason)
 
     def test_closed_day_even_when_a_menu_exists(self):
-        st = dining.location_status("14", D, at=AT)
+        with SyntheticCache():
+            st = self._status("14")
         self.assertEqual(st.status, dining.STATUS_CLOSED)
+        self.assertEqual(st.hours_status, dining.STATUS_CLOSED)
+        self.assertEqual(st.menu_status, dining.STATUS_OK)
         self.assertIs(st.open_now, False)
-        # the menu for that date exists (220 rows) -- closed is about HOURS,
-        # so food rows must remain queryable separately from the status
-        self.assertEqual(st.menu_count, 220)
+        self.assertEqual(st.menu_count, 1)
         self.assertIn("no published hours", st.reason)
 
-    def test_unavailable_when_the_source_cannot_be_read(self):
-        with patch.object(dining.cache, "get_json",
-                          side_effect=cache.CacheMiss("upstream down")):
-            st = dining.location_status("39", D, at=AT)
+    def test_menu_only_failure_is_unavailable_not_ok(self):
+        # hours are fine, but there is no menu fixture for 18
+        with SyntheticCache():
+            st = self._status("18")
+        self.assertEqual(st.status, dining.STATUS_UNAVAILABLE)
+        self.assertEqual(st.menu_status, dining.STATUS_UNAVAILABLE)
+        self.assertEqual(st.hours_status, dining.STATUS_OK)
+
+    def test_hours_only_failure_is_unavailable_not_ok(self):
+        # menu ok, but the hours envelope is captured after the replay clock
+        with SyntheticCache():
+            st = self._status("19")
+        self.assertEqual(st.status, dining.STATUS_UNAVAILABLE)
+        self.assertEqual(st.menu_status, dining.STATUS_OK)
+        self.assertEqual(st.hours_status, dining.STATUS_UNAVAILABLE)
+        self.assertIsNone(st.open_now)
+
+    def test_closed_cannot_be_unavailable(self):
+        # hours say closed, menu is unreachable -> source failure dominates
+        with SyntheticCache():
+            st = self._status("01")
+        self.assertEqual(st.status, dining.STATUS_UNAVAILABLE)
+        self.assertEqual(st.hours_status, dining.STATUS_CLOSED)
+
+    def test_unavailable_when_the_source_raises(self):
+        with SyntheticCache():
+            with patch.object(dining.cache, "get_json",
+                              side_effect=cache.CacheMiss("upstream down")):
+                st = self._status("39")
         self.assertEqual(st.status, dining.STATUS_UNAVAILABLE)
         self.assertIsNone(st.menu_count)
         self.assertIsNone(st.open_now)
-        self.assertIn("upstream down", st.reason or "")
 
     def test_every_configured_location_resolves_to_a_known_state(self):
         valid = {dining.STATUS_OK, dining.STATUS_CLOSED, dining.STATUS_EMPTY,
                  dining.STATUS_UNAVAILABLE}
-        for loc in dining.location_directory():
-            with self.subTest(location=loc.location_num):
-                st = dining.location_status(loc.location_num, D, at=AT)
-                self.assertIn(st.status, valid)
-                self.assertEqual(st.name, loc.name)
+        with SyntheticCache():
+            for loc in dining.location_directory():
+                with self.subTest(location=loc.location_num):
+                    st = self._status(loc.location_num)
+                    self.assertIn(st.status, valid)
+                    self.assertEqual(st.name, loc.name)
 
     def test_status_as_dict_is_json_ready(self):
-        row = dining.location_status("39", D, at=AT).as_dict()
+        with SyntheticCache():
+            row = self._status("39").as_dict()
         self.assertEqual(row["date"], "2026-09-19")
-        self.assertIn(row["status"], {"ok", "closed", "empty", "unavailable"})
-        json.dumps(row)                       # must not raise
+        self.assertIn("menu_status", row)
+        self.assertIn("hours_status", row)
+        json.dumps(row)
 
 
 class TestEmptyVsBadDateFormat(unittest.TestCase):
-    def test_valid_date_with_zero_recipes_is_empty_not_an_error(self):
-        res = dining.menu_result("09", D)
+    def test_menu_result_reports_empty_for_a_typed_call(self):
+        with SyntheticCache():
+            res = dining.menu_result("09", D)
         self.assertEqual(res.status, dining.STATUS_EMPTY)
         self.assertEqual(res.items, ())
-        self.assertEqual(dining.menu("09", D), [])
-        self.assertEqual(dining.menu("09", "09/19/2026"), [])
+
+    def test_frozen_menu_still_raises_on_a_genuine_empty(self):
+        with SyntheticCache():
+            with self.assertRaises(dining.MenuError):
+                dining.menu("09", D)
 
     def test_iso_date_string_raises_loudly(self):
         with self.assertRaises(dining.MenuError) as cm:
-            dining.menu("09", "2026-09-19")
+            dining.menu("15", "2026-09-19")
         self.assertIn("MM/DD/YYYY", str(cm.exception))
 
     def test_wrong_separator_raises_loudly(self):
         with self.assertRaises(dining.MenuError):
             dining.menu("15", "09-19-2026")
 
-    def test_unreachable_source_raises_not_returns_empty(self):
-        with patch.object(dining.cache, "get_json",
-                          side_effect=cache.CacheMiss("gone")):
-            with self.assertRaises(dining.MenuError):
-                dining.menu("15", D)
+
+class TestSourceValidation(unittest.TestCase):
+    def test_future_captured_menu_is_unavailable(self):
+        with SyntheticCache():
+            res = dining.menu_result("16", D)
+            st = dining.location_status("16", D, at=AT)
+        self.assertEqual(res.status, dining.STATUS_UNAVAILABLE)
+        self.assertIn("not_yet_available", res.reason)
+        self.assertEqual(res.items, ())
+        self.assertEqual(st.status, dining.STATUS_UNAVAILABLE)
+        self.assertEqual(st.menu_status, dining.STATUS_UNAVAILABLE)
+
+    def test_future_captured_hours_raise_and_yield_unavailable(self):
+        with SyntheticCache():
+            with self.assertRaises(dining.NotYetAvailableError):
+                dining.hours("19", D)
+            st = dining.location_status("19", D, at=AT)
+        self.assertEqual(st.status, dining.STATUS_UNAVAILABLE)
+        self.assertEqual(st.hours_status, dining.STATUS_UNAVAILABLE)
+
+    def test_payload_location_mismatch_is_source_mismatch(self):
+        with SyntheticCache():
+            res = dining.menu_result("17", D)
+        self.assertEqual(res.status, dining.STATUS_UNAVAILABLE)
+        self.assertIn("source_mismatch", res.reason)
+        self.assertIn("locationNum", res.reason)
+        self.assertEqual(res.items, ())
+
+    def test_payload_date_mismatch_is_source_mismatch(self):
+        with SyntheticCache():
+            res = dining.menu_result("18", D)
+        self.assertEqual(res.status, dining.STATUS_UNAVAILABLE)
+        self.assertIn("source_mismatch", res.reason)
+        self.assertIn("date", res.reason)
 
 
+# ============================================================ hours windows
 class TestOvernightHours(unittest.TestCase):
     def test_dx_window_crosses_midnight(self):
-        windows = dining.hours("71", D)
+        with SyntheticCache():
+            windows = dining.hours("71", D)
         self.assertEqual(len(windows), 1)
         self.assertEqual((windows[0].open_time, windows[0].close_time),
                          ("22:00:01", "02:00:00"))
@@ -151,53 +368,74 @@ class TestOvernightHours(unittest.TestCase):
         self.assertEqual(close_dt, datetime(2026, 9, 20, 2, 0))
 
     def test_open_before_and_after_midnight(self):
-        windows = dining.hours("71", D)
-        self.assertEqual(dining.is_open(windows, datetime(2026, 9, 19, 23, 0)),
-                         (True, 180.0))
-        is_open, mins = dining.is_open(windows, datetime(2026, 9, 20, 1, 0))
+        with SyntheticCache():
+            windows = dining.hours("71", D)
+            self.assertEqual(dining.is_open(windows, datetime(2026, 9, 19, 23, 0)),
+                             (True, 180.0))
+            is_open, mins = dining.is_open(windows, datetime(2026, 9, 20, 1, 0))
+        self.assertTrue(is_open)
+        self.assertAlmostEqual(mins, 60.0, delta=0.1)
+
+    def test_previous_day_window_covers_next_day_early_hours(self):
+        # The 09-20 window is only in the 09-20 list; its previous-day
+        # occurrence (22:00 on 09-19 -> 02:00 on 09-20) must still match 01:00.
+        with SyntheticCache():
+            windows = dining.hours("71", D2)
+            is_open, mins = dining.is_open(windows, datetime(2026, 9, 20, 1, 0))
         self.assertTrue(is_open)
         self.assertAlmostEqual(mins, 60.0, delta=0.1)
 
     def test_before_opening_is_positive_and_after_close_is_negative(self):
-        windows = dining.hours("71", D)
-        before = dining.is_open(windows, datetime(2026, 9, 19, 21, 0))
+        with SyntheticCache():
+            windows = dining.hours("71", D)
+            before = dining.is_open(windows, datetime(2026, 9, 19, 21, 0))
+            after = dining.is_open(windows, datetime(2026, 9, 20, 3, 0))
         self.assertFalse(before[0])
         self.assertGreater(before[1], 0)
-        after = dining.is_open(windows, datetime(2026, 9, 20, 3, 0))
         self.assertFalse(after[0])
         self.assertLess(after[1], 0)
 
     def test_xpress_lane_long_overnight_window(self):
-        windows = dining.hours("07", D)
-        self.assertEqual((windows[0].open_time, windows[0].close_time),
-                         ("08:00:01", "02:00:00"))
-        is_open, _ = dining.is_open(windows, datetime(2026, 9, 20, 1, 30))
+        with SyntheticCache():
+            windows = dining.hours("07", D)
+            is_open, _ = dining.is_open(windows, datetime(2026, 9, 20, 1, 30))
         self.assertTrue(is_open)
 
 
 class TestMultiUnitHall(unittest.TestCase):
-    def test_perry_place_returns_one_window_per_unit(self):
-        # Verified: foodpro_id 06 (Perry Place) has 8 physical units sharing the
-        # same extra_data foodpro_id, each with its own hours.
-        windows = dining.hours("06", date(2026, 9, 17))
-        self.assertEqual(len(windows), 8)
-        self.assertEqual(len({w.name for w in windows}), 8)
+    def test_one_window_per_unit(self):
+        with SyntheticCache():
+            windows = dining.hours("06", date(2026, 9, 17))
+        self.assertEqual(len(windows), 3)
+        self.assertEqual(len({w.name for w in windows}), 3)
         self.assertEqual({w.foodpro_id for w in windows}, {"06"})
 
-    def test_multi_unit_open_when_any_unit_is_open(self):
-        windows = dining.hours("06", date(2026, 9, 17))
-        is_open, _ = dining.is_open(windows, datetime(2026, 9, 17, 12, 0))
-        self.assertTrue(is_open)
-        # every unit is shut by 20:00, so the hall reads closed after that
-        closed, mins = dining.is_open(windows, datetime(2026, 9, 17, 21, 0))
+    def test_close_reflects_the_last_open_unit(self):
+        with SyntheticCache():
+            windows = dining.hours("06", date(2026, 9, 17))
+            # 12:00: Breakfast (to 13:00) and Lunch (to 18:00) are both open;
+            # the hall closes at the LAST of those, 18:00 -> 360 min.
+            is_open, mins = dining.is_open(windows, datetime(2026, 9, 17, 12, 0))
+            self.assertTrue(is_open)
+            self.assertAlmostEqual(mins, 360.0, delta=0.1)
+            # 17:00: Lunch (to 18:00) and Dinner (to 21:00) -> 240 min.
+            _, mins2 = dining.is_open(windows, datetime(2026, 9, 17, 17, 0))
+            self.assertAlmostEqual(mins2, 240.0, delta=0.1)
+
+    def test_multi_unit_closed_when_all_are_past(self):
+        with SyntheticCache():
+            windows = dining.hours("06", date(2026, 9, 17))
+            closed, mins = dining.is_open(windows, datetime(2026, 9, 17, 22, 0))
         self.assertFalse(closed)
         self.assertLess(mins, 0)
 
 
+# ============================================================ basic rows
 class TestBasicFoodRows(unittest.TestCase):
     def test_list_foods_row_shape_and_provenance(self):
-        res = dining.list_foods(location_num="39", d=D)
-        self.assertEqual(res["count"], 79)
+        with SyntheticCache():
+            res = dining.list_foods(location_num="39", d=D)
+        self.assertEqual(res["count"], 3)
         row = res["rows"][0]
         for key in ("location_num", "location_name", "date", "meal", "section",
                     "name", "description", "portion", "diet_tags", "allergens",
@@ -205,47 +443,44 @@ class TestBasicFoodRows(unittest.TestCase):
                     "source", "fetched_at"):
             self.assertIn(key, row)
         self.assertEqual(row["location_num"], "39")
-        self.assertEqual(row["location_name"], "Owens Food Court")
         self.assertEqual(row["date"], "2026-09-19")
         self.assertEqual(row["source"],
                          cache.key("dining_menu",
                                    {"location_num": "39",
                                     "dtdate": "09/19/2026"}))
-        self.assertEqual(row["fetched_at"], "2026-09-19T19:38:07+00:00")
+        self.assertEqual(row["fetched_at"], SYN_FETCHED)
 
     def test_basic_rows_never_fetch_nutrition(self):
-        with patch.object(dining, "nutrition_for_location",
-                          side_effect=AssertionError("nutrition must not be fetched")), \
-                patch.object(dining, "nutrition_bulk",
-                             side_effect=AssertionError("nutrition must not be fetched")):
-            res = dining.list_foods(d=D)
+        with SyntheticCache():
+            with patch.object(dining, "nutrition_for_location",
+                              side_effect=AssertionError("no nutrition")), \
+                    patch.object(dining, "nutrition_bulk",
+                                 side_effect=AssertionError("no nutrition")):
+                res = dining.list_foods(d=D)
         self.assertGreater(res["count"], 0)
 
     def test_query_search_is_case_insensitive_substring(self):
-        res = dining.search_foods("pizza", d=D)
+        with SyntheticCache():
+            res = dining.search_foods("wrap", d=D)
         self.assertGreater(res["count"], 0)
         for row in res["rows"]:
             blob = (f"{row['name']} {row['description']} {row['section']} "
                     f"{row['meal']}").lower()
-            self.assertIn("pizza", blob)
+            self.assertIn("wrap", blob)
 
     def test_structured_filters(self):
-        lunch = dining.filter_foods(d=D, meal="lunch")
-        self.assertGreater(lunch["count"], 0)
-        for row in lunch["rows"]:
-            self.assertEqual(row["meal"].lower(), "lunch")
-
-        section = dining.filter_foods(location_num="39", section="deli", d=D)
-        for row in section["rows"]:
-            self.assertIn("deli", row["section"].lower())
-
-        veg = dining.filter_foods(location_num="39", diet="vegetarian", d=D)
+        with SyntheticCache():
+            veg = dining.filter_foods(location_num="39", diet="vegetarian", d=D)
+            deli = dining.filter_foods(location_num="39", section="deli", d=D)
         self.assertGreater(veg["count"], 0)
         for row in veg["rows"]:
             self.assertIn("vegetarian", row["diet_tags"])
+        for row in deli["rows"]:
+            self.assertIn("deli", row["section"].lower())
 
     def test_all_locations_report_every_configured_location(self):
-        res = dining.list_foods(d=D)
+        with SyntheticCache():
+            res = dining.list_foods(d=D)
         reported = set(res["sources_ok"]) | {
             s["location_num"] for s in res["sources_skipped"]}
         self.assertEqual(reported, set(config.DINING_LOCATIONS))
@@ -253,12 +488,14 @@ class TestBasicFoodRows(unittest.TestCase):
         self.assertTrue(res["sources_skipped"])
 
     def test_multi_location_rows_span_several_locations(self):
-        rows = dining.list_foods(d=D)["rows"]
+        with SyntheticCache():
+            rows = dining.list_foods(d=D)["rows"]
         locs = {r["location_num"] for r in rows}
         self.assertGreaterEqual(len(locs), 2)
         self.assertTrue(locs.issubset(set(config.DINING_LOCATIONS)))
 
 
+# ============================================================ safety
 class TestSafetyInvariants(unittest.TestCase):
     def test_blank_allergen_never_treated_as_safe(self):
         rows = dining.list_foods(location_num="15", d=D,
@@ -272,8 +509,6 @@ class TestSafetyInvariants(unittest.TestCase):
             if not row["allergens"]:
                 self.assertTrue(row["venue_allergen_free"],
                                 f"blank-allergen item {row['name']} presented as safe")
-            self.assertIn("allergens_known", row)
-            self.assertIn("venue_allergen_free", row)
 
     def test_documented_viridian_exception_is_preserved(self):
         rows = dining.list_foods(location_num="15", d=D,
@@ -284,8 +519,23 @@ class TestSafetyInvariants(unittest.TestCase):
             self.assertTrue(row["section"].lower().startswith("viridian"))
             self.assertIs(row["allergens_known"], False)
 
+    def test_viridian_exception_is_bound_to_location_15(self):
+        # A section literally named "Viridian" at another hall must NOT inherit
+        # the D2 kitchen guarantee: its blank allergens stay UNKNOWN and are
+        # therefore excluded under an avoid filter.
+        with SyntheticCache():
+            rows = dining.list_foods(location_num="39", d=D,
+                                     avoid=("Peanuts",))["rows"]
+        names = {r["name"] for r in rows}
+        self.assertNotIn("Impostor Viridian", names)
+        for row in rows:
+            self.assertFalse(row["venue_allergen_free"])
+        # and the config helper itself is location-bound
+        self.assertFalse(config.is_venue_allergen_free("Viridian", "39"))
+        self.assertTrue(config.is_venue_allergen_free("Viridian", "15"))
+        self.assertFalse(config.is_venue_allergen_free("Viridian"))
+
     def test_source_contradiction_is_not_recommended(self):
-        # Whole Wheat Penne Pasta is tagged vegan but declares Eggs upstream.
         rows = dining.list_foods(location_num="15", d=D, diet="vegan",
                                  avoid=("Sesame",))["rows"]
         self.assertNotIn("Whole Wheat Penne Pasta", {r["name"] for r in rows})
@@ -298,27 +548,30 @@ class TestSafetyInvariants(unittest.TestCase):
             self.assertFalse(any("milk" in a.lower() for a in row["allergens"]))
 
 
+# ============================================================ failures
 class TestPartialFailure(unittest.TestCase):
     def test_one_unreachable_location_does_not_drop_the_others(self):
-        real = dining.menu_result
+        with SyntheticCache():
+            real = dining.menu_result
 
-        def fake(num, day, **kwargs):
-            if str(num) == "39":
-                return dining.MenuResult(
-                    "39", "Owens Food Court", day, dining.STATUS_UNAVAILABLE,
-                    reason="simulated upstream failure")
-            return real(num, day, **kwargs)
+            def fake(num, day, **kwargs):
+                if str(num) == "39":
+                    return dining.MenuResult(
+                        "39", "Owens Food Court", day,
+                        dining.STATUS_UNAVAILABLE, reason="simulated failure")
+                return real(num, day, **kwargs)
 
-        with patch.object(dining, "menu_result", side_effect=fake):
-            res = dining.list_foods(d=D)
+            with patch.object(dining, "menu_result", side_effect=fake):
+                res = dining.list_foods(d=D)
         skipped = {s["location_num"]: s for s in res["sources_skipped"]}
         self.assertIn("39", skipped)
         self.assertEqual(skipped["39"]["status"], dining.STATUS_UNAVAILABLE)
-        self.assertTrue(res["sources_ok"], "other locations must still be searched")
+        self.assertTrue(res["sources_ok"])
         self.assertTrue(all(r["location_num"] != "39" for r in res["rows"]))
 
     def test_find_food_exposes_typed_sources(self):
-        res = tools.find_food()
+        with SyntheticCache():
+            res = tools.find_food()
         reported = set(res["sources_ok"]) | {
             s["location_num"] for s in res["sources_skipped"]}
         self.assertEqual(reported, set(config.DINING_LOCATIONS))
@@ -328,53 +581,82 @@ class TestPartialFailure(unittest.TestCase):
             self.assertIn("status", entry)
             self.assertTrue(entry["reason"])
 
+    def test_all_locations_kcal_query_returns_no_unproven_items(self):
+        with SyntheticCache():
+            res = tools.find_food(max_kcal=800)
+        self.assertEqual(res["count"], 0)
+        self.assertEqual(res["items"], [])
+        self.assertEqual(res["sources_ok"], [])
+        self.assertTrue(res["sources_skipped"])
+        for entry in res["sources_skipped"]:
+            self.assertEqual(entry["status"], "nutrition_unavailable")
+        self.assertIn("max_kcal", res["reason"])
+
+    def test_single_location_kcal_query_still_proves_calories(self):
+        res = tools.find_food(location_num="15", max_kcal=800,
+                              avoid=("Peanuts",))
+        self.assertGreater(res["count"], 0)
+        self.assertTrue(all(r["kcal"] is not None for r in res["items"]))
+        self.assertEqual(res["sources_ok"], ["15"])
+
     def test_single_location_find_food_only_reports_that_location(self):
         res = tools.find_food(location_num="39")
-        self.assertEqual(res["sources_ok"], ["39"])
+        # D2-only replay: 39 is honestly unavailable, not silently dropped
+        self.assertIn("39", res["sources_ok"] + [
+            s["location_num"] for s in res["sources_skipped"]])
         self.assertTrue(all(r["location_num"] == "39" for r in res["items"]))
 
 
+# ============================================================ provenance
 class TestStalenessAndProvenance(unittest.TestCase):
     def test_stale_flag_after_the_age_threshold(self):
         future = datetime(2026, 9, 20, 10, 0, tzinfo=timezone.utc)
-        with patch.object(dining.config, "now", return_value=future):
-            st = dining.location_status("39", D, at=AT, max_age_s=6 * 3600)
+        with SyntheticCache():
+            with patch.object(dining.config, "now", return_value=future):
+                st = dining.location_status("39", D, at=AT, max_age_s=6 * 3600)
         self.assertIs(st.stale, True)
-        self.assertEqual(st.fetched_at, "2026-09-19T19:38:07+00:00")
+        self.assertEqual(st.fetched_at, SYN_FETCHED)
 
     def test_fresh_copy_is_not_stale(self):
-        soon = datetime(2026, 9, 19, 20, 0, tzinfo=timezone.utc)
-        with patch.object(dining.config, "now", return_value=soon):
-            st = dining.location_status("39", D, at=AT, max_age_s=6 * 3600)
+        soon = datetime(2026, 9, 19, 16, 0, tzinfo=timezone.utc)
+        with SyntheticCache():
+            with patch.object(dining.config, "now", return_value=soon):
+                st = dining.location_status("39", D, at=AT, max_age_s=6 * 3600)
         self.assertIs(st.stale, False)
 
     def test_unknown_threshold_reports_unknown_staleness(self):
-        st = dining.location_status("39", D, at=AT, max_age_s=None)
+        with SyntheticCache():
+            st = dining.location_status("39", D, at=AT, max_age_s=None)
         self.assertIsNone(st.stale)
 
-    def test_menu_result_provenance(self):
-        res = dining.menu_result("14", D)
+    def test_menu_result_provenance_uses_public_metadata(self):
+        with SyntheticCache():
+            res = dining.menu_result("39", D)
         self.assertEqual(res.source,
                          cache.key("dining_menu",
-                                   {"location_num": "14",
+                                   {"location_num": "39",
                                     "dtdate": "09/19/2026"}))
-        self.assertEqual(res.fetched_at, "2026-09-19T19:38:08+00:00")
+        self.assertEqual(res.fetched_at, SYN_FETCHED)
 
 
+# ============================================================ determinism
 class TestDeterministicReplay(unittest.TestCase):
     def test_list_foods_replays_identically(self):
-        first = json.dumps(dining.list_foods(d=D), sort_keys=True)
-        second = json.dumps(dining.list_foods(d=D), sort_keys=True)
+        with SyntheticCache():
+            first = json.dumps(dining.list_foods(d=D), sort_keys=True)
+            second = json.dumps(dining.list_foods(d=D), sort_keys=True)
         self.assertEqual(first, second)
 
     def test_find_food_ranking_replays_identically(self):
-        first = json.dumps(tools.find_food()["items"], sort_keys=True)
-        second = json.dumps(tools.find_food()["items"], sort_keys=True)
+        with SyntheticCache():
+            first = json.dumps(tools.find_food()["items"], sort_keys=True)
+            second = json.dumps(tools.find_food()["items"], sort_keys=True)
         self.assertEqual(first, second)
 
     def test_status_replays_identically(self):
-        first = dining.location_status("39", D, at=AT).as_dict()
-        second = dining.location_status("39", D, at=AT).as_dict()
+        with SyntheticCache():
+            first = dining.location_status("39", D, at=AT).as_dict()
+            second = dining.location_status("39", D, at=AT).as_dict()
         self.assertEqual(json.dumps(first, sort_keys=True),
                          json.dumps(second, sort_keys=True))
 

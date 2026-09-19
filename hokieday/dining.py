@@ -12,7 +12,13 @@ Those two empties are DIFFERENT and must never be conflated:
   * a malformed `dtdate` is a caller bug -> `_menu_dtdate` raises MenuError
     BEFORE any request (`menu()` and `menu_result()` propagate it);
   * a valid date with zero recipes is a REAL state -> `menu_result()` returns
-    STATUS_EMPTY and `menu()` returns [] (not an error).
+    STATUS_EMPTY, while the FROZEN `menu()` still raises MenuError on it.
+
+EVIDENCE MUST BE FROM THE PAST: an envelope captured after `config.now()` (the
+replay/request clock) is rejected (menu -> STATUS_UNAVAILABLE
+"not_yet_available", hours -> NotYetAvailableError) and returns no rows. A menu
+payload whose own `locationNum`/`date` disagree with the request is rejected as
+"source_mismatch" rather than attributed to the wrong hall/day.
 
 String handling: a `str` menu date must already be MM/DD/YYYY. `date` objects
 are formatted per-API (the safe path). `eat_options` needs BOTH formats, so it
@@ -47,9 +53,19 @@ from . import cache, config
 
 
 class MenuError(RuntimeError):
-    """Raised for a malformed menu date or an unreachable menu source.
+    """Raised for a malformed menu date, an unreachable menu source, or a
+    genuine zero-recipe menu -- the frozen `menu()` contract.
 
-    A valid date with zero recipes is NOT an error: see `menu_result()`.
+    `menu_result()` is the typed alternative that returns STATUS_EMPTY instead.
+    """
+
+
+class NotYetAvailableError(RuntimeError):
+    """Raised when a cached envelope was captured AFTER the replay/request clock.
+
+    A fixture from the future is not evidence about "now": serving it would
+    invent data the clock says has not happened yet. Both menu and hours reject
+    it (menu as STATUS_UNAVAILABLE, hours by raising this) and return no rows.
     """
 
 
@@ -105,13 +121,20 @@ STATUS_UNAVAILABLE = "unavailable"
 
 @dataclass(frozen=True)
 class LocationStatus:
-    """Per-location dining resolution, kept separate from the food rows."""
+    """Per-location dining resolution, kept separate from the food rows.
+
+    `menu_status` and `hours_status` are INDEPENDENT; `status` is their
+    composite. This matters because "menu ok but hours unknown" is not `ok`,
+    and "hours closed but menu unreachable" is `unavailable`, not `closed`.
+    """
     location_num: str
     name: str
     date: date
     status: str                     # ok | closed | empty | unavailable
     open_now: bool | None           # None when the hours source is unavailable
     menu_count: int | None          # None when the menu source is unavailable
+    menu_status: str | None = None  # ok | empty | unavailable
+    hours_status: str | None = None # ok | closed | unavailable
     windows: tuple[HoursWindow, ...] = ()
     stale: bool | None = None       # None when provenance/threshold unavailable
     source: str | None = None       # cache key of the menu envelope
@@ -124,6 +147,8 @@ class LocationStatus:
             "name": self.name,
             "date": self.date.isoformat(),
             "status": self.status,
+            "menu_status": self.menu_status,
+            "hours_status": self.hours_status,
             "open_now": self.open_now,
             "menu_count": self.menu_count,
             "windows": [
@@ -310,22 +335,36 @@ def _source_key(name: str, params: dict | None = None) -> str:
     return cache.key(name, params)
 
 
-def _envelope_meta(name: str, params: dict | None = None
-                   ) -> tuple[str | None, str | None]:
-    """(fetched_at, url) from a cache envelope, else (None, None).
+def _envelope_meta(name: str, params: dict | None = None) -> dict:
+    """Public provenance for a cache key ({} when absent).
 
-    Reads the envelope's provenance fields directly so a caller can disclose
-    WHEN a row was captured. A missing or malformed envelope is not an error:
-    provenance is reported when available and omitted otherwise.
+    Uses cache.metadata() rather than the private envelope helpers, so this
+    module never reaches into cache internals and is cheap to merge with parent
+    cache changes. A missing/malformed envelope is not an error: provenance is
+    disclosed when available and omitted otherwise.
     """
     try:
-        path = cache._json_path(name, params)
-        if not path.exists():
-            return None, None
-        env = cache._read_envelope(path)
+        return cache.metadata(name, params) or {}
     except Exception:                                        # noqa: BLE001
-        return None, None
-    return env.get("fetched_at"), env.get("url")
+        return {}
+
+
+def _captured_in_future(fetched_at: str | None) -> bool:
+    """True when an envelope was captured AFTER the replay/request clock.
+
+    A fixture from the future is not evidence about "now". Serving it as fresh
+    would invent data the clock says has not happened, so both menu and hours
+    reject it (unavailable / NotYetAvailableError) and return no rows.
+    """
+    if not fetched_at:
+        return False
+    try:
+        ts = datetime.fromisoformat(str(fetched_at))
+    except ValueError:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts > config.now(timezone.utc)
 
 
 def _stale(fetched_at: str | None, max_age_s: float | None) -> bool | None:
@@ -344,6 +383,27 @@ def _stale(fetched_at: str | None, max_age_s: float | None) -> bool | None:
         ts = ts.replace(tzinfo=timezone.utc)
     age = (config.now(timezone.utc) - ts).total_seconds()
     return age > float(max_age_s)
+
+
+def _payload_mismatch(payload: dict, location_num: str, day: date) -> str | None:
+    """Validate a menu payload's own location/date against what we requested.
+
+    The menu API can answer with a different location or day (a wrong id, a
+    cached neighbor). Accepting that silently would attribute another hall's
+    food to this one, so a mismatch is a typed `source_mismatch`, never rows.
+    """
+    got_loc = str(payload.get("locationNum", "")).strip()
+    if got_loc and got_loc != str(location_num):
+        return f"locationNum {got_loc!r} != requested {location_num!r}"
+    raw_date = str(payload.get("date", "")).strip()
+    if raw_date:
+        try:
+            got_day = datetime.strptime(raw_date, "%m/%d/%Y").date()
+        except ValueError:
+            return f"unparseable payload date {raw_date!r}"
+        if got_day != day:
+            return f"date {got_day.isoformat()} != requested {day.isoformat()}"
+    return None
 
 
 # ------------------------------------------------------------------ locations
@@ -393,13 +453,27 @@ def menu_result(location_num: str, d: date | str, force: bool = False,
             "dining_menu",
             config.ENDPOINTS["dining_menu"].format(
                 location_num=num, dtdate=dtdate),
-            params=params, force=force,
+            params=params, force=force, max_age_s=max_age_s,
         )
     except Exception as exc:                                 # noqa: BLE001
         return MenuResult(num, name, day, STATUS_UNAVAILABLE,
                           reason=f"menu unavailable: {exc}", source=source)
 
-    fetched_at, _ = _envelope_meta("dining_menu", params)
+    fetched_at = _envelope_meta("dining_menu", params).get("fetched_at")
+    if _captured_in_future(fetched_at):
+        return MenuResult(
+            num, name, day, STATUS_UNAVAILABLE,
+            reason=(f"not_yet_available: menu envelope captured {fetched_at} "
+                    f"after the replay/request clock"),
+            source=source, fetched_at=fetched_at,
+            stale=_stale(fetched_at, max_age_s))
+    mismatch = _payload_mismatch(payload, num, day)
+    if mismatch:
+        return MenuResult(
+            num, name, day, STATUS_UNAVAILABLE,
+            reason=f"source_mismatch: {mismatch}",
+            source=source, fetched_at=fetched_at,
+            stale=_stale(fetched_at, max_age_s))
     items = _parse_menu_items(payload, num, day)
     if not items:
         return MenuResult(
@@ -446,16 +520,17 @@ def _parse_menu_items(payload: dict, location_num: str,
 
 
 def menu(location_num: str, d: date | str, force: bool = False) -> list[MenuItem]:
-    """Menu for one location on one day.
+    """Menu for one location on one day (FROZEN contract).
 
     `d` as a `date` is formatted MM/DD/YYYY (the only format the API accepts).
     A string MUST already be MM/DD/YYYY: an ISO string raises a loud MenuError
-    before a request is made. A valid date with a genuinely empty menu returns
-    [] (STATUS_EMPTY via menu_result) rather than being conflated with the
-    bad-format trap; an unreachable source raises MenuError.
+    before a request is made. A GENUINE zero-recipe menu and an unreachable
+    source BOTH raise MenuError here -- `menu_result()` is the typed alternative
+    that returns STATUS_EMPTY / STATUS_UNAVAILABLE so callers can distinguish
+    them.
     """
     res = menu_result(location_num, d, force=force)
-    if res.status == STATUS_UNAVAILABLE:
+    if not res.items:
         raise MenuError(res.reason or f"menu unavailable for {location_num}")
     return list(res.items)
 
@@ -611,7 +686,8 @@ def nutrition_bulk(
 
 
 # ------------------------------------------------------------------ hours
-def hours(foodpro_id: str, d: date | str, force: bool = False) -> list[HoursWindow]:
+def hours(foodpro_id: str, d: date | str, force: bool = False,
+          max_age_s: float | None = None) -> list[HoursWindow]:
     """Opening windows for a FoodPro center on one day.
 
     NOTE the different date format: the hours API takes YYYY-MM-DD (a `date`
@@ -624,14 +700,24 @@ def hours(foodpro_id: str, d: date | str, force: bool = False) -> list[HoursWind
     ONE HoursWindow PER UNIT, so `is_open` is true when ANY unit is open and the
     caller can name the open unit. Splitting a hall into a single averaged
     window would hide which counter is actually serving.
+
+    Raises NotYetAvailableError when the served envelope was captured after the
+    replay/request clock: future evidence is unavailable, not empty/closed.
     """
     iso = d if isinstance(d, str) else d.isoformat()
+    params = {"foodpro_id": foodpro_id, "date": iso}
     payload = cache.get_json(
         "dining_hours",
         config.ENDPOINTS["dining_hours"].format(foodpro_id=foodpro_id, date=iso),
-        params={"foodpro_id": foodpro_id, "date": iso},
+        params=params,
         force=force,
+        max_age_s=max_age_s,
     )
+    fetched_at = _envelope_meta("dining_hours", params).get("fetched_at")
+    if _captured_in_future(fetched_at):
+        raise NotYetAvailableError(
+            f"hours envelope captured {fetched_at} after the replay/request "
+            f"clock for {foodpro_id} on {iso}")
     out: list[HoursWindow] = []
     for unit in payload or []:
         # Verified join: extra_data foodpro_id == menu locationNum (D2 = "15").
@@ -673,23 +759,49 @@ def window_span(w: HoursWindow) -> tuple[datetime, datetime]:
     return open_dt, close_dt
 
 
+def _is_overnight(w: HoursWindow) -> bool:
+    return _parse_clock(w.close_time) <= _parse_clock(w.open_time)
+
+
+def _candidate_spans(w: HoursWindow) -> list[tuple[datetime, datetime]]:
+    """All day-placements a single window could represent.
+
+    An overnight window (close <= open) crosses midnight, so the SAME clock
+    times appear once per calendar day. Besides its own date we also consider
+    the previous day's occurrence: a caller who asked for date D's hours and
+    probes at 01:00 must still match the window that opened at 22:00 on D-1 and
+    closed on D. Non-overnight windows are only anchored on their own date.
+    """
+    primary = window_span(w)
+    spans = [primary]
+    if _is_overnight(w):
+        spans.append((primary[0] - timedelta(days=1),
+                      primary[1] - timedelta(days=1)))
+    return spans
+
+
 def is_open(windows: list[HoursWindow], at: datetime) -> tuple[bool, float | None]:
     """(is_open_now, minutes_until_close) for a set of windows.
 
-    Open      -> (True,  minutes until that window's close).
+    Open      -> (True,  minutes until the LAST still-open unit closes).
     Between   -> (False, minutes until the NEXT window's close)  [positive].
     All past  -> (False, minutes since the last close)           [NEGATIVE].
 
-    Overnight windows (close < open) are rolled to the next day; see
-    window_span(). With several units, this returns the first open span, which
-    is the normal multi-unit case (any unit open == hall open).
+    Overnight windows (close < open) are rolled to the next day AND their
+    previous-day occurrence is considered, so probing 01:00 against date-D
+    hours correctly matches the 22:00(D-1)->02:00(D) window. With several units,
+    "minutes until close" is the union's LAST close, not the first unit's.
     """
     if not windows:
         return False, None
-    spans = sorted(window_span(w) for w in windows)
-    for open_dt, close_dt in spans:
-        if open_dt <= at < close_dt:
-            return True, (close_dt - at).total_seconds() / 60
+    spans: list[tuple[datetime, datetime]] = []
+    for w in windows:
+        spans.extend(_candidate_spans(w))
+    spans = sorted(set(spans))
+    open_closes = [close_dt for open_dt, close_dt in spans
+                   if open_dt <= at < close_dt]
+    if open_closes:
+        return True, (max(open_closes) - at).total_seconds() / 60
     upcoming = [(o, c) for o, c in spans if o > at]
     if upcoming:
         _, close_dt = upcoming[0]
@@ -722,37 +834,44 @@ def location_status(location_num: str, d: date | str | None = None,
 
     menu_res = menu_result(num, day, force=force, max_age_s=max_age_s)
 
-    hours_known = True
+    hours_status = STATUS_OK
     hours_reason: str | None = None
     try:
-        wins = hours(num, day, force=force)
+        wins = hours(num, day, force=force, max_age_s=max_age_s)
     except Exception as exc:                                 # noqa: BLE001
+        # CacheMiss, NotYetAvailableError, a future-captured envelope, or any
+        # upstream failure: the source is unavailable, NOT a closed day.
         wins = []
-        hours_known = False
+        hours_status = STATUS_UNAVAILABLE
         hours_reason = str(exc)
+    else:
+        if not wins:
+            hours_status = STATUS_CLOSED
 
     when = at or _now_campus()
-    if not hours_known:
-        open_now: bool | None = None
-    elif not wins:
+    if hours_status == STATUS_OK:
+        open_now: bool | None = is_open(wins, when)[0]
+    elif hours_status == STATUS_CLOSED:
         open_now = False
     else:
-        open_now, _ = is_open(wins, when)
+        open_now = None
 
-    if not hours_known and menu_res.status == STATUS_UNAVAILABLE:
+    menu_status = menu_res.status
+    # COMPOSITE PRECEDENCE: a source failure dominates (so a closed day with an
+    # unreachable menu is `unavailable`, never `closed`); then an actually
+    # closed day; then an operating location whose menu is empty; else ok.
+    if menu_status == STATUS_UNAVAILABLE or hours_status == STATUS_UNAVAILABLE:
         status = STATUS_UNAVAILABLE
-        reason = hours_reason or menu_res.reason
-    elif not hours_known:
-        status = menu_res.status
-        reason = (menu_res.reason
-                  or f"hours unavailable: {hours_reason}")
-    elif not wins:
+        parts = []
+        if menu_status == STATUS_UNAVAILABLE:
+            parts.append(menu_res.reason or "menu unavailable")
+        if hours_status == STATUS_UNAVAILABLE:
+            parts.append(f"hours unavailable: {hours_reason}")
+        reason = "; ".join(parts)
+    elif hours_status == STATUS_CLOSED:
         status = STATUS_CLOSED
         reason = f"no published hours for {num} on {day.isoformat()}"
-    elif menu_res.status == STATUS_UNAVAILABLE:
-        status = STATUS_UNAVAILABLE
-        reason = menu_res.reason
-    elif menu_res.status == STATUS_EMPTY:
+    elif menu_status == STATUS_EMPTY:
         status = STATUS_EMPTY
         reason = menu_res.reason or "operating but no published menu"
     else:
@@ -760,11 +879,12 @@ def location_status(location_num: str, d: date | str | None = None,
         reason = None
 
     menu_count = (len(menu_res.items)
-                  if menu_res.status != STATUS_UNAVAILABLE else None)
+                  if menu_status != STATUS_UNAVAILABLE else None)
     return LocationStatus(
         location_num=num, name=name, date=day, status=status,
-        open_now=open_now, menu_count=menu_count, windows=tuple(wins),
-        stale=menu_res.stale, source=menu_res.source,
+        open_now=open_now, menu_count=menu_count,
+        menu_status=menu_status, hours_status=hours_status,
+        windows=tuple(wins), stale=menu_res.stale, source=menu_res.source,
         fetched_at=menu_res.fetched_at, reason=reason,
     )
 
@@ -796,7 +916,8 @@ def _apply_avoid(items: list[MenuItem], avoid: tuple[str, ...]) -> list[MenuItem
         stated = [alg.lower() for alg in it.allergens]
         if any(b in alg for alg in stated for b in bad):
             continue                      # definitely contains it
-        if not stated and not config.is_venue_allergen_free(it.section):
+        if not stated and not config.is_venue_allergen_free(
+                it.section, it.location_num):
             continue                      # UNKNOWN -> excluded by default
         kept.append(it)
     return kept
@@ -818,7 +939,8 @@ def _food_row(it: MenuItem, location_name: str, source: str | None,
         # SAFETY: blank means UNKNOWN, never allergen-free. venue_allergen_free
         # explains a blank; it does not turn allergens_known true.
         allergens_known=bool(it.allergens),
-        venue_allergen_free=config.is_venue_allergen_free(it.section),
+        venue_allergen_free=config.is_venue_allergen_free(
+            it.section, it.location_num),
         recipe_id=it.recipe_id,
         source=source,
         fetched_at=fetched_at,
@@ -955,7 +1077,13 @@ def eat_options(
         using the verified foodpro_id == locationNum join. Closed -> [].
     """
     day = _as_date(d)
-    items = menu(location_num, day, force=force)
+    # Use the typed result, not the frozen menu(): a genuine empty menu is a
+    # valid (empty) option list for filtering, while an unavailable source must
+    # still surface as an error to callers.
+    res = menu_result(location_num, day, force=force)
+    if res.status == STATUS_UNAVAILABLE:
+        raise MenuError(res.reason or f"menu unavailable for {location_num}")
+    items = list(res.items)
 
     # Require the upstream diet designation AND reject any row whose own declared
     # allergens directly contradict that designation (source-quality guard).

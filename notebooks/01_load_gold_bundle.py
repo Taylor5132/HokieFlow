@@ -85,6 +85,9 @@ TABLES = [
     "stops",
     "next_departures",
     "live_buses",
+    "dining_locations",
+    "dining_status",
+    "food_basic",
     "eat_options",
     "dining_hours",
 ]
@@ -127,6 +130,18 @@ COMMENTS = {
         "Dining menu items with allergens and diet tags. SAFETY: a blank allergens array "
         "means UNKNOWN, NOT allergen-free (188 of 470 D2 rows). Filter on allergens_known."
     ),
+    "dining_locations": (
+        "Deterministic directory of all 12 official FoodPro locations, sorted by "
+        "location_num; the picker source of truth even when Locations.aspx is down."
+    ),
+    "dining_status": (
+        "Per-location resolution: composite status (ok/closed/empty/unavailable) with "
+        "INDEPENDENT menu_status and hours_status plus provenance and stale."
+    ),
+    "food_basic": (
+        "BASIC multi-location food rows (no nutrition). SAFETY: blank allergens means "
+        "UNKNOWN; venue_allergen_free is bound to the D2 Viridian kitchen only."
+    ),
     "dining_hours": "Per-location opening windows for the service date.",
 }
 
@@ -149,12 +164,31 @@ for name, comment in COMMENTS.items():
 
 # COMMAND ----------
 
+STATS_KEYS = {
+    "stops": "stops",
+    "next_departures": "next_departures",
+    "live_buses": "live_buses",
+    "dining_locations": "dining_locations",
+    "dining_status": "dining_status",
+    "food_basic": "food_basic",
+    "eat_options": "eat_options",
+    "dining_hours": "dining_hours",
+}
+
+mismatches = []
 for name in TABLES:
     try:
         n = spark.table(f"{CATALOG}.{SCHEMA}.{name}").count()
-        print(f"{name:16} {n:>7}")
+        want = bundle.get("_stats", {}).get(STATS_KEYS.get(name, name))
+        flag = "ok" if (want is None or n == want) else "MISMATCH"
+        if flag == "MISMATCH":
+            mismatches.append((name, want, n))
+        print(f"{flag:8} {name:16} got={n:<7} exported={want}")
     except Exception as exc:
         print(f"{name:16} MISSING ({exc})")
+        mismatches.append((name, bundle.get("_stats", {}).get(name), None))
+
+assert not mismatches, f"stale upload: {mismatches}; re-run scripts/export_gold.py"
 
 # COMMAND ----------
 
@@ -190,6 +224,28 @@ WHERE stop_id = '1600'
 GROUP BY route_id ORDER BY first_dep
 """).show(truncate=False)
 
+# Multi-location basic rows must carry provenance and never lose the directory.
+spark.sql(f"""
+SELECT
+  COUNT(*)                                            AS locations,
+  COUNT(DISTINCT location_num)                        AS distinct_nums
+FROM {CATALOG}.{SCHEMA}.dining_locations
+""").show()
+
+spark.sql(f"""
+SELECT status, COUNT(*) AS n
+FROM {CATALOG}.{SCHEMA}.dining_status
+GROUP BY status ORDER BY status
+""").show()
+
+spark.sql(f"""
+SELECT
+  COUNT(*)                                                  AS basic_rows,
+  SUM(CASE WHEN fetched_at IS NULL THEN 1 ELSE 0 END)       AS missing_fetched,
+  SUM(CASE WHEN venue_allergen_free THEN 1 ELSE 0 END)      AS venue_allergen_free
+FROM {CATALOG}.{SCHEMA}.food_basic
+""").show()
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -198,7 +254,8 @@ GROUP BY route_id ORDER BY first_dep
 # MAGIC 1. `02_governance.py` — column masks and row filters (the FERPA slide).
 # MAGIC 2. Wire the tools to read these tables (`hokieday/tools.py` exposes a `Source`
 # MAGIC    protocol; a `TableSource` reads Delta instead of the local modules).
-# MAGIC 3. Create the Genie space over `next_departures`, `live_buses`, `eat_options`.
+# MAGIC 3. Create the Genie space over `next_departures`, `live_buses`, `eat_options`,
+# MAGIC    `dining_locations`, `dining_status`, `food_basic`.
 # MAGIC
 # MAGIC **Reminder to say out loud in the demo:** no academic record — no transcript, no grades,
 # MAGIC no GPA — ever enters this lakehouse, and Unity Catalog enforces that rather than relying

@@ -504,6 +504,25 @@ def has(name: str, params: dict | None = None) -> bool:
     return _json_path(name, params).exists()
 
 
+def metadata(name: str, params: dict | None = None) -> dict | None:
+    """Public, read-only provenance for a cache key -- or None if absent.
+
+    Exposes the envelope's capture fields (key, url, fetched_at, mode) WITHOUT
+    the payload, so callers that only need provenance never reach into the
+    private envelope helpers. A caller that needs payload + provenance together
+    should still call get_json() then metadata(); the pair is not atomic across
+    a concurrent live refresh, so provenance is advisory, not a lock.
+    """
+    path = _json_path(name, params)
+    if not path.exists():
+        return None
+    try:
+        env = _read_envelope(path)
+    except Exception:                                        # noqa: BLE001
+        return None
+    return {k: env.get(k) for k in ("key", "url", "fetched_at", "mode")}
+
+
 def put_json(name: str, url: str, payload: Any, *, params: dict | None = None) -> None:
     """Persist a DERIVED payload (e.g. all-menu nutrition merged from chunks).
 

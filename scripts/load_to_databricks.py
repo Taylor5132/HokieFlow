@@ -29,7 +29,8 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 from dbapi import load_credentials, request, run_sql  # noqa: E402
 
-TABLES = ["stops", "next_departures", "live_buses", "eat_options", "dining_hours"]
+TABLES = ["stops", "next_departures", "live_buses", "dining_locations",
+          "dining_status", "food_basic", "eat_options", "dining_hours"]
 CATALOG = "hokieday"
 SCHEMA = "gold"
 VOLUME = "landing"
@@ -59,6 +60,18 @@ def table_comment(spark_sql_name: str, bundle: dict) -> str:
         "eat_options": (
             "Dining menu items with allergens, diet tags and nutrition. SAFETY: a blank "
             "allergens array means UNKNOWN, never allergen-free. Filter on allergens_known."
+        ),
+        "dining_locations": (
+            "Deterministic directory of all 12 official FoodPro locations, sorted by "
+            "location_num; the picker source of truth even when Locations.aspx is down."
+        ),
+        "dining_status": (
+            "Per-location resolution: composite status (ok/closed/empty/unavailable) "
+            "with INDEPENDENT menu_status and hours_status plus provenance and stale."
+        ),
+        "food_basic": (
+            "BASIC multi-location food rows (no nutrition). SAFETY: blank allergens "
+            "means UNKNOWN; venue_allergen_free is bound to the D2 Viridian kitchen only."
         ),
         "dining_hours": "Per-location opening windows for the service date.",
     }[spark_sql_name])
@@ -127,6 +140,9 @@ def main() -> int:
         "stops": stats.get("stops"),
         "next_departures": stats.get("next_departures"),
         "live_buses": stats.get("live_buses"),
+        "dining_locations": stats.get("dining_locations"),
+        "dining_status": stats.get("dining_status"),
+        "food_basic": stats.get("food_basic"),
         "eat_options": stats.get("eat_options"),
         "dining_hours": stats.get("dining_hours"),
     }
@@ -157,6 +173,18 @@ def main() -> int:
             SELECT route_id, MIN(dep_time) AS first_dep
             FROM {args.catalog}.{args.schema}.next_departures
             WHERE stop_id = '1600' GROUP BY route_id ORDER BY first_dep""",
+        "basic rows carry provenance": f"""
+            SELECT COUNT(*) AS basic_rows,
+                   SUM(CASE WHEN fetched_at IS NULL THEN 1 ELSE 0 END) AS missing_fetched
+            FROM {args.catalog}.{args.schema}.food_basic""",
+        "all 12 locations present in the directory": f"""
+            SELECT COUNT(*) AS locations,
+                   COUNT(DISTINCT location_num) AS distinct_nums
+            FROM {args.catalog}.{args.schema}.dining_locations""",
+        "status states are explicit": f"""
+            SELECT status, COUNT(*) AS n
+            FROM {args.catalog}.{args.schema}.dining_status
+            GROUP BY status ORDER BY status""",
     }
     for label, stmt in checks.items():
         res = run_sql(host, token, stmt, wh)
