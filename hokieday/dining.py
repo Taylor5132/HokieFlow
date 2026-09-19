@@ -112,9 +112,16 @@ def unit_foodpro_id(unit: dict) -> str | None:
 
 
 def _now_campus() -> datetime:
-    """Wall-clock now in config.CAMPUS_TZ, naive (matches hours-api times)."""
+    """Now in config.CAMPUS_TZ, naive (matches hours-api times).
+
+    Sourced from config.now(), NOT the raw wall clock. In DEMO_MODE=cache the
+    replay clock is pinned to the snapshot; calling datetime.now() here would
+    evaluate dining hours at demo time while transit is evaluated at snapshot
+    time, so a single answer would mix two different clocks (e.g. a bus board
+    reading 11:48 alongside a dining "closed" verdict computed at 08:00).
+    """
     tz = ZoneInfo(config.CAMPUS_TZ)
-    return datetime.now(tz).replace(tzinfo=None)
+    return config.now(tz).replace(tzinfo=None)
 
 
 def _nutrition_chunks(items: list[tuple[str, str, int]], chunk: int) -> list[str]:
