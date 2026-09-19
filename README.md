@@ -14,10 +14,12 @@ hokieday/
     gtfs.py            # static GTFS -> departures          [worker: gtfs]
     livebus.py         # live buses -> crowding + lateness   [worker: livebus]
     dining.py          # menu, nutrition, allergens, hours   [worker: dining]
+    weather.py         # NWS forecast/alerts/observation + leg risk badges
     tools.py           # deterministic tools + plan_day/re-planning loop
     # agent.py         # NOT BUILT YET: future LLM tool-selection layer
   scripts/
     seed_cache.py      # build fixtures/ from known-good captured payloads
+    fetch_weather.py   # edge fetch NWS -> frozen weather fixtures
     tap_buses.py       # 60s poller -> appends the ML training dataset
     export_gold.py     # local decision-ready data -> JSONL handoff
     load_to_databricks.py
