@@ -1,19 +1,17 @@
 import os
 
 from dotenv import load_dotenv
-from supabase import Client, create_client
+from supabase import create_client, Client
 
+# Load variables from .env
 load_dotenv()
 
-SUPABASE_URL = https://kiedafunuugiglokbaad.supabase.co
-SUPABASE_ANON_KEY = sb_publishable_l_nx3CKkLuSySPUsgRhaFw_H8FYRa_E
+# Get Supabase credentials
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-if not SUPABASE_URL:
-    raise ValueError("SUPABASE_URL is missing. Add it to your .env file.")
-
-if not SUPABASE_ANON_KEY:
-    raise ValueError(
-        "SUPABASE_ANON_KEY or SUPABASE_PUBLISHABLE_KEY is missing. Add it to your .env file."
-    )
-
-supabase: Client = create_client(https://kiedafunuugiglokbaad.supabase.co, sb_publishable_l_nx3CKkLuSySPUsgRhaFw_H8FYRa_E)
+# Create Supabase connection
+supabase: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_KEY
+)
