@@ -147,6 +147,20 @@ def main() -> int:
     for k, v in bundle["_stats"].items():
         print(f"  {k:32} {v}")
     print(f"\nwrote {BUNDLE}  ({BUNDLE.stat().st_size:,} bytes)")
+
+    # Per-table JSONL: one JSON object per line. This is what Databricks
+    # read_files() consumes directly; a single nested JSON object (the bundle)
+    # would have to be unpicked in SQL, which is fiddly and error-prone.
+    tables_dir = OUT_DIR / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("stops", "next_departures", "live_buses", "eat_options",
+                 "dining_hours"):
+        rows = bundle.get(name) or []
+        with (tables_dir / f"{name}.jsonl").open("w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+        print(f"  table {name:18} {len(rows):>6} rows -> {(tables_dir / (name + '.jsonl')).name}")
+    print(f"wrote JSONL tables to {tables_dir}")
     return 0
 
 
