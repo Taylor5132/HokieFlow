@@ -8,3 +8,4 @@ gold/
 .env
 databrickscfg
 token*
+fixtures/gtfs/

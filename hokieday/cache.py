@@ -12,6 +12,7 @@ Binary bodies (the GTFS zip) are stored as a sibling ".bin" file.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import urllib.error
@@ -27,18 +28,33 @@ class CacheMiss(RuntimeError):
     """Raised in cache-only mode when a fixture is not present."""
 
 
+# Filename components are limited to 255 bytes on common filesystems; keep well
+# under it so the "__h<digest>" suffix always fits.
+_MAX_KEY_LEN = 120
+
+
 # ------------------------------------------------------------------ keys
 def key(name: str, params: dict | None = None) -> str:
     """Deterministic, filename-safe cache key.
 
     key("dining_menu", {"location_num": "15", "dtdate": "09/19/2026"})
       -> "dining_menu__dtdate=09-19-2026__location_num=15"
+
+    Keys longer than _MAX_KEY_LEN are hashed. This is not cosmetic: a 40-item
+    nutrition query string produced a filename well past the 255-byte filesystem
+    limit and every write failed with `OSError: [Errno 63] File name too long`,
+    which silently emptied the whole nutrition seed. Short keys are returned
+    unchanged so existing fixtures keep their names.
     """
     params = params or {}
     raw = name if not params else name + "__" + "__".join(
         f"{k}={params[k]}" for k in sorted(params)
     )
-    return re.sub(r"[^A-Za-z0-9._=+-]", "-", raw)
+    safe = re.sub(r"[^A-Za-z0-9._=+-]", "-", raw)
+    if len(safe) > _MAX_KEY_LEN:
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+        return f"{safe[:_MAX_KEY_LEN // 2]}__h{digest}"
+    return safe
 
 
 def _json_path(name: str, params: dict | None = None) -> Path:
@@ -159,6 +175,27 @@ def get_bytes(name: str, url: str, *, params: dict | None = None,
     p.write_bytes(data)
     _write_envelope(_json_path(name, params), url, {"bytes": len(data), "file": p.name})
     return data
+
+
+def has(name: str, params: dict | None = None) -> bool:
+    """True if a cache entry exists on disk (never touches the network).
+
+    Needed because a DERIVED entry has no real source URL, so get_json() cannot
+    be used to probe for it: live mode would try to fetch the pseudo-URL and fail
+    with `unknown url type`.
+    """
+    return _json_path(name, params).exists()
+
+
+def put_json(name: str, url: str, payload: Any, *, params: dict | None = None) -> None:
+    """Persist a DERIVED payload (e.g. all-menu nutrition merged from chunks).
+
+    Deliberately a no-op in DEMO_MODE=cache: a replay must never rewrite the
+    frozen store it is reading. Live runs are what populate it.
+    """
+    if config.CACHE_ONLY:
+        return
+    _write_envelope(_json_path(name, params), url, payload)
 
 
 def stats() -> dict:

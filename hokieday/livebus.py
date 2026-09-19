@@ -20,11 +20,15 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from . import cache, config
+
+if TYPE_CHECKING:                      # annotation-only, for the "Gtfs" forward ref
+    from .gtfs import Gtfs
 
 _CAMPUS_TZ = ZoneInfo(config.CAMPUS_TZ)
 

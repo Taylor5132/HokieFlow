@@ -25,6 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from typing import Any
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from . import cache, config
@@ -247,6 +248,74 @@ _NUTRIENT_FIELDS = {
 }
 
 
+def _nutrients_from(payload: dict) -> dict[str, Nutrients]:
+    """Parse a NutritiveReport payload into {recipeId: Nutrients}."""
+    out: dict[str, Nutrients] = {}
+    for recipe in payload.get("recipes") or []:
+        vals = {
+            n.get("name"): _num(n.get("value"))
+            for n in recipe.get("nutrients") or []
+        }
+        out[str(recipe.get("id", ""))] = Nutrients(
+            cals=vals.get("Cals", 0.0),
+            protein_g=vals.get("Prot", 0.0),
+            fat_g=vals.get("Fat-T", 0.0),
+            carb_g=vals.get("Carb", 0.0),
+            sodium_mg=vals.get("Sod", 0.0),
+        )
+    return out
+
+
+def nutrition_for_location(location_num: str, d: date | str,
+                           force: bool = False) -> dict[str, Nutrients]:
+    """Nutrition for EVERY item on a location's menu, keyed by recipeId.
+
+    WHY THIS EXISTS (a real bug, not a nicety)
+    -----------------------------------------
+    Caching nutrition per CHUNK is fragile: the chunk string depends on which
+    items are in the request. `eat_options(max_kcal=...)` used to request
+    nutrition for the already-filtered subset (470 -> 142 after diet+allergen
+    filtering), which produced chunk keys that did not match the seeded
+    menu-order chunks. Every lookup missed, a miss means "kcal unknown", and the
+    calorie filter then dropped all 142 candidates -- so the meal silently
+    disappeared from every plan, and "can I eat and still make class?" answered
+    "no".
+
+    Fetching the WHOLE MENU in menu order and caching it under one stable
+    {location_num, date} key makes any later subset hit, whatever survives
+    filtering.
+    """
+    day = _as_date(d)
+    params = {"location_num": str(location_num), "date": day.isoformat()}
+    origin = "derived: all-menu nutrition merged from NutritiveReport chunks"
+
+    if cache.has("nutrition_location", params) and not force:
+        return _nutrients_from(
+            cache.get_json("nutrition_location", origin, params=params))
+
+    try:
+        menu_items = menu(location_num, day, force=force)
+    except Exception:                                        # noqa: BLE001
+        return {}
+
+    merged: dict = {"recipes": []}
+    for chunk_str in _nutrition_chunks(
+            [(it.recipe_id, it.portion_size or "1", 1) for it in menu_items], 40):
+        try:
+            payload = cache.get_json(
+                "dining_nutrition",
+                config.ENDPOINTS["dining_nutrition"].format(
+                    items=quote(chunk_str, safe="*,")),
+                params={"items": chunk_str}, force=force)
+        except cache.CacheMiss:
+            continue            # partial nutrition beats none; kcal stays unknown
+        merged["recipes"].extend(payload.get("recipes") or [])
+
+    if merged["recipes"]:
+        cache.put_json("nutrition_location", origin, merged, params=params)
+    return _nutrients_from(merged)
+
+
 def nutrition_bulk(
     items: list[tuple[str, str, int]], chunk: int = 40, force: bool = False,
 ) -> dict[str, Nutrients]:
@@ -260,9 +329,15 @@ def nutrition_bulk(
     """
     out: dict[str, Nutrients] = {}
     for chunk_str in _nutrition_chunks(list(items), chunk):
+        # The items string MUST be percent-encoded. Real portion sizes include
+        # fractions with spaces and slashes (e.g. "1 1/2", "1/10"), so an
+        # unencoded chunk produced `InvalidURL: URL can't contain control
+        # characters ... (found at least ' ')` and the whole seed silently
+        # returned nothing. '*' and ',' are safe to leave literal.
         payload = cache.get_json(
             "dining_nutrition",
-            config.ENDPOINTS["dining_nutrition"].format(items=chunk_str),
+            config.ENDPOINTS["dining_nutrition"].format(
+                items=quote(chunk_str, safe="*,")),
             params={"items": chunk_str},
             force=force,
         )
@@ -384,9 +459,12 @@ def eat_options(
         ]
 
     if max_kcal is not None:
-        nut = nutrition_bulk(
-            [(it.recipe_id, it.portion_size, 1) for it in items], force=force,
-        )
+        # Look nutrition up for the WHOLE MENU (menu order, cached per location),
+        # never for the already-filtered subset: subsetting changed the chunk
+        # boundaries, every chunk key missed the cache, and because a miss means
+        # "kcal unknown" the ceiling then dropped all 142 candidates -- the meal
+        # silently vanished from every plan. See nutrition_for_location().
+        nut = nutrition_for_location(location_num, day, force=force)
         items = [
             it for it in items
             if it.recipe_id in nut and nut[it.recipe_id].cals <= max_kcal

@@ -232,7 +232,6 @@ def next_departures(g: Gtfs, stop_id: str, at: datetime, horizon_min: int = 180,
     # and may exceed 24 h (after-midnight service belongs to the prior day).
     midnight = datetime(service_date.year, service_date.month, service_date.day,
                         tzinfo=_TZ)
-    horizon_s = horizon_min * 60
     trips = g.trips
     routes = g.routes
     out: list[Departure] = []
