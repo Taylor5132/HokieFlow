@@ -208,6 +208,47 @@ class TestBugRegressions(unittest.TestCase):
                                  "a walking plan should not be absurdly long")
 
 
+class TestMealChoice(unittest.TestCase):
+    """Four rankings were tried for the "I'm hungry" pick and three failed
+    visibly in the demo: cheapest-first gave 'Cinnamon Apples (82 kcal)',
+    calorie-distance gave 'Oreo Cobbler Cake', a dessert penalty gave 'Bleu Cheese
+    Dressing', and a name penalty gave '1000 Island'. This locks in the shipped
+    rule: meal-ish sections first, then most filling."""
+
+    def test_build_your_own_bars_are_demoted(self):
+        """Bars serve COMPONENTS, not dishes. This is what let a salad bar offer
+        '1000 Island' as lunch."""
+        self.assertEqual(tools.section_rank("Edens Salad Bar", "Lettuce"), 2)
+        self.assertEqual(tools.section_rank("East Side Deli Bar", "Turkey"), 2)
+        self.assertEqual(tools.section_rank("Yogurt Bar", "Granola"), 2)
+
+    def test_real_stations_are_meals(self):
+        self.assertEqual(tools.section_rank("Mangia Pizza", "Cheese Pizza"), 0)
+        self.assertEqual(tools.section_rank("Mangia Pasta", "Penne"), 0)
+        self.assertEqual(tools.section_rank("Viridian Entrees", "Roast Chicken"), 0)
+        self.assertEqual(tools.section_rank("Edens Soups and Chili", "Chili"), 0)
+
+    def test_barbecue_is_not_caught_by_the_bar_rule(self):
+        """' bar' is spaced deliberately so it does not match 'barbecue'."""
+        self.assertNotEqual(tools.section_rank("Barbecue Pit", "Pulled Pork"), 2)
+
+    def test_the_shipped_pick_is_a_dish(self):
+        for profile in ("demo-student-1", "demo-student-2"):
+            r = tools.plan_day(profile, "11:22", "13:00")
+            eat = [l for l in r["itinerary"]["legs"] if l["type"] == "eat"]
+            self.assertEqual(len(eat), 1)
+            self.assertGreater(eat[0]["kcal"], 150,
+                               f"{profile} was offered a snack-sized meal")
+
+    def test_food_ranking_prefers_a_meal_section(self):
+        r = tools.find_food(location_num="15", diet="vegetarian",
+                            avoid=("Peanuts", "Tree Nuts"), max_kcal=800)
+        top = r["items"][0]
+        self.assertEqual(
+            tools.section_rank(str(top.get("section")), str(top.get("name"))), 0,
+            f"top pick {top['name']!r} from {top.get('section')!r} is not a meal section")
+
+
 class TestCacheKeyLength(unittest.TestCase):
     """BUG: a 40-item nutrition query produced a filename past the 255-byte
     filesystem limit; every write failed with Errno 63 and the whole nutrition

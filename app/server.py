@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""HokieDay demo server — stdlib only, no dependencies, works offline.
+
+WHY STDLIB, NOT STREAMLIT
+Streamlit/pandas are not installed on this machine, and more importantly the
+expo demo must survive unknown Wi-Fi and a possible Databricks quota shutdown.
+`http.server` needs nothing installed and reads the frozen fixtures, so the demo
+depends on nothing but Python.
+
+Run:
+    DEMO_MODE=cache python3 app/server.py            # offline, deterministic
+    DEMO_MODE=cache python3 app/server.py --port 8080
+
+Endpoints:
+    GET  /                  the UI
+    GET  /api/status        clock, mode, data freshness, provenance
+    GET  /api/scenarios     the preset demo buttons
+    POST /api/ask           {"text": "..."} -> plan_day(...) result
+    GET  /api/raw?n=1       the raw JSON for scenario n (debugging / slides)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+from hokieday import cache, config, tools  # noqa: E402
+
+TZ = ZoneInfo(config.CAMPUS_TZ)
+
+# Preset scenarios. Each is a deterministic call into the SAME plan_day the agent
+# uses -- the demo is not a re-enactment.
+SCENARIOS: list[dict] = [
+    {
+        "id": "eat",
+        "label": "Can I eat and still make my 1:25?",
+        "text": "I've got from 11:22 to 13:00, I'm hungry, and I need to get from Burruss to McBryde",
+        "student_ref": "demo-student-1", "start": "11:22", "end": "13:00", "prefs": {},
+    },
+    {
+        "id": "bus_replan",
+        "label": "Same trip, but I want the bus",
+        "text": "Same trip but I'd rather take the bus than walk",
+        "student_ref": "demo-student-1", "start": "11:22", "end": "13:00",
+        "prefs": {"prefer": "bus"},
+    },
+    {
+        "id": "vegan",
+        "label": "Vegan, and no sesame",
+        "text": "I'm vegan and I can't have sesame. Same window.",
+        "student_ref": "demo-student-2", "start": "11:22", "end": "13:00", "prefs": {},
+    },
+    {
+        "id": "tight",
+        "label": "Tighter window (11:22 to 12:05)",
+        "text": "Only have until 12:05",
+        "student_ref": "demo-student-1", "start": "11:22", "end": "12:05", "prefs": {},
+    },
+]
+
+TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})\b")
+
+
+def parse_free_text(text: str) -> dict:
+    """A deliberately SMALL rule-based parser.
+
+    It is NOT presented as the language model. With a Databricks workspace the
+    text->parameters step is the agent's job (Mosaic AI calls these same tools);
+    this exists so the behaviour is demonstrable with no network at all. The UI
+    labels it as such rather than implying an LLM is running.
+    """
+    t = (text or "").lower()
+    call = dict(SCENARIOS[0])
+    call["prefs"] = {}
+    if any(w in t for w in ("bus", "transit", "ride ")):
+        call["prefs"]["prefer"] = "bus"
+    if "vegan" in t:
+        call["student_ref"] = "demo-student-2"
+    elif "vegetarian" in t:
+        call["student_ref"] = "demo-student-1"
+    times = TIME_RE.findall(text or "")
+    if len(times) >= 2:
+        call["start"] = f"{int(times[0][0]):02d}:{times[0][1]}"
+        call["end"] = f"{int(times[1][0]):02d}:{times[1][1]}"
+    elif len(times) == 1:
+        call["end"] = f"{int(times[0][0]):02d}:{times[0][1]}"
+    return call
+
+
+def run_plan(call: dict) -> dict:
+    result = tools.plan_day(call["student_ref"], call["start"], call["end"],
+                            call.get("prefs") or {})
+    result["_request"] = {"student_ref": call["student_ref"],
+                          "start": call["start"], "end": call["end"],
+                          "prefs": call.get("prefs") or {}}
+    return result
+
+
+def status() -> dict:
+    import time as _time
+    fixtures = cache.stats()
+    ages = {}
+    for name, params in (("bt_buses", {}), ("dining_menu",
+                                            {"location_num": "15",
+                                             "dtdate": "09/19/2026"})):
+        a = cache.age_seconds(name, params)
+        ages[name] = None if a is None else round(a / 3600.0, 1)
+    live = tools.get_live_bus(source=None)
+    return {
+        "mode": config.DEMO_MODE,
+        "offline": config.CACHE_ONLY,
+        "clock": config.now().isoformat(timespec="seconds"),
+        "clock_pinned_to_snapshot": config.CACHE_ONLY,
+        "wall_clock": datetime.now(TZ).isoformat(timespec="seconds"),
+        "campus_now": config.now(TZ).strftime("%a %d %b %Y %H:%M"),
+        "fixtures": fixtures["count"],
+        "fixture_age_hours": ages,
+        "live_vehicles": len(live.get("buses", live) or []),
+        "live_stale": live.get("stale"),
+        "generated_in_ms": round(_time.perf_counter() * 0 + 0, 1),
+        "assumptions": {
+            "eat_minutes": tools.EAT_MINUTES,
+            "meal_ranking": tools.MEAL_RANKING_RULE,
+            "meal_ranking_note": "a demo convenience, not dietary advice",
+            "min_board_buffer_min": tools.MIN_BOARD_BUFFER_MIN,
+            "walk_speed_mps": config.WALK_SPEED_MPS,
+            "walk_path_factor": config.WALK_PATH_FACTOR,
+            "bus_full_pct": config.BUS_FULL_PCT,
+        },
+        "caveats": [
+            "blank allergen field means UNKNOWN, except in a documented "
+            "allergen-free kitchen (Viridian) -- see venue_allergen_free",
+            "live bus positions are a replayed snapshot; sched_delta_min is "
+            "computed against the pinned snapshot clock",
+            "walk times use a straight-line path factor, not a routed path",
+        ],
+    }
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):        # quieter console
+        if "/api/" not in (args[0] if args else ""):
+            return
+
+    def _send(self, code: int, body: bytes, ctype: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj, code: int = 200) -> None:
+        self._send(code, json.dumps(obj, default=str, indent=1).encode("utf-8"),
+                   "application/json; charset=utf-8")
+
+    def do_GET(self) -> None:                 # noqa: N802
+        path = self.path.split("?")[0]
+        if path in ("/", "/index.html"):
+            html = (Path(__file__).parent / "index.html").read_bytes()
+            self._send(200, html, "text/html; charset=utf-8")
+            return
+        if path == "/api/status":
+            self._json(status())
+            return
+        if path == "/api/scenarios":
+            self._json([{k: s[k] for k in ("id", "label", "text")} for s in SCENARIOS])
+            return
+        if path == "/api/raw":
+            from urllib.parse import parse_qs, urlparse
+            n = int((parse_qs(urlparse(self.path).query).get("n", ["1"])[0]))
+            idx = max(0, min(len(SCENARIOS) - 1, n - 1))
+            try:
+                self._json(run_plan(dict(SCENARIOS[idx])))
+            except Exception as exc:                      # noqa: BLE001
+                self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+            return
+        self._json({"error": "not found"}, 404)
+
+    def do_POST(self) -> None:                # noqa: N802
+        if self.path.split("?")[0] != "/api/ask":
+            self._json({"error": "not found"}, 404)
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:                                  # noqa: BLE001
+            payload = {}
+        try:
+            if payload.get("scenario_id"):
+                match = next((s for s in SCENARIOS
+                              if s["id"] == payload["scenario_id"]), None)
+                if match is None:
+                    self._json({"error": "unknown scenario_id"}, 400)
+                    return
+                call = dict(match)
+            else:
+                call = parse_free_text(payload.get("text", ""))
+            self._json(run_plan(call))
+        except Exception as exc:                           # noqa: BLE001
+            self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=8321)
+    ap.add_argument("--host", default="127.0.0.1")
+    args = ap.parse_args()
+
+    st = status()
+    print("=" * 68)
+    print("HokieDay demo server")
+    print("=" * 68)
+    print(f"  mode        : {st['mode']}   offline={st['offline']}")
+    print(f"  campus now  : {st['campus_now']}  (pinned to the snapshot)")
+    print(f"  fixtures    : {st['fixtures']}")
+    print(f"  live buses  : {st['live_vehicles']}   stale={st['live_stale']}")
+    print(f"\n  open http://{args.host}:{args.port}/")
+    print("  Ctrl-C to stop\n")
+    ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

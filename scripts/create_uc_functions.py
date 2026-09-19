@@ -130,7 +130,18 @@ FUNCTIONS: list[tuple[str, str, str, str]] = [
                  ))
             AND (p_max_kcal IS NULL
                  OR (e.kcal IS NOT NULL AND e.kcal <= p_max_kcal))
-          ORDER BY e.kcal ASC NULLS LAST
+          ORDER BY (CASE
+                      WHEN lower(e.name) RLIKE 'dressing|vinaigrette|sauce|syrup|butter|spread|jam|jelly|condiment|dip|seasoning|vinegar|ketchup|mustard|mayonnaise|soda|juice|coffee|tea|water|milk|cream cheese|whipped cream|relish'
+                        THEN 2
+                      WHEN lower(e.section) RLIKE
+                           'condiment|topping|dressing|sauce|syrup|butter|spread|beverage|drink|coffee|tea|juice|soda|milk|patisserie|ice cream|dessert|cookie|cake|brownie|cobbler|yogurt|mousse|smoothie|cereal|bagel|bread|oatmeal| bar'
+                        THEN 2
+                      WHEN lower(e.section) RLIKE
+                           'entree|entr\u00e9e|deli|salad|pizza|pasta|grill|pan asia|salsa|soup|chili|bowl|sub|wrap|sandwich|burrito|taco'
+                        THEN 0
+                      ELSE 1 END) ASC,
+                   e.kcal DESC NULLS LAST,
+                   e.name ASC
           LIMIT 40)""",
     ),
     (

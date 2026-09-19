@@ -37,6 +37,88 @@ _CAMPUS_TZ = ZoneInfo(config.CAMPUS_TZ)
 # ---------------------------------------------------------------------------
 EAT_MINUTES = 20.0          # assumed time to sit down and eat one item
 MIN_BOARD_BUFFER_MIN = 2.0   # buffer needed at a stop to actually board the bus
+
+# When a student says they are hungry, prefer a MEAL-sized item over the smallest
+# available. Ordering by calories ascending made the agent offer "Cinnamon Apples
+# (82 kcal)" as lunch. This is a DECLARED assumption, surfaced in the demo UI
+# alongside EAT_MINUTES -- not a hidden magic number.
+MEAL_TARGET_KCAL = 450.0        # kept only to document a failed approach; see below
+
+# How the "I'm hungry" pick is chosen. Four approaches were tried and each
+# failed visibly in the demo:
+#   1. kcal ascending        -> "Cinnamon Apples (82 kcal)" as lunch
+#   2. closeness to 450 kcal -> "Oreo Cobbler Cake"
+#   3. + dessert penalty     -> "Bleu Cheese Dressing" (a salad-bar condiment)
+#   4. + item-name penalty   -> "1000 Island" (a dressing with no keyword in its name)
+# Keyword-hunting does not converge, because "is this a meal?" is not recoverable
+# from names. The shipped rule is deliberately simple and explainable:
+#     among items that satisfy the constraints, offer the MOST FILLING one
+#     (highest calories), with obviously non-meal sections demoted.
+# A student who says they are hungry wants the biggest meal that fits, and that
+# rule is one sentence a judge can check. It is a DEMO CONVENIENCE, not dietary
+# advice -- stated in the UI rather than presented as nutrition.
+MEAL_RANKING_RULE = "most filling option that satisfies the constraints"
+
+# Ranking the "I'm hungry" pick. Two naive attempts failed in visible ways:
+#   kcal ascending            -> "Cinnamon Apples (82 kcal)" as lunch
+#   kcal-distance only        -> "Oreo Cobbler Cake"
+#   + dessert penalty         -> "Bleu Cheese Dressing" (a condiment)
+# So classify the SECTION into meal / neutral / non-meal and rank meals first,
+# then closeness to the target. A whitelist is used rather than a blacklist
+# because section names vary; the blacklist only demotes the obvious cases.
+#
+# NOTE: duplicated in the SQL UC function find_food (it cannot import Python);
+# tests/test_regressions.py asserts the Python path picks a MEAL section.
+MEAL_SECTION_PATTERN = ("entree|entr\u00e9e|deli|salad|pizza|pasta|grill|pan asia|"
+                        "salsa|soup|chili|bowl|sub|wrap|sandwich|burrito|taco")
+NON_MEAL_SECTION_PATTERN = (
+    "condiment|topping|dressing|sauce|syrup|butter|spread|beverage|drink|"
+    "coffee|tea|juice|soda|milk|patisserie|ice cream|dessert|cookie|cake|"
+    "brownie|cobbler|yogurt|mousse|smoothie|cereal|bagel|bread|oatmeal|"
+    # Build-your-own stations ("Edens Salad Bar", "East Side Deli Bar",
+    # "Yogurt Bar") serve COMPONENTS, not composed dishes -- which is why a
+    # salad bar offered "1000 Island" as lunch. Written as " bar" so it does not
+    # also catch "barbecue".
+    " bar")
+MEAL_SECTION_SQL = ("entree|entr\u00e9e|deli|salad|pizza|pasta|grill|pan asia|"
+                    "salsa|soup|chili|bowl|sub|wrap|sandwich|burrito|taco")
+NON_MEAL_SECTION_SQL = (
+    "condiment|topping|dressing|sauce|syrup|butter|spread|beverage|drink|"
+    "coffee|tea|juice|soda|milk|patisserie|ice cream|dessert|cookie|cake|"
+    "brownie|cobbler|yogurt|mousse|smoothie|cereal|bagel|bread|oatmeal|"
+    " bar")
+
+# Section alone is not enough: "Bleu Cheese Dressing" is served at the SALAD BAR,
+# so the section matched the meal whitelist and the agent offered dressing as
+# lunch. The ITEM name is the signal that actually distinguishes a dish from a
+# condiment, so it is checked first and can only ever DEMOTE.
+NON_MEAL_ITEM_PATTERN = (
+    "dressing|vinaigrette|sauce|syrup|butter|spread|jam|jelly|condiment|dip|"
+    "seasoning|vinegar|ketchup|mustard|mayonnaise|soda|juice|coffee|tea|water|"
+    "milk|cream cheese|whipped cream|relish|salsa verde|hot sauce")
+NON_MEAL_ITEM_SQL = (
+    "dressing|vinaigrette|sauce|syrup|butter|spread|jam|jelly|condiment|dip|"
+    "seasoning|vinegar|ketchup|mustard|mayonnaise|soda|juice|coffee|tea|water|"
+    "milk|cream cheese|whipped cream|relish")
+
+
+def section_rank(section: str | None, name: str | None = None) -> int:
+    """0 = looks like a meal, 1 = unclassified, 2 = dessert/condiment/drink.
+
+    The ITEM name is checked first and can only demote, so a dressing served at a
+    salad bar is not mistaken for a meal.
+    """
+    import re as _re
+    if name and _re.search(NON_MEAL_ITEM_PATTERN, name.lower()):
+        return 2
+    s = (section or "").lower()
+    # NON-MEAL IS CHECKED BEFORE MEAL: a "Salad Bar" contains the word "salad"
+    # but is a component station, so demotion must win.
+    if _re.search(NON_MEAL_SECTION_PATTERN, s):
+        return 2
+    if _re.search(MEAL_SECTION_PATTERN, s):
+        return 0
+    return 1
 _DEPARTURE_LIMIT = 10       # rows per departures board
 
 # Places that are BOTH in config.PLACES (walkable, have coordinates) AND dining
@@ -539,6 +621,20 @@ def find_food(location_num: str | None = None, diet: str | None = None,
                 "max_kcal": max_kcal, "open_only": bool(open_only),
                 "count": 0, "items": [],
                 "reason": f"menu data unavailable: {exc}"}
+    # Rank: meal-ish section first, then dessert/condiment/drink, then closeness
+    # to a MEAL-sized target. Three naive rankings failed visibly: cheapest-first
+    # gave "Cinnamon Apples (82 kcal)", calorie-distance gave "Oreo Cobbler Cake",
+    # and a dessert penalty gave "Bleu Cheese Dressing". Unknown calories sort
+    # last; ties break on name so the choice is reproducible.
+    # Tier by section classification (meals first, desserts/condiments/drinks
+    # last), then MOST FILLING first, then name for reproducibility. See
+    # MEAL_RANKING_RULE for the four approaches this replaced.
+    rows.sort(key=lambda r: (
+        section_rank(str(r.get("section")), str(r.get("name"))),
+        -((r["kcal"] if r.get("kcal") is not None else -1e9)),
+        str(r.get("name", "")),
+    ))
+
     reason = None
     if not rows:
         reason = ("no menu items matched (allergen filters are hard filters; "

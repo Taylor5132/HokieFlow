@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HokieDay</title>
+<style>
+  :root{
+    --bg:#0f1115; --card:#181b22; --card2:#1f232c; --ink:#e9edf3; --dim:#98a2b3;
+    --line:#2a3040; --accent:#e87722; --maroon:#861f41; --ok:#3fb950; --warn:#d29922;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:26px 20px 60px}
+  h1{font-size:26px;margin:0 0 2px}
+  h1 span{color:var(--accent)}
+  .sub{color:var(--dim);font-size:14px;margin-bottom:18px}
+  .pill{display:inline-block;padding:3px 9px;border-radius:999px;font-size:12px;
+        border:1px solid var(--line);background:var(--card2);color:var(--dim);margin-right:6px}
+  .pill.ok{color:var(--ok);border-color:#24502f}
+  .pill.warn{color:var(--warn);border-color:#544216}
+  button{font:inherit;cursor:pointer;border-radius:10px;border:1px solid var(--line);
+         background:var(--card2);color:var(--ink);padding:10px 14px;text-align:left}
+  button:hover{border-color:var(--accent)}
+  button.primary{border-color:var(--maroon);background:#2a1620}
+  .row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+  .qa{display:flex;gap:10px;margin:16px 0 22px}
+  input[type=text]{flex:1;font:inherit;padding:12px 14px;border-radius:10px;
+        border:1px solid var(--line);background:var(--card);color:var(--ink)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+        padding:16px 18px;margin-bottom:16px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:820px){.grid{grid-template-columns:1fr}}
+  .k{color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:.08em}
+  .big{font-size:19px;margin:4px 0 10px}
+  .banner{border-left:4px solid var(--accent);background:#241a10;padding:12px 14px;
+          border-radius:8px;margin:6px 0 16px}
+  .banner b{color:var(--accent)}
+  .leg{display:flex;gap:12px;padding:9px 0;border-bottom:1px dashed var(--line)}
+  .leg:last-child{border-bottom:none}
+  .num{width:22px;color:var(--dim);font-variant-numeric:tabular-nums}
+  .type{width:52px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim)}
+  .mins{width:74px;font-variant-numeric:tabular-nums}
+  .what{flex:1}
+  .tag{display:inline-block;font-size:11px;color:var(--dim);border:1px solid var(--line);
+       border-radius:6px;padding:1px 6px;margin-left:6px}
+  .tag.sched{color:#7cc4ff;border-color:#274763}
+  .tag.est{color:var(--warn);border-color:#544216}
+  .tag.safe{color:var(--ok);border-color:#24502f}
+  .muted{color:var(--dim);font-size:13px}
+  .planA{opacity:.92;border-color:#3a2a33}
+  .kv{display:flex;justify-content:space-between;font-size:13px;color:var(--dim);margin-top:8px}
+  .foot{color:var(--dim);font-size:12.5px;margin-top:22px;border-top:1px solid var(--line);padding-top:14px}
+  code{background:var(--card2);padding:1px 5px;border-radius:5px;font-size:12.5px}
+  .err{color:#ff7b72}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Hokie<span>Day</span></h1>
+  <div class="sub">
+    One question across dining, transit, hours and menus — and it <b>re-plans when reality moves</b>.
+  </div>
+  <div id="status"></div>
+
+  <div class="row" id="scenarios" style="margin-top:16px"></div>
+
+  <div class="qa">
+    <input type="text" id="q" placeholder="Ask in your own words, e.g. “I'm vegan, no sesame, free 11:22–13:00, Burruss to McBryde”">
+    <button class="primary" onclick="ask()">Ask</button>
+  </div>
+
+  <div id="out"></div>
+
+  <div class="foot" id="foot"></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function tagFor(leg){
+  if(leg.type==="bus") return '<span class="tag sched">scheduled · service-filtered</span>';
+  if(leg.type==="walk") return '<span class="tag est">estimated · straight-line×factor</span>';
+  if(leg.type==="eat"){
+    let t = '<span class="tag sched">from menu API</span>';
+    if(leg.allergens_known === false && leg.venue_allergen_free)
+      t += '<span class="tag safe">documented allergen-free kitchen</span>';
+    else if(leg.allergens_known === false)
+      t += '<span class="tag est">allergens UNKNOWN</span>';
+    return t;
+  }
+  return '';
+}
+
+function legRow(l){
+  const what = l.place
+    ? esc(l.place) + (l.item ? ` — <b>${esc(l.item)}</b> (${esc(l.kcal)} kcal)` : "")
+    : `${esc(l.from)} → ${esc(l.to)}`;
+  const route = l.type === "bus" ? ` <span class="muted">route ${esc(l.route_id)}, wait ${esc(l.wait_min)} min</span>` : "";
+  return `<div class="leg">
+     <div class="num">${esc(l.seq)}</div>
+     <div class="type">${esc(l.type)}</div>
+     <div class="mins">${esc(l.minutes)} min</div>
+     <div class="what">${what}${route}${tagFor(l)}</div>
+   </div>`;
+}
+
+function itineraryCard(it, title, cls){
+  if(!it) return "";
+  const legs = (it.legs||[]).map(legRow).join("");
+  return `<div class="card ${cls||''}">
+    <div class="k">${esc(title)}</div>
+    <div class="big">Leave ${esc((it.leave_time||"").slice(11,16))} → arrive ${esc((it.arrive_time||"").slice(11,16))}
+      <span class="muted">(${esc(it.total_min)} min, slack ${esc(it.slack_min)} min)</span></div>
+    ${legs}
+    <div class="kv"><span>${it.used_bus ? "uses the bus" : "walking"}</span>
+      <span>${it.arrives_in_window ? "inside the window" : "MISSES the window"}</span></div>
+  </div>`;
+}
+
+function render(r){
+  if(r.error){ $("#out").innerHTML = `<div class="card err">Error: ${esc(r.error)}</div>`; return; }
+  const it = r.itinerary, t = r.replan_trigger;
+  let html = "";
+
+  html += `<div class="card"><div class="k">answer</div>
+    <div class="big">${esc(r.rationale)}</div>
+    <div class="muted">student_ref <code>${esc(r.student_ref)}</code> — a surrogate key; no name, no PID, no academic data.</div>
+  </div>`;
+
+  if(t){
+    html += `<div class="banner"><b>RE-PLANNED — ${esc(t.cause)}</b><br>${esc(t.detail)}
+      <div class="muted" style="margin-top:6px">Plan A was built, then live state was re-checked and invalidated it.
+      Both plans are shown so the change is inspectable, not asserted.</div></div>`;
+  }
+
+  const planA = (r.alternatives||[]).find(a => a.type === "previous_itinerary_a");
+  if(planA){
+    html += `<div class="grid">
+       ${itineraryCard(planA.itinerary, "PLAN A — invalidated", "planA")}
+       ${itineraryCard(it, "PLAN B — what we now recommend", "")}
+     </div>`;
+  } else {
+    html += itineraryCard(it, "PLAN", "");
+  }
+
+  const alts = (r.alternatives||[]).filter(a => a.type === "walk_direct");
+  if(alts.length){
+    html += `<div class="card"><div class="k">alternative</div>
+      <div>Walk the whole way: <b>${esc(alts[0].minutes)} min</b>
+      <span class="muted">(${esc(alts[0].meters)} m straight-line)</span></div></div>`;
+  }
+
+  const req = r._request || {};
+  html += `<div class="card"><div class="k">request</div>
+    <div class="muted">profile <code>${esc(req.student_ref)}</code> · window
+    <code>${esc(req.start)}–${esc(req.end)}</code> ·
+    prefs <code>${esc(JSON.stringify(req.prefs))}</code></div></div>`;
+
+  $("#out").innerHTML = html;
+}
+
+async function ask(scenarioId){
+  const body = scenarioId ? {scenario_id: scenarioId} : {text: $("#q").value};
+  $("#out").innerHTML = '<div class="card muted">planning…</div>';
+  try{
+    const res = await fetch("/api/ask", {
+      method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)
+    });
+    render(await res.json());
+  }catch(e){
+    $("#out").innerHTML = `<div class="card err">request failed: ${esc(e)}</div>`;
+  }
+}
+
+async function boot(){
+  try{
+    const s = await (await fetch("/api/status")).json();
+    $("#status").innerHTML =
+      `<span class="pill ${s.offline ? 'ok':''}">${s.offline ? "OFFLINE · frozen snapshot" : "MODE " + s.mode}</span>
+       <span class="pill">campus now ${esc(s.campus_now)}</span>
+       <span class="pill">${esc(s.live_vehicles)} live buses</span>
+       <span class="pill ${s.live_stale ? 'warn':''}">${s.fixtures} fixtures</span>`;
+    $("#foot").innerHTML =
+      `<div class="k" style="margin-bottom:6px">assumptions &amp; caveats (stated, not hidden)</div>
+       ${s.caveats.map(c => "• " + esc(c)).join("<br>")}
+       <div style="margin-top:10px">assumed constants:
+         eat ${esc(s.assumptions.eat_minutes)} min ·
+         boarding buffer ${esc(s.assumptions.min_board_buffer_min)} min ·
+         walk ${esc(s.assumptions.walk_speed_mps)} m/s × ${esc(s.assumptions.walk_path_factor)} path factor ·
+         bus "full" at ${esc(s.assumptions.bus_full_pct)}%</div>
+       <div style="margin-top:10px">The free-text box uses a small rule-based parser offline;
+         with a Databricks workspace the text→parameters step is the agent's job, calling these
+         same tools as governed Unity Catalog functions.</div>`;
+
+    const sc = await (await fetch("/api/scenarios")).json();
+    const b = $("#scenarios");
+    sc.forEach((s2, i) => {
+      const el = document.createElement("button");
+      el.className = i === 1 ? "primary" : "";
+      el.textContent = s2.label;
+      el.onclick = () => ask(s2.id);
+      b.appendChild(el);
+    });
+  }catch(e){
+    $("#status").innerHTML = `<span class="pill warn">status unavailable: ${esc(e)}</span>`;
+  }
+  ask("eat");
+}
+boot();
+</script>
+</body>
+</html>
