@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -252,6 +253,22 @@ def _http(url: str, timeout: int) -> bytes:
         return r.read()
 
 
+def _http_post(url: str, data: bytes, timeout: int) -> bytes:
+    """POST an application/x-www-form-urlencoded body.
+
+    Kept separate from ``_http`` so every existing GET caller (and the tests
+    that monkeypatch ``cache._http`` with a ``(url, timeout)`` callable) stays
+    untouched. The POST body is what makes it a *different* operation: an
+    ArcGIS route solve cannot be represented as a cache key by URL alone.
+    """
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"User-Agent": config.USER_AGENT,
+                 "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
 def _fetch_failed(exc: Exception) -> bool:
     return isinstance(
         exc,
@@ -389,6 +406,90 @@ def get_bytes(name: str, url: str, *, params: dict | None = None,
         _write_envelope(_json_path(name, params), url,
                         {"bytes": len(data), "file": p.name})
         return data
+
+
+def _post_cache_params(url: str, encoded_form: bytes,
+                       params: dict | None) -> dict:
+    """Return caller parameters plus an opaque identity for this exact POST.
+
+    The URL and body are hashed rather than copied into the filename: request
+    bodies can be large and may contain private values. The reserved key is
+    always overwritten, so a caller cannot accidentally (or deliberately)
+    make two different POSTs share an entry by supplying a stale identity.
+    """
+    identity = hashlib.sha256(url.encode("utf-8") + b"\0" + encoded_form).hexdigest()
+    out = dict(params or {})
+    out["_post_sha256"] = identity
+    return out
+
+
+def _post_envelope_url(url: str) -> str:
+    """Safe endpoint-only URL for cache metadata (no userinfo/query/fragment)."""
+    parts = urllib.parse.urlsplit(url)
+    netloc = parts.netloc.rsplit("@", 1)[-1]
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def post_form_json(name: str, url: str, form: dict,
+                   *, params: dict | None = None,
+                   max_age_s: float | None = None, force: bool = False,
+                   timeout: int = 30) -> Any:
+    """Cached POST of an ``application/x-www-form-urlencoded`` body -> parsed JSON.
+
+    Same contract as :func:`get_json` (per-key lock, inside-lock freshness
+    recheck, recent-failure cooldown, stale fallback, ``DEMO_MODE=cache`` reads
+    only) but the request is a form POST. Needed because an ArcGIS NAServer
+    ``solve`` carries a JSON ``travelMode`` object and a ``stops`` object that
+    are both too large and too operationally meaningful to fold into a URL.
+
+    The helper itself folds a SHA-256 identity of the exact URL + encoded form
+    body into the cache key. Callers may add readable ``params`` for diagnostics,
+    but correctness never depends on them. Neither body values nor credentials
+    are included in filenames or warning logs. Writes use the same lock,
+    cooldown and atomic envelope publisher as GET.
+    """
+    data = urllib.parse.urlencode(form, doseq=True).encode("utf-8")
+    cache_params = _post_cache_params(url, data, params)
+    p = _json_path(name, cache_params)
+    k = key(name, cache_params)
+
+    if config.CACHE_ONLY:
+        if p.exists():
+            return _read_envelope(p)["payload"]
+        raise CacheMiss(f"DEMO_MODE=cache and no fixture for {k}")
+
+    if (not force and p.exists()
+            and (max_age_s is None
+                 or (age_seconds(name, cache_params) or 1e18) <= max_age_s)):
+        return _read_envelope(p)["payload"]
+
+    with _key_lock(k):
+        have = p.exists()
+        fresh = have and (max_age_s is None
+                          or (age_seconds(name, cache_params) or 1e18) <= max_age_s)
+        if fresh and not force:
+            return _read_envelope(p)["payload"]
+
+        suppressed = None if force else _suppress_retry(k, max_age_s)
+        if suppressed is not None:
+            if have:
+                print(f"[cache] WARN {k}: refresh skipped after recent failure "
+                      f"({suppressed}); using cached copy")
+                return _read_envelope(p)["payload"]
+            raise CacheRefreshError(
+                f"{k}: refresh suppressed after recent failure ({suppressed})") from suppressed
+
+        try:
+            payload = json.loads(_http_post(url, data, timeout).decode("utf-8", "replace"))
+        except Exception as exc:                 # noqa: BLE001 - deliberate breadth
+            _record_failure(k, exc)
+            if have:
+                print(f"[cache] WARN {k}: POST failed ({exc}); using cached copy")
+                return _read_envelope(p)["payload"]
+            raise
+        _clear_failure(k)
+        _write_envelope(p, _post_envelope_url(url), payload)
+        return payload
 
 
 def has(name: str, params: dict | None = None) -> bool:
