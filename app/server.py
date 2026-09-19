@@ -21,6 +21,7 @@ Endpoints:
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import re
 import sys
@@ -225,9 +226,30 @@ def main() -> int:
     print(f"  campus now  : {st['campus_now']}  (pinned to the snapshot)")
     print(f"  fixtures    : {st['fixtures']}")
     print(f"  live buses  : {st['live_vehicles']}   stale={st['live_stale']}")
-    print(f"\n  open http://{args.host}:{args.port}/")
+
+    # Bind BEFORE announcing a URL, so we never print an address we did not get.
+    # Binding can fail because a previous instance is still running -- easy on
+    # demo day, and a raw traceback is a bad look. Step to the next free port and
+    # say plainly which one we actually bound.
+    httpd = None
+    for port in range(args.port, args.port + 6):
+        try:
+            httpd = ThreadingHTTPServer((args.host, port), Handler)
+            break
+        except OSError as exc:
+            if exc.errno != errno.EADDRINUSE:
+                raise
+            print(f"  port {port} is busy (an older HokieDay server still "
+                  f"running?), trying {port + 1}")
+    if httpd is None:
+        print(f"\n  Could not bind any port in {args.port}-{args.port + 5}.\n"
+              f"  Stop the other instance, or run: python3 app/server.py --port 9000")
+        return 1
+
+    bound = httpd.server_address[1]
+    print(f"\n  open http://{args.host}:{bound}/")
     print("  Ctrl-C to stop\n")
-    ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+    httpd.serve_forever()
     return 0
 
 
