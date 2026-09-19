@@ -262,3 +262,55 @@ def next_departures(g: Gtfs, stop_id: str, at: datetime, horizon_min: int = 180,
 
     out.sort(key=lambda d: (d.dep_time, d.route_id))
     return out[:limit]
+
+
+# ------------------------------------------------------------------ shapes
+# Route GEOMETRY, loaded lazily.
+#
+# Not part of the Gtfs dataclass on purpose: shapes.txt is 7,351 points and only
+# the map view needs it, so putting it behind load_shapes() keeps load_gtfs()
+# fast for the agent path (which never draws anything).
+_SHAPES_CACHE: dict[str, list[tuple[float, float]]] | None = None
+
+
+def load_shapes(force: bool = False) -> dict[str, list[tuple[float, float]]]:
+    """shape_id -> [(lat, lon), ...] ordered by shape_pt_sequence.
+
+    This is the real route the bus drives, so a map drawn from it is our own
+    ingested geometry rather than a screenshot or a third-party basemap.
+    Verified: 67 shapes, 23-367 points each, referenced by all 3,658 trips.
+    """
+    global _SHAPES_CACHE
+    if _SHAPES_CACHE is not None and not force:
+        return _SHAPES_CACHE
+
+    path = ensure_extracted() / "shapes.txt"
+    rows: dict[str, list[tuple[int, float, float]]] = {}
+    with path.open(newline="", encoding="utf-8-sig") as fh:
+        for r in csv.DictReader(fh):
+            try:
+                rows.setdefault(str(r["shape_id"]), []).append((
+                    int(r["shape_pt_sequence"]),
+                    float(r["shape_pt_lat"]),
+                    float(r["shape_pt_lon"]),
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue                      # malformed row: skip, never raise
+    _SHAPES_CACHE = {sid: [(la, lo) for _, la, lo in sorted(pts)]
+                     for sid, pts in rows.items()}
+    return _SHAPES_CACHE
+
+
+def shape_for_trip(g: Gtfs, trip_id: str) -> list[tuple[float, float]] | None:
+    """The driving geometry for one trip, or None if unknown.
+
+    A shape is per-TRIP, not per-route, so it already encodes direction: drawing
+    the wrong one would show the bus going the wrong way round the loop.
+    """
+    trip = g.trips.get(str(trip_id))
+    if not trip:
+        return None
+    shape_id = trip.get("shape_id")
+    if not shape_id:
+        return None
+    return load_shapes().get(str(shape_id))

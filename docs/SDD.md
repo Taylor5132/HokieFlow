@@ -669,6 +669,50 @@ Design points worth defending:
 > (`/api/origins`) covers that case. Do not claim "GPS works on your phone" at the
 > expo unless the page is served over HTTPS or localhost.
 
+### 12.7 The map: our own geometry, plus a keyless navigation handoff
+
+**Decision: no third-party basemap.** Verified constraints forced it:
+
+| Option | Key | Offline | Verdict |
+|---|---|---|---|
+| Google Maps JS | API key required "for authentication and **billing**"; a free **Maps Demo Key** exists for prototyping | needs tiles | rejected: breaks the offline demo |
+| Apple MapKit JS | **Maps token** from an Apple Developer account | needs tiles | rejected: account + signed token, unnecessary |
+| Apple / Google **deep links** | **none** — Google states "You don't need a Google API key to use Maps URLs"; Apple map links need no account (`dirflg`: `w` foot, `r` transit) | n/a (opens the app) | **adopted** |
+| **Our own SVG** from GTFS shapes | **none** | **yes** | **adopted** |
+
+The map is therefore drawn from **our ingested GTFS shape geometry** (67 shapes,
+23–367 points each, median 97, referenced by all 3,658 trips). The bus leg's trip
+carries a `shape_id`, so the orange line is *the road the bus actually drives* —
+our own data, not a screenshot, and it renders with networking off.
+
+**Honesty rules baked into the image itself:**
+
+* bus legs → real GTFS shape geometry
+* walk legs → **straight dashed lines**, and the legend says *"walk (straight-line
+  estimate)"*, because our walk model is haversine × 1.30 and **not** a routed
+  path. Drawing a path would be a lie the geometry cannot support.
+* a scale bar, and no street names or imagery — it is a **schematic**, labelled as
+  one rather than passed off as a basemap.
+
+**Re-plans are legible in ONE image.** When a plan is invalidated, plan A's bus
+route is drawn in dashed grey *underneath* the chosen plan, the bbox covers both
+(so the abandoned loop is not cropped), and the legend names it *"plan A route
+(abandoned)"*. Two stacked maps would have been worse on a phone.
+
+**The handoff.** "We plan the trip; the maps app navigates it." Four keyless
+links (Apple/Google × walk/transit) built from the plan's **own** origin and
+destination, with commas percent-encoded and `api=1` present (Google ignores all
+parameters without it). Turn-by-turn is deliberately not built.
+
+**Failure isolation:** a map exception is caught and reported as `_map_error`
+while the plan is still returned. The plan is the product; the map is a view, and
+one must never take out the other.
+
+**Bug found by running it, not by linting:** `from . import mapview` raised
+`ImportError: attempted relative import with no known parent package` because the
+server is run as a *script*. Absolute (`from app import mapview`) works both as a
+script and as `app.server` under test. Pyflakes was clean throughout.
+
 ---
 
 ## 13. Non-functional requirements

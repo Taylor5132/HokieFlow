@@ -36,6 +36,12 @@ sys.path.insert(0, str(REPO))
 
 from hokieday import cache, config, tools  # noqa: E402
 
+# Absolute, not relative: this file is run as a SCRIPT (`python3 app/server.py`),
+# where `from . import x` raises "attempted relative import with no known parent
+# package". REPO is on sys.path just above, so `app` resolves either way -- as a
+# namespace package when run as a script, and as app.server when tests import it.
+from app import mapview  # noqa: E402
+
 TZ = ZoneInfo(config.CAMPUS_TZ)
 
 # Preset scenarios. Each is a deterministic call into the SAME plan_day the agent
@@ -210,6 +216,36 @@ def resolve_origin(payload: dict) -> tuple[str | None, dict]:
     return key, info
 
 
+def deep_links(result: dict) -> list[dict]:
+    """Keyless handoff URLs — "we plan it, your maps app navigates it".
+
+    Verified: Google states "You don't need a Google API key to use Maps URLs",
+    and Apple map links need no developer account either. Turn-by-turn is the
+    part we deliberately do NOT build, so we hand off to the app that does.
+    `dirflg`: d=car, w=foot, r=public transit. `travelmode`: walking|transit.
+    """
+    legs = ((result.get("itinerary") or {}).get("legs")) or []
+    origin = next((l.get("from_coords") for l in legs if l.get("from_coords")), None)
+    dest = next((l.get("to_coords") for l in reversed(legs) if l.get("to_coords")), None)
+    if not (origin and dest):
+        return []
+    # Commas must be percent-encoded in Maps URLs.
+    o = f"{origin[0]:.6f}%2C{origin[1]:.6f}"
+    d = f"{dest[0]:.6f}%2C{dest[1]:.6f}"
+    return [
+        {"label": "Walk it", "app": "Apple Maps",
+         "url": f"https://maps.apple.com/?saddr={o}&daddr={d}&dirflg=w"},
+        {"label": "Transit", "app": "Apple Maps",
+         "url": f"https://maps.apple.com/?saddr={o}&daddr={d}&dirflg=r"},
+        {"label": "Walk it", "app": "Google Maps",
+         "url": ("https://www.google.com/maps/dir/?api=1"
+                 f"&origin={o}&destination={d}&travelmode=walking")},
+        {"label": "Transit", "app": "Google Maps",
+         "url": ("https://www.google.com/maps/dir/?api=1"
+                 f"&origin={o}&destination={d}&travelmode=transit")},
+    ]
+
+
 def run_plan(call: dict, origin: dict | None = None) -> dict:
     result = tools.plan_day(call["student_ref"], call["start"], call["end"],
                             call.get("prefs") or {})
@@ -218,6 +254,20 @@ def run_plan(call: dict, origin: dict | None = None) -> dict:
                           "prefs": call.get("prefs") or {}}
     result["_origin"] = origin or {"source": "default", "label": None,
                                     "accuracy_m": None, "note": None}
+    # The map is drawn from OUR data (GTFS shapes) and inlined, so it renders with
+    # networking off. Deep links are the keyless handoff for real navigation.
+    try:
+        plan_a = next((a.get("itinerary") for a in (result.get("alternatives") or [])
+                       if a.get("type") == "previous_itinerary_a"), None)
+        result["_map_svg"] = mapview.build_map_svg(result.get("itinerary"),
+                                                   overlay=plan_a)
+    except Exception as exc:                               # noqa: BLE001
+        result["_map_svg"] = ""
+        result["_map_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        result["_links"] = deep_links(result)
+    except Exception:                                      # noqa: BLE001
+        result["_links"] = []
     return result
 
 

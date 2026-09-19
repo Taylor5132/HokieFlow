@@ -405,6 +405,13 @@ def _haversine_m(a: tuple[float, float], b: tuple[float, float]) -> float:
     return 2 * 6_371_000.0 * math.asin(math.sqrt(h))
 
 
+def _xy(p: dict | None) -> tuple[float, float] | None:
+    """(lat, lon) from a place row, or None. Used to put leg geometry on a map."""
+    if not p or "lat" not in p or "lon" not in p:
+        return None
+    return (float(p["lat"]), float(p["lon"]))
+
+
 def _walk_result(from_place: str, to_place: str) -> dict:
     a, b = _place(from_place), _place(to_place)
     if a is None or b is None:
@@ -780,6 +787,12 @@ def _build_itinerary(src: Any, *, start_dt: datetime, end_dt: datetime,
 
     eat_start = None
     waypoint = from_place
+    # Coordinates per leg, so a map can be drawn FROM THE PLAN. The leg `from`/
+    # `to` fields are display strings for humans ("stop 1125 (Tennis Courts)"),
+    # and re-parsing them to draw would be both fragile and wrong-shaped.
+    origin_p = _place(from_place) or {}
+    dest_p = _place(to_place) or {}
+    eat_p = _place(eat_place) or {}
     if eat_place:
         w1 = _walk_result(from_place, eat_place)
         if "error" in w1:
@@ -787,6 +800,7 @@ def _build_itinerary(src: Any, *, start_dt: datetime, end_dt: datetime,
         else:
             legs.append({"seq": len(legs) + 1, "type": "walk",
                          "from": from_place, "to": eat_place,
+                         "from_coords": _xy(origin_p), "to_coords": _xy(eat_p),
                          "start_time": _iso(t),
                          "minutes": w1["minutes"], "meters": w1["meters"],
                          "method": w1["method"]})
@@ -805,6 +819,7 @@ def _build_itinerary(src: Any, *, start_dt: datetime, end_dt: datetime,
                     legs.append({
                         "seq": len(legs) + 1, "type": "eat",
                         "location_num": str(eat_loc), "place": eat_place,
+                        "coords": _xy(eat_p),
                         "item": item["name"], "kcal": item.get("kcal"),
                         "allergens": item.get("allergens"),
                         "allergens_known": item.get("allergens_known"),
@@ -838,6 +853,8 @@ def _build_itinerary(src: Any, *, start_dt: datetime, end_dt: datetime,
                         legs.append({"seq": len(legs) + 1, "type": "walk",
                                      "from": waypoint,
                                      "to": f"stop {sa['stop_id']} ({sa['name']})",
+                                     "from_coords": tuple(sa["place_coords"]),
+                                     "to_coords": (sa["lat"], sa["lon"]),
                                      "start_time": _iso(t), "minutes": w2min,
                                      "method": "walk to boarding stop"})
                         t = t + timedelta(minutes=w2min)
@@ -851,6 +868,8 @@ def _build_itinerary(src: Any, *, start_dt: datetime, end_dt: datetime,
                         "trip_id": ride["trip_id"],
                         "from_stop": ride["from_stop"],
                         "to_stop": ride["to_stop"],
+                        "from_coords": (sa["lat"], sa["lon"]),
+                        "to_coords": (sd["lat"], sd["lon"]),
                         "dep_time": _iso(ride["dep_time"]),
                         "arrive_time": _iso(b_end),
                         "wait_min": wait, "ride_min": ride["ride_min"],
@@ -867,6 +886,8 @@ def _build_itinerary(src: Any, *, start_dt: datetime, end_dt: datetime,
                     legs.append({"seq": len(legs) + 1, "type": "walk",
                                  "from": f"stop {sd['stop_id']} ({sd['name']})",
                                  "to": to_place, "start_time": _iso(t),
+                                 "from_coords": (sd["lat"], sd["lon"]),
+                                 "to_coords": _xy(dest_p),
                                  "minutes": w3min,
                                  "method": "walk from alighting stop"})
                     t = t + timedelta(minutes=w3min)
@@ -880,6 +901,9 @@ def _build_itinerary(src: Any, *, start_dt: datetime, end_dt: datetime,
             else:
                 legs.append({"seq": len(legs) + 1, "type": "walk",
                              "from": waypoint, "to": to_place,
+                             "from_coords": _xy(eat_p if waypoint == eat_place
+                                                else origin_p),
+                             "to_coords": _xy(dest_p),
                              "start_time": _iso(t), "minutes": w4["minutes"],
                              "meters": w4["meters"], "method": w4["method"]})
                 t = t + timedelta(minutes=w4["minutes"])

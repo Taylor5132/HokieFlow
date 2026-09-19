@@ -125,6 +125,16 @@ input[type=text]:focus{outline:none;border-color:var(--accent)}
         border:1px solid var(--line);background:var(--card2);color:var(--ink);padding:0 10px}
 .origin-note{font-size:12.5px;color:var(--warn);margin-top:6px}
 
+/* map: an inline SVG drawn from OUR GTFS geometry, so it works offline */
+.mapwrap{background:#12151b;border:1px solid var(--line);border-radius:16px;
+         overflow:hidden;margin:0 0 12px}
+.mapwrap svg{display:block;width:100%;height:auto}
+.links{display:flex;flex-wrap:wrap;gap:8px}
+.maplink{display:inline-block;min-height:40px;line-height:40px;padding:0 14px;
+         border-radius:999px;border:1px solid var(--line);background:var(--card2);
+         color:var(--ink);text-decoration:none;font-size:14px}
+.maplink:active{transform:scale(.98)}
+
 details{margin-top:4px}
 summary{color:var(--dim);font-size:13px;cursor:pointer;list-style:none;padding:6px 0}
 summary::-webkit-details-marker{display:none}
@@ -272,6 +282,12 @@ function render(r){
 
   const planA = (r.alternatives||[]).find(a => a.type === "previous_itinerary_a");
 
+  if(r._map_svg){
+    h += `<div class="mapwrap">${r._map_svg}</div>`;
+  } else if(r._map_error){
+    h += `<div class="card err">map unavailable: ${esc(r._map_error)}</div>`;
+  }
+
   if(trg){
     h += `<div class="banner">
       <div class="head"><span class="dot"></span>RE-PLANNED — ${esc(trg.cause)}</div>
@@ -291,6 +307,15 @@ function render(r){
     h += `<div class="card"><div class="k">alternative</div>
       <div>Walk the whole way: <b>${esc(walk.minutes)} min</b>
         <span class="muted">(${esc(walk.meters)} m straight-line)</span></div></div>`;
+  }
+
+  if((r._links||[]).length){
+    h += `<div class="card"><div class="k">navigate it</div>
+      <div class="links">` +
+      r._links.map(l => `<a class="maplink" href="${esc(l.url)}" target="_blank"
+         rel="noopener">${esc(l.label)} · ${esc(l.app)}</a>`).join("") +
+      `</div><div class="muted" style="margin-top:10px">Opens your maps app for
+        turn-by-turn. We plan the trip; the maps app navigates it. No API key needed.</div></div>`;
   }
   $("#out").innerHTML = h;
 }
@@ -327,6 +352,9 @@ async function boot(){
         bus "full" at ${esc(s.assumptions.bus_full_pct)}%</div>
        <div style="margin-top:8px">meal choice: ${esc(s.assumptions.meal_ranking)}
         — a demo convenience, not dietary advice.</div>
+       <div style="margin-top:8px">The map is drawn from the GTFS shape geometry we ingested — no basemap, no
+        tiles, no API key, and it renders with networking off. Dashed lines are straight-line walk
+        estimates, because that is what our walk model actually computes.</div>
        <div style="margin-top:8px">The text box uses a small rule-based parser offline; with a
         Databricks workspace the text→parameters step is the agent's job, calling these same
         tools as governed Unity Catalog functions.</div>`;
