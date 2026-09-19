@@ -2,7 +2,7 @@
 
 Unified campus-life agent for Virginia Tech. Built for VTHacks 14, Deloitte × Databricks challenge.
 
-**Read `../SDD.md` first — it is the source of truth.** This repo is the implementation of its Tier 1.
+**Read `docs/SDD.md` first — it is the source of truth.** This repo is the implementation of its Tier 1.
 
 ## Shape of the repo
 
