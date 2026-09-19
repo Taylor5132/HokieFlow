@@ -1,0 +1,25 @@
+route_id,agency_id,route_short_name,route_long_name,route_desc,route_type,route_color,route_text_color
+PHB,30091,PHB,Patrick Henry B,,3,00782A,000000
+SMA,30091,SMA,South Main Airport,,3,84B817,000000
+HWB,30091,HWB,Hethwood B,,3,0098D4,000000
+PHD,30091,PHD,Patrick Henry Drive,,3,FF69B4,000000
+HDG,30091,HDG,Harding Avenue,,3,874901,000000
+CRC,30091,CRC,Corporate Research Center,,3,00782A,000000
+TCP,30091,TCP,Toms Creek Progress,,3,EE7C0E,000000
+PRG,30091,PRG,Progress Street,,3,7156A5,000000
+TCR,30091,TCR,Toms Creek Road,,3,EE7C0E,000000
+TTH,30091,TTH,Two Town Trolley Hospital ,,3,87012D,FFFFFF
+TTS,30091,TTS,Two Town Trolley Spradlin Farms,Two Town Trolley Spradlin Farms,3,EE7C0E,000000
+BMR,30091,BMR,Beamer Way,,3,FF69B4,000000
+UCB,30091,UCB,University City Blvd,,3,84B817,000000
+HXP,30091,HXP,Hokie Express,,3,00A4A7,000000
+SME,30091,SME,South Main Ellett,,3,0098D4,000000
+NMG,30091,NMG,North Main Givens,,3,E32017,000000
+CRB,30091,CRB,Carpenter Boulevard,,3,E32017,000000
+HWA,30091,HWA,Hethwood A,,3,1A4882,FFFFFF
+SMS,30091,SMS,South Main Southpark,,3,0098D4,000000
+CAS,30091,CAS,Campus Shuttle,,3,302F2F,FFFFFF
+HWC,30091,HWC,Hethwood Combined,,3,7156A5,000000
+HXS,30091,HXS,Hokie Express Stanger,,3,00A4A7,000000
+GRN,30091,GRN,Explorer Green,,3,84B817,000000
+BLU,30091,BLU,Explorer Blue,,3,0000FF,FFFFFF

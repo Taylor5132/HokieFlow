@@ -1,0 +1,1 @@
+"""Offline test suite. Requires DEMO_MODE=cache; must never touch the network."""
