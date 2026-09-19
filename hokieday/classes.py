@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
@@ -109,6 +110,17 @@ SCHEMA_SNAPSHOT = "hokieday.classes.snapshot/1"
 SCHEMA_SEARCH = "hokieday.classes.search/1"
 SCHEMA_NEXT_CLASS = "hokieday.classes.next_class/1"
 SCHEMA_SCHEDULE = "hokieday.classes.schedule/1"
+
+# ICS safety bounds: a hostile or accidentally huge calendar must never exhaust
+# memory or spin forever. Exceeding a bound is an explicit parse error/flag.
+MAX_ICS_BYTES = 512 * 1024        # input size
+MAX_ICS_LINES = 20_000            # unfolded lines
+MAX_ICS_EVENTS = 500              # VEVENTs accepted
+MAX_ICS_OCCURRENCES = 2_000       # occurrences per event expansion
+MAX_ICS_WINDOW_DAYS = 730         # default recurrence cap (~2 years)
+
+# A planning buffer larger than this is almost certainly a bug, not a plan.
+MAX_BUFFER_MIN = 240.0
 
 TERM_FALL_2026 = "202609"
 SUPPORTED_TERMS: dict[str, str] = {
@@ -844,6 +856,7 @@ class SelectionResult:
     missing: tuple[str, ...]
     invalid: tuple[str, ...]
     duplicates: tuple[str, ...] = ()
+    ambiguous: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -851,6 +864,7 @@ class SelectionResult:
             "missing": list(self.missing),
             "invalid": list(self.invalid),
             "duplicates": list(self.duplicates),
+            "ambiguous": list(self.ambiguous),
         }
 
 
@@ -859,29 +873,37 @@ def select_crns(sections: Iterable[ClassSection], crns: str | Iterable[str],
     """Resolve pasted CRNs against parsed sections -> found/missing/invalid.
 
     CRN identity is (term, crn). When a term is given, a CRN from another term
-    is reported missing rather than silently matched.
+    is reported missing rather than silently matched. When the SAME CRN exists
+    under more than one term and no ``term`` is supplied, it is reported as
+    ``ambiguous`` and NOT selected -- the caller must disambiguate by term.
     """
     valid, invalid = parse_crns(crns)
     by_crn: dict[str, ClassSection] = {}
+    terms_by_crn: dict[str, set[str]] = {}
     for s in sections:
         if term and str(s.term) != str(term):
             continue
+        terms_by_crn.setdefault(s.crn, set()).add(str(s.term))
         by_crn.setdefault(s.crn, s)
     found: list[ClassSection] = []
     missing: list[str] = []
     dupes: list[str] = []
+    ambiguous: list[str] = []
     seen: set[str] = set()
     for c in valid:
         if c in seen:
             dupes.append(c)
             continue
         seen.add(c)
+        if term is None and len(terms_by_crn.get(c, set())) > 1:
+            ambiguous.append(c)
+            continue
         if c in by_crn:
             found.append(by_crn[c])
         else:
             missing.append(c)
     return SelectionResult(tuple(found), tuple(missing), tuple(invalid),
-                           tuple(dupes))
+                           tuple(dupes), tuple(ambiguous))
 
 
 # ---------------------------------------------------------------------------
@@ -913,17 +935,28 @@ def campus_tz() -> ZoneInfo:
 def expand_section(
     section: ClassSection,
     *,
-    start: date,
-    end: date,
+    start: date | None = None,
+    end: date | None = None,
     tz: ZoneInfo | None = None,
     skip_holidays: bool = True,
 ) -> list[ClassOccurrence]:
-    """Expand a section's weekly meetings across [start, end] inclusive.
+    """Expand a section's weekly meetings across its term window.
 
-    TBA meetings produce NO occurrences (they have no day/time to expand) and
-    are reported by ``ClassSection.has_tba`` / flags instead. University
-    holidays for the section's term are skipped when ``skip_holidays``.
+    The range is CLAMPED to the section term's VERIFIED ``TERM_WINDOWS`` entry:
+    a caller can request a sub-window, but never beyond the term, and an
+    unknown/unverified term yields NO occurrences (never a synthesized
+    +120-day window). TBA meetings produce no occurrences and are surfaced by
+    ``ClassSection.has_tba``. University holidays for the term are skipped.
+
+    PARTIAL-TERM LIMITATION: a meeting pattern is expanded for the WHOLE term
+    window. Banner does not expose part-of-term session start/end dates in the
+    results table, so first-half/second-half courses are expanded over the full
+    term (documented as a known limitation).
     """
+    win = _section_window(section, start, end)
+    if win is None:
+        return []
+    lo, hi = win
     tz = tz or campus_tz()
     holidays = _holiday_set(section.term) if skip_holidays else frozenset()
     out: list[ClassOccurrence] = []
@@ -934,7 +967,7 @@ def expand_section(
             wd = DAY_TO_WEEKDAY.get(day)
             if wd is None:
                 continue
-            for d in _weekday_dates(start, end, wd):
+            for d in _weekday_dates(lo, hi, wd):
                 if d in holidays:
                     continue
                 out.append(ClassOccurrence(
@@ -947,11 +980,41 @@ def expand_section(
     return out
 
 
+def term_expandability(term: str) -> tuple[bool, str | None]:
+    """Whether recurrence may be expanded for a Banner term.
+
+    Only VERIFIED windows expand. An unknown or unverified term is a typed
+    unavailable -> no occurrences, never an invented default window.
+    """
+    tw = term_window(term)
+    if tw is None:
+        return False, f"term {str(term)!r} has no known term window"
+    if not tw.verified:
+        return False, f"term {str(term)!r} window is unverified"
+    return True, None
+
+
+def _section_window(
+    section: ClassSection,
+    start: date | None,
+    end: date | None,
+) -> tuple[date, date] | None:
+    """Clamp a requested range to the section term's verified window."""
+    tw = term_window(section.term)
+    if tw is None or not tw.verified:
+        return None
+    lo = tw.classes_begin if start is None else max(start, tw.classes_begin)
+    hi = tw.classes_end if end is None else min(end, tw.classes_end)
+    if lo > hi:
+        return None
+    return lo, hi
+
+
 def expand_sections(
     sections: Iterable[ClassSection],
     *,
-    start: date,
-    end: date,
+    start: date | None = None,
+    end: date | None = None,
     tz: ZoneInfo | None = None,
     skip_holidays: bool = True,
 ) -> list[ClassOccurrence]:
@@ -991,12 +1054,46 @@ def find_conflicts(
 def schedule_conflicts(
     sections: Iterable[ClassSection],
     *,
-    start: date,
-    end: date,
+    start: date | None = None,
+    end: date | None = None,
     tz: ZoneInfo | None = None,
+    ics_events: Iterable[IcsEvent] | None = None,
 ) -> list[Conflict]:
-    occ = expand_sections(sections, start=start, end=end, tz=tz)
+    occ = combined_occurrences(sections, ics_events or (), start=start, end=end,
+                               tz=tz)
     return find_conflicts(occ)
+
+
+def combined_occurrences(
+    sections: Iterable[ClassSection],
+    ics_events: Iterable[IcsEvent],
+    *,
+    start: date | None = None,
+    end: date | None = None,
+    tz: ZoneInfo | None = None,
+) -> list[ClassOccurrence]:
+    """All dated occurrences: Banner sections expanded by term window, plus
+    ICS events expanded by their own dated recurrence. ICS events are NEVER
+    converted into Banner sections, so they cannot leak into weekly expansion."""
+    out = expand_sections(sections, start=start, end=end, tz=tz)
+    out.extend(expand_ics_events(ics_events, start=start, end=end, tz=tz))
+    out.sort(key=lambda o: (o.start, o.crn))
+    return out
+
+
+def _validate_buffer(buffer_min: float) -> float:
+    """Finite, non-negative, bounded planning buffer. Raise on garbage."""
+    try:
+        b = float(buffer_min)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"buffer_min must be a number, got {buffer_min!r}") from exc
+    if not math.isfinite(b):
+        raise ValueError("buffer_min must be finite")
+    if b < 0:
+        raise ValueError("buffer_min must be >= 0")
+    if b > MAX_BUFFER_MIN:
+        raise ValueError(f"buffer_min {b:g} exceeds MAX_BUFFER_MIN {MAX_BUFFER_MIN:g}")
+    return b
 
 
 # ---------------------------------------------------------------------------
@@ -1011,28 +1108,21 @@ def next_class(
     buffer_min: float = 10.0,
     skip_online: bool = False,
     tz: ZoneInfo | None = None,
+    ics_events: Iterable[IcsEvent] | None = None,
 ) -> NextClass | None:
     """The next timed class meeting at/after ``at`` -> deterministic deadline.
 
-    ``deadline`` (leave_by) = class start - ``buffer_min``. This is the value
-    HokieFlow uses as the planning horizon; it is computed, not narrated.
-    TBA meetings are ignored here (they have no time) -- surface them with
-    ``ClassSection.has_tba`` so the UI can show the TBA state.
+    ``deadline`` (leave_by) = class start - ``buffer_min``. Banner sections are
+    clamped to their verified term window; ICS events are expanded from their
+    own dated recurrence. TBA meetings are ignored here (no time to schedule);
+    surface them with ``ClassSection.has_tba``.
     """
+    b = _validate_buffer(buffer_min)
     tz = tz or campus_tz()
     if at.tzinfo is None:
         at = at.replace(tzinfo=tz)
-    section_list = list(sections)
-    if start is None or end is None:
-        if start is None:
-            starts = [term_window(s.term).classes_begin for s in section_list
-                      if term_window(s.term)]
-            start = min(starts) if starts else at.date()
-        if end is None:
-            ends = [term_window(s.term).classes_end for s in section_list
-                    if term_window(s.term)]
-            end = max(ends) if ends else at.date() + timedelta(days=120)
-    occ = expand_sections(section_list, start=start, end=end, tz=tz)
+    occ = combined_occurrences(list(sections), list(ics_events or ()),
+                               start=start, end=end, tz=tz)
     for o in occ:
         if o.start < at:
             continue
@@ -1041,8 +1131,8 @@ def next_class(
         return NextClass(
             occurrence=o,
             minutes_until=(o.start - at).total_seconds() / 60,
-            leave_by=o.start - timedelta(minutes=buffer_min),
-            buffer_min=buffer_min,
+            leave_by=o.start - timedelta(minutes=b),
+            buffer_min=b,
         )
     return None
 
@@ -1056,21 +1146,36 @@ def next_class_json(
     buffer_min: float = 10.0,
     skip_online: bool = False,
     tz: ZoneInfo | None = None,
+    ics_events: Iterable[IcsEvent] | None = None,
 ) -> dict:
+    b = _validate_buffer(buffer_min)
     tz = tz or campus_tz()
     if at.tzinfo is None:
         at = at.replace(tzinfo=tz)
-    nc = next_class(sections, at, start=start, end=end, buffer_min=buffer_min,
-                    skip_online=skip_online, tz=tz)
+    section_list = list(sections)
+    ics_list = list(ics_events or ())
+    nc = next_class(section_list, at, start=start, end=end, buffer_min=b,
+                    skip_online=skip_online, tz=tz, ics_events=ics_list)
     if nc is None:
+        unverified = _dedupe(
+            r for s in section_list
+            for ok, r in [term_expandability(s.term)] if not ok and r)
+        if section_list and not ics_list and unverified:
+            status = "unavailable"
+            reason = ("; ".join(unverified) + ". Only verified TERM_WINDOWS "
+                      "expand; no fallback window is invented.")
+        else:
+            status = "none"
+            reason = ("no timed class meeting found in the requested window; "
+                      "check TBA meetings with section.flags().has_tba")
         return {
             "schema": SCHEMA_NEXT_CLASS,
-            "status": "none",
+            "status": status,
             "at": at.isoformat(timespec="seconds"),
             "deadline": None,
-            "buffer_min": buffer_min,
-            "reason": "no timed class meeting found in the requested window; "
-                      "check TBA meetings with section.flags().has_tba",
+            "buffer_min": b,
+            "reason": reason,
+            "unverified_terms": unverified,
         }
     payload = {"schema": SCHEMA_NEXT_CLASS, "at": at.isoformat(timespec="seconds")}
     payload.update(nc.to_dict())
@@ -1087,6 +1192,7 @@ def _schedule_record(section: ClassSection, snapshot_id: str = "") -> dict:
     plus a display snapshot. Grades/roster/PID are never present by design.
     """
     return {
+        "kind": "crn",
         "term": section.term,
         "crn": section.crn,
         "subject": section.subject,
@@ -1099,63 +1205,148 @@ def _schedule_record(section: ClassSection, snapshot_id: str = "") -> dict:
     }
 
 
+def _ics_schedule_record(event: IcsEvent, snapshot_id: str = "") -> dict:
+    """A stored ICS entry keeps DATED/RECURRENCE semantics (uid identity).
+
+    It is intentionally NOT a ClassSection: an ICS event has no (term, CRN) and
+    must never be treated as a weekly Banner meeting.
+    """
+    rec = event.to_dict()
+    rec.update({"kind": "ics", "term": "", "snapshot_id": snapshot_id})
+    return rec
+
+
 def add_to_schedule(
     schedule: Iterable[dict],
-    sections: Iterable[ClassSection],
-    crns: str | Iterable[str],
+    sections: Iterable[ClassSection] | None = None,
+    crns: str | Iterable[str] | None = None,
     *,
     term: str | None = None,
     snapshot_id: str = "",
+    ics_events: Iterable[IcsEvent] | None = None,
 ) -> dict:
-    """Add selected CRNs to a local schedule list.
+    """Add selected Banner CRNs and/or ICS events to a local schedule list.
 
-    Returns a JSON-ready dict; the caller persists it (no DB here). Duplicate
-    (term, crn) entries are reported, not added twice.
+    Two identity spaces, kept separate on purpose:
+      * Banner records use ``kind="crn"`` and identity ``(term, crn)``.
+      * ICS records use ``kind="ics"`` and identity ``uid``.
+    Returns a JSON-ready dict; the caller persists it (no DB here).
     """
     current = list(schedule or [])
-    have = {(str(r.get("term", "")), str(r.get("crn", ""))) for r in current}
-    sel = select_crns(sections, crns, term=term)
+    have_crn = {(str(r.get("term", "")), str(r.get("crn", "")))
+                for r in current if r.get("kind", "crn") == "crn"}
+    have_uid = {str(r.get("uid", "")) for r in current if r.get("kind") == "ics"}
     added: list[dict] = []
-    already: list[str] = list(sel.duplicates)
-    for s in sel.found:
-        key = (s.term, s.crn)
-        if key in have:
-            already.append(s.crn)
+    already: list[str] = []
+    missing: list[str] = []
+    invalid: list[str] = []
+    ambiguous: list[str] = []
+
+    if crns is not None:
+        sel = select_crns(sections or (), crns, term=term)
+        already.extend(sel.duplicates)
+        missing.extend(sel.missing)
+        invalid.extend(sel.invalid)
+        ambiguous.extend(sel.ambiguous)
+        for s in sel.found:
+            key = (s.term, s.crn)
+            if key in have_crn:
+                already.append(s.crn)
+                continue
+            have_crn.add(key)
+            rec = _schedule_record(s, snapshot_id)
+            current.append(rec)
+            added.append(rec)
+
+    for event in (ics_events or ()):
+        uid = str(event.uid)
+        if uid in have_uid:
+            already.append(uid)
             continue
-        have.add(key)
-        rec = _schedule_record(s, snapshot_id)
+        have_uid.add(uid)
+        rec = _ics_schedule_record(event, snapshot_id)
         current.append(rec)
         added.append(rec)
+
     return {
         "schema": SCHEMA_SCHEDULE,
         "schedule": current,
         "added": added,
-        "missing": list(sel.missing),
-        "invalid": list(sel.invalid),
+        "missing": list(missing),
+        "invalid": list(invalid),
+        "ambiguous": _dedupe(ambiguous),
         "already_in_schedule": _dedupe(already),
     }
 
 
 def remove_from_schedule(
     schedule: Iterable[dict],
-    crns: str | Iterable[str],
+    crns: str | Iterable[str] | None = None,
+    *,
+    term: str | None = None,
+    uids: str | Iterable[str] | None = None,
 ) -> dict:
-    valid, invalid = parse_crns(crns)
-    want = set(valid)
+    """Remove Banner CRNs and/or ICS UIDs, preserving composite identity.
+
+    Banner CRNs are only unique WITHIN a term, so a CRN that appears under more
+    than one term in the schedule is AMBIGUOUS unless ``term`` is supplied; it
+    is reported in ``ambiguous`` and left in place rather than silently removed
+    from every term.
+    """
+    valid, invalid = parse_crns(crns) if crns is not None else ([], [])
+    want_crns = set(valid)
+    want_term = str(term) if term is not None else None
+    want_uids = set()
+    if uids is not None:
+        raw = ([uids] if isinstance(uids, str) else list(uids))
+        want_uids = {str(u).strip() for u in raw if str(u).strip()}
+
+    # (crn -> set of terms present) for Banner records.
+    terms_by_crn: dict[str, set[str]] = {}
+    for rec in schedule or []:
+        if rec.get("kind", "crn") != "crn":
+            continue
+        terms_by_crn.setdefault(str(rec.get("crn", "")), set()).add(
+            str(rec.get("term", "")))
+
     kept: list[dict] = []
     removed: list[str] = []
+    ambiguous: list[str] = []
     for rec in schedule or []:
+        kind = rec.get("kind", "crn")
+        if kind == "ics":
+            if str(rec.get("uid", "")) in want_uids:
+                removed.append(str(rec.get("uid", "")))
+            else:
+                kept.append(rec)
+            continue
         crn = str(rec.get("crn", ""))
-        if crn in want:
-            removed.append(crn)
-        else:
+        rec_term = str(rec.get("term", ""))
+        if crn not in want_crns:
             kept.append(rec)
-    missing = [c for c in valid if c not in removed]
+            continue
+        if want_term is not None:
+            if rec_term == want_term:
+                removed.append(crn)
+            else:
+                kept.append(rec)
+            continue
+        if len(terms_by_crn.get(crn, set())) > 1:
+            ambiguous.append(crn)          # do NOT remove an ambiguous CRN
+            kept.append(rec)
+            continue
+        removed.append(crn)
+
+    not_in = [c for c in valid if c not in removed]
+    for u in sorted(want_uids):
+        if u not in removed:
+            not_in.append(u)
     return {
         "schema": SCHEMA_SCHEDULE,
         "schedule": kept,
         "removed": _dedupe(removed),
-        "not_in_schedule": missing,
+        "not_in_schedule": not_in,
+        "ambiguous": _dedupe(ambiguous),
         "invalid": invalid,
     }
 
@@ -1164,14 +1355,82 @@ def resolve_schedule(
     schedule: Iterable[dict],
     sections: Iterable[ClassSection],
 ) -> list[ClassSection]:
-    """Join a stored schedule back to freshly parsed sections by (term, crn)."""
+    """Join stored Banner records back to freshly parsed sections by (term, crn).
+
+    ICS records are ignored here -- use ``schedule_occurrences`` so they are
+    consumed as expanded dated occurrences, never as Banner sections.
+    """
     by_key = {(s.term, s.crn): s for s in sections}
     out: list[ClassSection] = []
     for rec in schedule or []:
+        if rec.get("kind", "crn") != "crn":
+            continue
         s = by_key.get((str(rec.get("term", "")), str(rec.get("crn", ""))))
         if s is not None:
             out.append(s)
     return out
+
+
+def resolve_ics_schedule(schedule: Iterable[dict]) -> list[IcsEvent]:
+    """Rebuild stored ICS entries into IcsEvents (dated recurrence preserved).
+
+    Reconstruction goes through ``parse_ics`` on a one-event calendar so the
+    stored RRULE/DTSTART are re-validated instead of trusted blindly.
+    """
+    out: list[IcsEvent] = []
+    for rec in schedule or []:
+        if rec.get("kind") != "ics":
+            continue
+        text = _ics_record_to_text(rec)
+        parsed = parse_ics(text)
+        if parsed.events:
+            out.append(parsed.events[0])
+    return out
+
+
+def _ics_record_to_text(rec: dict) -> str:
+    """Serialize one stored ICS record back to a minimal VEVENT calendar.
+
+    Uses the RAW DTSTART/DTEND values (not the ISO projection) plus the TZID so
+    re-parsing re-validates the same recurrence rather than trusting the store.
+    """
+    tzid = rec.get("tzid")
+
+    def dt_line(name: str, raw: str) -> str:
+        raw = str(raw or "")
+        if (tzid and len(raw) == 15 and "T" in raw and not raw.endswith("Z")):
+            return f"{name};TZID={tzid}:{raw}"
+        return f"{name}:{raw}"
+
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT",
+             f"UID:{rec.get('uid', '')}",
+             dt_line("DTSTART", rec.get("raw_start", "")),
+             dt_line("DTEND", rec.get("raw_end", ""))]
+    if rec.get("summary"):
+        lines.append(f"SUMMARY:{rec['summary']}")
+    if rec.get("location"):
+        lines.append(f"LOCATION:{rec['location']}")
+    rrule = rec.get("rrule") or {}
+    if rrule and rec.get("recurring"):
+        parts = [f"{k}={v}" for k, v in rrule.items() if not k.startswith("_")]
+        if parts:
+            lines.append("RRULE:" + ";".join(parts))
+    lines += ["END:VEVENT", "END:VCALENDAR"]
+    return "\n".join(lines)
+
+
+def schedule_occurrences(
+    schedule: Iterable[dict],
+    sections: Iterable[ClassSection] | None = None,
+    *,
+    start: date | None = None,
+    end: date | None = None,
+    tz: ZoneInfo | None = None,
+) -> list[ClassOccurrence]:
+    """Dated occurrences for a stored schedule: Banner sections + ICS events."""
+    resolved = resolve_schedule(schedule, sections or ())
+    ics = resolve_ics_schedule(schedule)
+    return combined_occurrences(resolved, ics, start=start, end=end, tz=tz)
 
 
 # ---------------------------------------------------------------------------
@@ -1297,77 +1556,14 @@ def crosswalk_contract(crosswalk: dict[str, Building] | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Numeric exam-code schedule (public HZSKEXAM page) -- optional hook
+# Final-exam page: RAW CAPTURE ONLY
 # ---------------------------------------------------------------------------
-@dataclass(frozen=True)
-class ExamSlot:
-    code: str
-    date: date | None
-    begin: str | None
-    end: str | None
-    label: str = ""
-
-    def to_dict(self) -> dict:
-        return {
-            "code": self.code,
-            "date": self.date.isoformat() if self.date else None,
-            "begin": self.begin,
-            "end": self.end,
-            "label": self.label,
-        }
-
-
-def parse_exam_schedule_html(html: str, *, term: str = TERM_FALL_2026) -> list[ExamSlot]:
-    """Best-effort parse of the public final-exam grid.
-
-    The page is a matrix of exam codes under date/time headers. This parser
-    reads the header cells to learn each column's date + window and returns
-    one ExamSlot per (code, occurrence). It is deliberately conservative: a
-    code with no resolvable header context is skipped rather than guessed.
-    """
-    rows = extract_table_rows(html, lambda a: "plaintable" in a.get("class", "")
-                              or "dataentrytable" in a.get("class", ""))
-    slots: list[ExamSlot] = []
-    seen: set[tuple[str, str]] = set()
-    current_date: date | None = None
-    current_begin: str | None = None
-    current_end: str | None = None
-    for row in rows:
-        # A date header row contains a long date like "Friday , Dec 11".
-        for cell in row:
-            m = re.search(r"([A-Z][a-z]+)\s*,?\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|"
-                          r"Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})", cell)
-            if m:
-                try:
-                    mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul",
-                           "Aug", "Sep", "Oct", "Nov", "Dec"].index(m.group(2)) + 1
-                    current_date = date(2026, mon, int(m.group(3)))
-                except (ValueError, IndexError):
-                    current_date = None
-            tm = re.search(r"(\d{1,2}:\d{2}(?:AM|PM)?)\s*(?:to|-)\s*"
-                           r"(\d{1,2}:\d{2}(?:AM|PM)?)", cell, re.I)
-            if tm:
-                current_begin = parse_clock(tm.group(1).upper())
-                current_end = parse_clock(tm.group(2).upper())
-        for cell in row:
-            for code in re.findall(r"\b(\d{2}[A-Z])\b", cell):
-                key = (code, f"{current_date}-{current_begin}")
-                if key in seen:
-                    continue
-                seen.add(key)
-                slots.append(ExamSlot(code=code, date=current_date,
-                                      begin=current_begin, end=current_end,
-                                      label="final exam grid"))
-    return slots
-
-
-def exam_slot_for(section: ClassSection, slots: Iterable[ExamSlot]) -> ExamSlot | None:
-    if not section.exam_code:
-        return None
-    for s in slots:
-        if s.code.upper() == section.exam_code.upper():
-            return s
-    return None
+# The public HZSKEXAM page is a date x time matrix with year-less column
+# headers. The previous "best effort" parser guessed the year and dropped
+# codes with no header context, which risked returning WRONG exam dates. It has
+# been removed rather than shipped: scripts/fetch_classes.py --exams still
+# captures the raw HTML for a future, verified parser, but no exam data is
+# exported from this module today.
 
 
 # ---------------------------------------------------------------------------
@@ -1394,22 +1590,13 @@ class IcsEvent:
         return (self.dtend - self.dtstart).total_seconds() / 60
 
     def to_meeting(self) -> Meeting:
+        """Display-only projection. NOT a recurrence source: use
+        ``expand_ics_event`` for dated occurrences."""
         b = None if self.all_day else self.dtstart.strftime("%H:%M")
         e = None if self.all_day else self.dtend.strftime("%H:%M")
         meeting = parse_location(self.location)
         return replace(meeting, days=self.days if not self.all_day else (),
                        begin=b, end=e)
-
-    def to_section(self, *, term: str = "") -> ClassSection:
-        meeting = self.to_meeting()
-        warn = list(self.warnings)
-        warn.append("imported from ICS: identity is UID, not a VT CRN")
-        return ClassSection(
-            term=term, crn=self.uid, subject="", course_number="",
-            title=self.summary or self.uid, modality="(ICS import)",
-            meetings=(meeting,), warnings=tuple(_dedupe(warn)),
-            source="ics",
-        )
 
     def to_dict(self) -> dict:
         return {
@@ -1418,6 +1605,8 @@ class IcsEvent:
             "location": self.location,
             "dtstart": self.dtstart.isoformat(timespec="seconds"),
             "dtend": self.dtend.isoformat(timespec="seconds"),
+            "raw_start": self.raw_start,
+            "raw_end": self.raw_end,
             "all_day": self.all_day,
             "tzid": self.tzid,
             "rrule": dict(self.rrule),
@@ -1490,45 +1679,105 @@ def _parse_ics_dt(value: str, params: dict[str, str], default_tz: ZoneInfo,
     if tzid:
         try:
             return base.replace(tzinfo=ZoneInfo(tzid)), False, tzid
-        except ZoneInfoNotFoundError:
-            warnings.append(f"unknown TZID {tzid!r}; assuming campus time")
-            return base.replace(tzinfo=default_tz), False, tzid
+        except ZoneInfoNotFoundError as exc:
+            # Unknown TZID is REJECTED, never silently shifted to campus time.
+            raise ValueError(f"unknown TZID {tzid!r}") from exc
     warnings.append("floating time with no TZID; assuming campus time")
     return base.replace(tzinfo=default_tz), False, tzid
 
 
-_ALLOWED_RRULE = {"FREQ", "INTERVAL", "COUNT", "UNTIL", "BYDAY", "WKST"}
+_RRULE_SUPPORTED = {"FREQ", "INTERVAL", "COUNT", "UNTIL", "BYDAY"}
 
 
 def _parse_rrule(value: str, dtstart_weekday: int,
                  warnings: list[str]) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Parse a WEEKLY RRULE, flagging anything unsupported instead of guessing.
+
+    A flagged rule carries ``_UNSUPPORTED`` and the event is skipped by the
+    caller, so a bad/unsupported rule can never produce invented recurrence.
+    """
     rule: dict[str, str] = {}
     for part in value.split(";"):
         if not part:
             continue
         k, _, v = part.partition("=")
         k = k.strip().upper()
-        if k not in _ALLOWED_RRULE:
+        v = v.strip().upper()
+        if k not in _RRULE_SUPPORTED:
             warnings.append(f"unsupported RRULE part {k!r}; event flagged")
-            rule.setdefault("_UNSUPPORTED", "")
+            rule["_UNSUPPORTED"] = k
             continue
-        rule[k] = v.strip().upper()
+        rule[k] = v
+
     freq = rule.get("FREQ", "")
     if freq != "WEEKLY":
         warnings.append(f"unsupported RRULE FREQ={freq or '?'} (only WEEKLY)")
-        rule["_UNSUPPORTED"] = ""
+        rule["_UNSUPPORTED"] = "FREQ"
         return rule, ()
+
+    if "INTERVAL" in rule:
+        raw = rule["INTERVAL"]
+        if not raw.isdigit() or int(raw) < 1:
+            warnings.append(f"invalid RRULE INTERVAL={raw!r} (positive integer)")
+            rule["_UNSUPPORTED"] = "INTERVAL"
+            return rule, ()
+
+    if "COUNT" in rule:
+        raw = rule["COUNT"]
+        if not raw.isdigit() or int(raw) < 1 or int(raw) > MAX_ICS_OCCURRENCES:
+            warnings.append(
+                f"invalid RRULE COUNT={raw!r} (1..{MAX_ICS_OCCURRENCES})")
+            rule["_UNSUPPORTED"] = "COUNT"
+            return rule, ()
+
+    if "UNTIL" in rule:
+        try:
+            _parse_ics_dt(rule["UNTIL"], {}, campus_tz(), [])
+        except ValueError:
+            warnings.append(f"invalid RRULE UNTIL={rule['UNTIL']!r}")
+            rule["_UNSUPPORTED"] = "UNTIL"
+            return rule, ()
+
     byday = rule.get("BYDAY", "")
     days: list[str] = []
     if byday:
         for tok in byday.split(","):
-            tok = tok.strip().upper().lstrip("+-0123456789")
-            b = ICS_DAY_TO_BANNER.get(tok)
-            if b and b not in days:
+            tok = tok.strip().upper()
+            if not tok or not tok.isalpha() or tok not in ICS_DAY_TO_BANNER:
+                warnings.append(
+                    f"unsupported RRULE BYDAY token {tok!r} (plain MO..SU)")
+                rule["_UNSUPPORTED"] = "BYDAY"
+                return rule, ()
+            b = ICS_DAY_TO_BANNER[tok]
+            if b not in days:
                 days.append(b)
     if not days:
         days = [WEEKDAY_TO_DAY[dtstart_weekday]]
     return rule, tuple(sorted(days, key=lambda d: DAY_TO_WEEKDAY[d]))
+
+
+def _decode_ics_text(value: str) -> str:
+    """Decode RFC 5545 TEXT escapes (\\n, \\N, \\, \\; \\\\).
+
+    An unknown escape drops the backslash and keeps the character; it never
+    raises. This is applied to UID/SUMMARY/LOCATION only (the values a UI shows
+    or matches on) -- not to DTSTART/RRULE, which are parsed structurally.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(value):
+        ch = value[i]
+        if ch == "\\" and i + 1 < len(value):
+            nxt = value[i + 1]
+            if nxt in ("n", "N"):
+                out.append("\n")
+            else:
+                out.append(nxt)
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
 
 def parse_ics(text: str, *, tz: ZoneInfo | None = None) -> IcsParse:
@@ -1538,10 +1787,19 @@ def parse_ics(text: str, *, tz: ZoneInfo | None = None) -> IcsParse:
     TZID, or floating->campus warning), SUMMARY, LOCATION, UID, and weekly
     RRULE (FREQ=WEEKLY with BYDAY/INTERVAL/COUNT/UNTIL). Unsupported or
     malformed parts are reported in ``warnings``/``errors`` and the event is
-    skipped -- never guessed.
+    skipped -- never guessed. Input bytes/lines/events and recurrence counts are
+    bounded (``MAX_ICS_*``); unknown TZIDs and RDATE/EXDATE/WKST are rejected.
     """
+    raw = text or ""
+    if len(raw.encode("utf-8", "replace")) > MAX_ICS_BYTES:
+        return IcsParse((), (), (f"ICS exceeds {MAX_ICS_BYTES} bytes; rejected",),
+                        valid=False)
     default_tz = tz or campus_tz()
-    lines = unfold_ics(text)
+    lines = unfold_ics(raw)
+    if len(lines) > MAX_ICS_LINES:
+        return IcsParse((), (), (f"ICS exceeds {MAX_ICS_LINES} lines; rejected",),
+                        valid=False)
+
     warnings: list[str] = []
     errors: list[str] = []
     events: list[IcsEvent] = []
@@ -1572,6 +1830,10 @@ def parse_ics(text: str, *, tz: ZoneInfo | None = None) -> IcsParse:
                 errors.append("END:VEVENT with no BEGIN:VEVENT")
                 continue
             in_event = False
+            if len(events) >= MAX_ICS_EVENTS:
+                errors.append(
+                    f"more than {MAX_ICS_EVENTS} VEVENTs; remaining skipped")
+                continue
             ev, err = _build_event(props, event_warnings, default_tz)
             if ev is None:
                 errors.append(err or "malformed VEVENT")
@@ -1606,6 +1868,12 @@ def _build_event(props: dict[str, tuple[dict[str, str], str]],
         return None, "VEVENT missing DTSTART"
     if "UID" not in props or not props["UID"][1].strip():
         return None, "VEVENT missing UID"
+    # RDATE/EXDATE change the date set in ways this bounded parser does not
+    # model; reject rather than silently dropping the exceptions.
+    if "RDATE" in props:
+        return None, "RDATE recurrence is unsupported; event skipped"
+    if "EXDATE" in props:
+        return None, "EXDATE exceptions are unsupported; event skipped"
     try:
         dtstart, all_day, tzid = _parse_ics_dt(
             props["DTSTART"][1], props["DTSTART"][0], default_tz, warnings)
@@ -1626,24 +1894,22 @@ def _build_event(props: dict[str, tuple[dict[str, str], str]],
     if dtend < dtstart:
         return None, "DTEND is before DTSTART"
 
-    uid = props["UID"][1].strip()
-    summary = props.get("SUMMARY", ({}, ""))[1].strip()
-    location = props.get("LOCATION", ({}, ""))[1].strip()
+    uid = _decode_ics_text(props["UID"][1].strip())
+    summary = _decode_ics_text(props.get("SUMMARY", ({}, ""))[1].strip())
+    location = _decode_ics_text(props.get("LOCATION", ({}, ""))[1].strip())
     days: tuple[str, ...] = ()
     rrule: dict[str, str] = {}
     recurring = False
     if "RRULE" in props:
         rrule, days = _parse_rrule(props["RRULE"][1], dtstart.weekday(), warnings)
         recurring = True
+        if "_UNSUPPORTED" in rrule:
+            return None, f"unsupported RRULE for UID {uid!r}; event skipped"
     elif not all_day:
         # A single VEVENT with no RRULE is ONE class meeting, not a weekly one.
-        # days is still populated for display/ICS->Meeting, but recurrence is
-        # explicitly off so expansion cannot invent repeats.
         days = (WEEKDAY_TO_DAY[dtstart.weekday()],)
     if all_day:
         warnings.append("all-day event: no class time to expand")
-    if "_UNSUPPORTED" in rrule:
-        return None, f"unsupported RRULE for UID {uid!r}; event skipped"
     return IcsEvent(
         uid=uid, summary=summary, location=location, dtstart=dtstart,
         dtend=dtend, all_day=all_day, tzid=tzid, rrule=rrule, days=days,
@@ -1656,11 +1922,23 @@ def _build_event(props: dict[str, tuple[dict[str, str], str]],
 def expand_ics_event(event: IcsEvent, *, start: date | None = None,
                      end: date | None = None,
                      tz: ZoneInfo | None = None) -> list[ClassOccurrence]:
-    """Expand a supported IcsEvent's weekly recurrence into occurrences.
+    """Expand a supported IcsEvent's DATED weekly recurrence into occurrences.
 
     Respects INTERVAL/COUNT/UNTIL and BYDAY. All-day or unsupported events
-    yield nothing (they are flagged by the parser instead).
+    yield nothing (they are flagged by the parser instead). The window and the
+    occurrence count are bounded (``MAX_ICS_WINDOW_DAYS`` /
+    ``MAX_ICS_OCCURRENCES``) and the function never raises: a malformed event
+    returns [] rather than crashing the planner.
     """
+    try:
+        return _expand_ics_event_impl(event, start=start, end=end, tz=tz)
+    except Exception:                                    # noqa: BLE001
+        return []
+
+
+def _expand_ics_event_impl(event: IcsEvent, *, start: date | None = None,
+                           end: date | None = None,
+                           tz: ZoneInfo | None = None) -> list[ClassOccurrence]:
     if event.all_day or not event.days:
         return []
     tz = tz or campus_tz()
@@ -1681,20 +1959,24 @@ def expand_ics_event(event: IcsEvent, *, start: date | None = None,
             end=event.dtend, meeting=meeting, title_extra="ics",
         )]
 
-    interval = int(rrule.get("INTERVAL", "1") or 1) or 1
+    interval = int(rrule.get("INTERVAL", "1") or 1)
+    if interval < 1:
+        return []
     count = int(rrule["COUNT"]) if rrule.get("COUNT", "").isdigit() else None
     until: date | None = None
     if rrule.get("UNTIL"):
-        raw = rrule["UNTIL"]
         try:
-            until_dt, _, _ = _parse_ics_dt(raw, {}, tz, [])
+            until_dt, _, _ = _parse_ics_dt(rrule["UNTIL"], {}, tz, [])
             until = until_dt.date()
         except ValueError:
-            until = None
+            return []                     # parser flags invalid UNTIL already
     win_start = max(start or first, first)
-    win_end = end or until or (first + timedelta(days=365))
+    default_end = first + timedelta(days=MAX_ICS_WINDOW_DAYS)
+    win_end = end or until or default_end
     if until:
         win_end = min(win_end, until)
+    if (win_end - win_start).days > MAX_ICS_WINDOW_DAYS:
+        win_end = win_start + timedelta(days=MAX_ICS_WINDOW_DAYS)
 
     # Iterate week-by-week so INTERVAL is honored exactly. COUNT counts every
     # recurrence from DTSTART (RFC 5545), so occurrences before the query
@@ -1704,7 +1986,9 @@ def expand_ics_event(event: IcsEvent, *, start: date | None = None,
     week = first - timedelta(days=first.weekday())
     while week - timedelta(days=6) <= win_end:
         for day_letter in event.days:
-            wd = DAY_TO_WEEKDAY[day_letter]
+            wd = DAY_TO_WEEKDAY.get(day_letter)
+            if wd is None:
+                continue
             d = week + timedelta(days=wd)
             if d < first:
                 continue
@@ -1722,11 +2006,25 @@ def expand_ics_event(event: IcsEvent, *, start: date | None = None,
                 end=start_dt + duration, meeting=event.to_meeting(),
                 title_extra="ics",
             ))
+            if len(out) >= MAX_ICS_OCCURRENCES:
+                out.sort(key=lambda o: o.start)
+                return out
             if count is not None and n >= count:
                 out.sort(key=lambda o: o.start)
                 return out
         week += timedelta(days=7 * interval)
     out.sort(key=lambda o: o.start)
+    return out
+
+
+def expand_ics_events(events: Iterable[IcsEvent], *, start: date | None = None,
+                      end: date | None = None,
+                      tz: ZoneInfo | None = None) -> list[ClassOccurrence]:
+    """Expand many IcsEvents into a single sorted occurrence list."""
+    out: list[ClassOccurrence] = []
+    for e in events:
+        out.extend(expand_ics_event(e, start=start, end=end, tz=tz))
+    out.sort(key=lambda o: (o.start, o.crn))
     return out
 
 
@@ -1743,6 +2041,7 @@ class TimetableSnapshot:
     snapshot_id: str = ""
     campus: str = DEFAULT_CAMPUS
     schema: str = SCHEMA_SNAPSHOT
+    content_sha1: str = ""
 
     def meta_dict(self) -> dict:
         return {
@@ -1754,6 +2053,7 @@ class TimetableSnapshot:
             "query": dict(self.query),
             "source_url": self.source_url,
             "fetched_at": self.fetched_at.isoformat(timespec="seconds"),
+            "content_sha1": self.content_sha1,
         }
 
     def to_dict(self) -> dict:
@@ -1774,9 +2074,15 @@ def make_snapshot(html: str, *, term: str, query: dict | None = None,
     """
     safe_query = sanitize_query(query or {})
     fetched = fetched_at or config.now(timezone.utc)
-    digest_src = json.dumps(
-        {"term": str(term), "query": safe_query}, sort_keys=True,
-        separators=(",", ":"))
+    if fetched.tzinfo is None:
+        fetched = fetched.replace(tzinfo=timezone.utc)
+    content_sha1 = hashlib.sha1((html or "").encode("utf-8")).hexdigest()
+    digest_src = json.dumps({
+        "term": str(term),
+        "query": safe_query,
+        "fetched_at": fetched.isoformat(timespec="seconds"),
+        "content_sha1": content_sha1,
+    }, sort_keys=True, separators=(",", ":"))
     sid = snapshot_id or (
         "classes_snapshot__" + hashlib.sha1(digest_src.encode()).hexdigest()[:12])
     return {
@@ -1788,6 +2094,7 @@ def make_snapshot(html: str, *, term: str, query: dict | None = None,
         "query": safe_query,
         "source_url": source_url,
         "fetched_at": fetched.isoformat(timespec="seconds"),
+        "content_sha1": content_sha1,
         "html": html,
     }
 
@@ -1826,29 +2133,41 @@ def save_snapshot(path: str | Path, snapshot: dict) -> Path:
 
 
 def load_snapshot(path: str | Path) -> TimetableSnapshot:
-    """Read a snapshot JSON envelope (see scripts/fetch_classes.py)."""
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    """Read and VALIDATE a snapshot JSON envelope (see scripts/fetch_classes.py).
+
+    Rejects a missing/invalid ``fetched_at`` (a snapshot with no trustworthy
+    capture time cannot be labelled fresh/stale) and re-sanitizes the stored
+    query so a hand-edited file cannot smuggle a forbidden key back in. If a
+    content hash is present it is verified against the HTML.
+    """
+    p = Path(path)
+    data = json.loads(p.read_text(encoding="utf-8"))
     if data.get("schema") != SCHEMA_SNAPSHOT:
-        raise ValueError(f"{path}: not a {SCHEMA_SNAPSHOT} snapshot")
+        raise ValueError(f"{p}: not a {SCHEMA_SNAPSHOT} snapshot")
     fetched_at = data.get("fetched_at")
-    if isinstance(fetched_at, str):
-        try:
-            fetched_at = datetime.fromisoformat(fetched_at)
-        except ValueError as exc:
-            raise ValueError(f"{path}: bad fetched_at {fetched_at!r}") from exc
-    if fetched_at is None:
-        fetched_at = config.now(timezone.utc)
-    if fetched_at.tzinfo is None:
-        fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+    if not isinstance(fetched_at, str) or not fetched_at.strip():
+        raise ValueError(f"{p}: missing fetched_at")
+    try:
+        fetched = datetime.fromisoformat(fetched_at)
+    except ValueError as exc:
+        raise ValueError(f"{p}: bad fetched_at {fetched_at!r}") from exc
+    if fetched.tzinfo is None:
+        raise ValueError(f"{p}: fetched_at must include a timezone offset")
+    html = str(data.get("html", ""))
+    content_sha1 = str(data.get("content_sha1", "") or "")
+    actual_sha1 = hashlib.sha1(html.encode("utf-8")).hexdigest()
+    if content_sha1 and content_sha1 != actual_sha1:
+        raise ValueError(f"{p}: content_sha1 does not match html")
     return TimetableSnapshot(
         term=str(data.get("term", "")),
-        html=str(data.get("html", "")),
-        query=dict(data.get("query", {}) or {}),
-        fetched_at=fetched_at,
+        html=html,
+        query=sanitize_query(dict(data.get("query", {}) or {})),
+        fetched_at=fetched,
         source_url=str(data.get("source_url", BANNER_PROC_URL)),
-        snapshot_id=str(data.get("id", Path(path).stem)),
+        snapshot_id=str(data.get("id", p.stem)),
         campus=str(data.get("campus", DEFAULT_CAMPUS)),
         schema=str(data.get("schema", SCHEMA_SNAPSHOT)),
+        content_sha1=content_sha1 or actual_sha1,
     )
 
 
@@ -1932,32 +2251,53 @@ def search_result_json(
 
 def schedule_json(
     schedule: Iterable[dict],
-    sections: Iterable[ClassSection],
+    sections: Iterable[ClassSection] | None = None,
     *,
-    start: date,
-    end: date,
+    start: date | None = None,
+    end: date | None = None,
     now: datetime | None = None,
     max_age_s: float = 6 * 3600,
     snapshot: TimetableSnapshot | None = None,
+    ics_events: Iterable[IcsEvent] | None = None,
 ) -> dict:
-    """Add/remove/list schedule response with conflict + stale + state info."""
+    """Schedule response with conflict + stale + state info.
+
+    Conflicts are computed from DATED occurrences: Banner sections expanded by
+    their verified term window plus ICS events expanded by their own dated
+    recurrence. ICS records are never turned into Banner sections.
+    """
     schedule_list = list(schedule or [])
-    section_list = list(sections)
+    section_list = list(sections or ())
+    ics_list = list(ics_events or ())
     resolved = resolve_schedule(schedule_list, section_list)
-    conflicts = schedule_conflicts(resolved, start=start, end=end)
+    resolved_ics = resolve_ics_schedule(schedule_list)
+    if ics_list:
+        by_uid = {e.uid: e for e in ics_list}
+        resolved_ics = [by_uid.get(e.uid, e) for e in resolved_ics]
+    occ = combined_occurrences(resolved, resolved_ics, start=start, end=end)
+    conflicts = find_conflicts(occ)
     stale = snapshot_is_stale(snapshot, max_age_s=max_age_s, now=now) if snapshot else False
-    known = {(s.term, s.crn) for s in section_list}
+    known_crn = {(s.term, s.crn) for s in section_list}
+    known_uid = {e.uid for e in (ics_list or resolved_ics)}
+    unresolved: list[str] = []
+    for rec in schedule_list:
+        if rec.get("kind", "crn") == "ics":
+            uid = str(rec.get("uid", ""))
+            if uid not in known_uid:
+                unresolved.append(uid)
+        else:
+            key = (str(rec.get("term", "")), str(rec.get("crn", "")))
+            if key not in known_crn:
+                unresolved.append(str(rec.get("crn", "")))
     return {
         "schema": SCHEMA_SCHEDULE,
         "schedule": schedule_list,
         "count": len(schedule_list),
+        "occurrence_count": len(occ),
         "conflicts": [c.to_dict() for c in conflicts],
         "state": "conflict" if conflicts else (
             "stale_snapshot" if stale else "ready"),
-        "unresolved_crns": [
-            r.get("crn") for r in schedule_list
-            if (str(r.get("term", "")), str(r.get("crn", ""))) not in known
-        ],
+        "unresolved": unresolved,
         "snapshot": snapshot.meta_dict() if snapshot else None,
     }
 
@@ -1978,20 +2318,24 @@ __all__ = [
     "BANNER_BASE", "BANNER_FORM_URL", "BANNER_PROC_URL", "BANNER_BUILDINGS_URL",
     "BANNER_EXAMS_URL", "DEFAULT_CAMPUS", "DEFAULT_CORE_CODE",
     "SCHEMA_SNAPSHOT", "SCHEMA_SEARCH", "SCHEMA_NEXT_CLASS", "SCHEMA_SCHEDULE",
+    "MAX_ICS_BYTES", "MAX_ICS_LINES", "MAX_ICS_EVENTS", "MAX_ICS_OCCURRENCES",
+    "MAX_ICS_WINDOW_DAYS", "MAX_BUFFER_MIN",
     "TERM_FALL_2026", "SUPPORTED_TERMS", "TERM_WINDOWS", "HOLIDAYS",
-    "TermWindow", "term_name", "term_window", "Meeting", "ClassSection",
+    "TermWindow", "term_name", "term_window", "term_expandability",
+    "Meeting", "ClassSection",
     "ClassOccurrence", "TimetableParse", "Conflict", "NextClass", "Building",
-    "ExamSlot", "IcsEvent", "IcsParse", "SelectionResult", "TimetableSnapshot",
+    "IcsEvent", "IcsParse", "SelectionResult", "TimetableSnapshot",
     "DAY_TO_WEEKDAY", "WEEKDAY_TO_DAY", "ICS_DAY_TO_BANNER", "BANNER_DAY_TO_ICS",
     "parse_days", "days_to_text", "parse_clock", "parse_location",
     "parse_course_label", "is_valid_crn", "parse_crns", "extract_table_rows",
     "parse_timetable_html", "search", "select_crns", "expand_section",
     "expand_sections", "campus_tz", "find_conflicts", "schedule_conflicts",
-    "next_class", "next_class_json", "add_to_schedule", "remove_from_schedule",
-    "resolve_schedule", "parse_building_list_html", "load_buildings",
+    "combined_occurrences", "next_class", "next_class_json", "add_to_schedule",
+    "remove_from_schedule", "resolve_schedule", "resolve_ics_schedule",
+    "schedule_occurrences", "parse_building_list_html", "load_buildings",
     "building_crosswalk", "attach_gis_coords", "crosswalk_contract",
-    "parse_exam_schedule_html", "exam_slot_for", "unfold_ics", "parse_ics",
-    "expand_ics_event", "make_snapshot", "sanitize_query", "QUERY_KEYS",
+    "unfold_ics", "parse_ics", "expand_ics_event", "expand_ics_events",
+    "make_snapshot", "sanitize_query", "QUERY_KEYS",
     "FORBIDDEN_QUERY_KEYS", "save_snapshot", "load_snapshot",
     "snapshot_age_seconds", "snapshot_is_stale", "snapshot_sections",
     "UI_STATES", "search_state", "search_result_json", "schedule_json",

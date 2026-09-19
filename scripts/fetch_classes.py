@@ -17,7 +17,7 @@ PUBLIC DATA ONLY. This script:
 
 Usage
 -----
-    # one harmless query -> fixtures/classes_snapshot_fall2026_as.json
+    # one harmless query -> fixtures/classes_snapshot_202609_AS.json
     python3 scripts/fetch_classes.py --term 202609 --subject AS
 
     # a pasted CRN
@@ -120,17 +120,34 @@ def fetch_exams() -> str:
 # ---------------------------------------------------------------------------
 # Subject list (parsed from the form page's JS, no separate endpoint)
 # ---------------------------------------------------------------------------
-_OPTION_RE = re.compile(
-    r'new Option\("([^"]*)","([^"]*)"', re.I)
+_OPTION_RE = re.compile(r'new Option\("([^"]*)","([^"]*)"', re.I)
+# The subject list lives inside `switch (listindex) { case "202609": ... break; }`.
+# Parsing the WHOLE page would mix terms; we parse only the requested case block.
+_CASE_RE = re.compile(r'case\s+"([^"]+)"\s*:(.*?)break;', re.I | re.S)
 
 
-def parse_subject_codes(form_html: str) -> list[tuple[str, str]]:
-    """[(code, label)] from the form's ``new Option(...)`` subject list."""
+def parse_subject_codes(form_html: str, term: str | None = None) -> list[tuple[str, str]]:
+    """[(code, label)] from the requested term's ``new Option(...)`` block.
+
+    Without ``term`` the first case block is used (the form's default term).
+    Codes are de-duplicated in first-seen order and the pseudo "All Subjects"
+    code ``%`` is dropped.
+    """
+    html = form_html or ""
+    matches = list(_CASE_RE.finditer(html))
+    if term is not None:
+        block = next((m.group(2) for m in matches if m.group(1) == str(term)), "")
+        if not block:
+            return []
+    else:
+        block = matches[0].group(2) if matches else html
     out: list[tuple[str, str]] = []
-    for label, code in _OPTION_RE.findall(form_html or ""):
+    seen: set[str] = set()
+    for label, code in _OPTION_RE.findall(block):
         code = code.strip()
-        if not code or code == "%":
+        if not code or code == "%" or code in seen:
             continue
+        seen.add(code)
         out.append((code, label.strip()))
     return out
 
@@ -189,25 +206,26 @@ def _subject_mode(args) -> int:
               "--yes-crawl to confirm, and keep --delay polite.")
         return 2
     form_html = _request(classes.BANNER_FORM_URL)
-    subjects = parse_subject_codes(form_html)
+    subjects = parse_subject_codes(form_html, term=args.term)
     if args.list_subjects:
         for code, label in subjects:
             print(f"{code}\t{label}")
         return 0
     if not subjects:
-        print("could not parse any subject codes from the form page", file=sys.stderr)
+        print(f"no subject list found for term {args.term!r} "
+              "(the form may not offer that term)", file=sys.stderr)
         return 1
     if args.subject:
         wanted = [s for s in subjects if s[0].upper() == args.subject.upper()]
         if not wanted:
-            print(f"subject {args.subject!r} is not in the form's subject list",
-                  file=sys.stderr)
+            print(f"subject {args.subject!r} is not in term {args.term} "
+                  "subject list", file=sys.stderr)
             return 1
         subjects = wanted
     if args.max_subjects:
         subjects = subjects[: args.max_subjects]
     print(f"crawling {len(subjects)} subject(s), {args.delay}s apart")
-    written = 0
+    written_paths: set[str] = set()
     for i, (code, _label) in enumerate(subjects, 1):
         try:
             html = fetch_timetable(term=args.term, subject=code,
@@ -219,12 +237,15 @@ def _subject_mode(args) -> int:
         path = write_timetable_snapshot(
             args.out, html, term=args.term, subject=code, campus=args.campus,
             name=f"{args.term}_{code}")
+        written_paths.add(str(path.resolve()))
         print(f"  [{i}/{len(subjects)}] {code} -> {path.name} "
               f"({len(html):,} bytes)")
-        written += 1
         if i < len(subjects):
             time.sleep(max(0.0, args.delay))
-    print(f"wrote {written} snapshot(s) to {args.out}")
+    if not written_paths:
+        print("nothing was written (all requests failed)", file=sys.stderr)
+        return 1
+    print(f"wrote {len(written_paths)} unique snapshot(s) to {args.out}")
     return 0
 
 
@@ -258,6 +279,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-subjects", type=int, default=0,
                     help="cap the crawl (safety valve); 0 = all")
     args = ap.parse_args(argv)
+
+    if args.delay < 1.0:
+        print("--delay must be >= 1 second (be a polite client)", file=sys.stderr)
+        return 2
 
     args.out.mkdir(parents=True, exist_ok=True)
     did_something = False

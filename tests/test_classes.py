@@ -7,38 +7,58 @@ Everything is offline. The only captive data is:
     harmless public AS-subject query captured 2026-09-19 (instructor cells are
     all "N/A"; no student data exists on the public page at all),
   * fixtures/classes_buildings.html -- the public building-abbreviation page,
-  * fixtures/classes_snapshot_fall2026_as.json -- a generated snapshot envelope,
   * fixtures/classes_schedule_sample.ics -- a SYNTHETIC calendar.
+
+Snapshots are GENERATED deterministically from the canonical HTML fixture (see
+``_make_snapshot``), so there is exactly one committed copy of the timetable.
 """
+import argparse
 import ast
 import importlib.util
+import json
 import os
 import tempfile
-
-os.environ.setdefault("DEMO_MODE", "cache")   # must precede hokieday imports
-
-import json
 import unittest
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
+from unittest import mock
+from urllib.error import URLError
 from zoneinfo import ZoneInfo
+
+os.environ.setdefault("DEMO_MODE", "cache")   # must precede hokieday imports
 
 from hokieday import classes, config
 
 FIX = Path(__file__).resolve().parent.parent / "fixtures"
 TIMETABLE_HTML = FIX / "classes_timetable_fall2026_as.html"
 BUILDINGS_HTML = FIX / "classes_buildings.html"
-SNAPSHOT_JSON = FIX / "classes_snapshot_fall2026_as.json"
 ICS_SAMPLE = FIX / "classes_schedule_sample.ics"
 
 TZ = ZoneInfo("America/New_York")
+CAPTURED_AT = datetime(2026, 9, 19, 15, 22, 29, tzinfo=timezone.utc)
+
+FORM_HTML = """<script>
+function dropdownlist(listindex){switch(listindex){
+case "202609":
+document.ttform.subj_code.options[0]=new Option("All Subjects","%",false,false);
+document.ttform.subj_code.options[1]=new Option("AAD - Architecture","AAD",false,false);
+document.ttform.subj_code.options[2]=new Option("AS - Aerospace","AS",false,false);
+break;
+case "202612":
+document.ttform.subj_code.options[1]=new Option("AS - Aerospace","AS",false,false);
+break;
+default:
+document.ttform.subj_code.options[1]=new Option("AAD - Architecture","AAD",false,false);
+}
+}</script>"""
 
 
 def setUpModule():
     if not config.CACHE_ONLY:
         raise RuntimeError(
             "tests.test_classes requires DEMO_MODE=cache (network must stay off)")
-    for p in (TIMETABLE_HTML, BUILDINGS_HTML, SNAPSHOT_JSON, ICS_SAMPLE):
+    for p in (TIMETABLE_HTML, BUILDINGS_HTML, ICS_SAMPLE):
         if not p.exists():
             raise RuntimeError(f"missing fixture {p}")
 
@@ -78,6 +98,19 @@ def _section(crn, days=("M",), begin="10:00", end="11:15",
     return classes.ClassSection(
         term=term, crn=crn, subject=subject, course_number=course,
         title=title, meetings=(m,))
+
+
+def _make_snapshot(html=None, *, term="202609", query=None, fetched_at=CAPTURED_AT):
+    return classes.make_snapshot(
+        TIMETABLE_HTML.read_text(encoding="utf-8") if html is None else html,
+        term=term, query=query or {"subject": "AS", "campus": "0", "term": term},
+        fetched_at=fetched_at)
+
+
+def _write_snapshot(tmpdir, snapshot) -> Path:
+    p = Path(tmpdir) / "snap.json"
+    classes.save_snapshot(p, snapshot)
+    return p
 
 
 # ===========================================================================
@@ -146,7 +179,6 @@ class TestFixtureParse(unittest.TestCase):
         self.assertIn("tba_arr", classes.section_state(self.by_crn["92874"]))
 
     def test_full_page_and_fragment_parse_same(self):
-        # Feed the bare fragment and a wrapped page; both must find the table.
         frag = TIMETABLE_HTML.read_text(encoding="utf-8")
         wrapped = f"<html><body><div>{frag}</div></body></html>"
         p2 = classes.parse_timetable_html(wrapped, term="202609")
@@ -300,6 +332,7 @@ class TestCRNSelectionAndSchedule(unittest.TestCase):
         out = classes.add_to_schedule([], self.sections, "81476", term="202609")
         rec = out["schedule"][0]
         json.dumps(rec)
+        self.assertEqual(rec["kind"], "crn")
         self.assertEqual(set(rec) & {"pid", "gpa", "grades", "roster"}, set())
         self.assertEqual(rec["term"], "202609")
         self.assertEqual(rec["crn"], "81476")
@@ -308,6 +341,38 @@ class TestCRNSelectionAndSchedule(unittest.TestCase):
         out = classes.add_to_schedule([], self.sections, "81476, 81481")
         resolved = classes.resolve_schedule(out["schedule"], self.sections)
         self.assertEqual({s.crn for s in resolved}, {"81476", "81481"})
+
+    def test_select_crns_ambiguous_without_term(self):
+        sections = [_section("81476", term="202609"),
+                    _section("81476", term="202612")]
+        res = classes.select_crns(sections, "81476")
+        self.assertEqual(res.found, ())
+        self.assertEqual(res.ambiguous, ("81476",))
+        resolved = classes.select_crns(sections, "81476", term="202612")
+        self.assertEqual(resolved.found[0].term, "202612")
+        self.assertEqual(resolved.ambiguous, ())
+
+    def test_add_to_schedule_reports_ambiguous(self):
+        sections = [_section("81476", term="202609"),
+                    _section("81476", term="202612")]
+        out = classes.add_to_schedule([], sections, "81476")
+        self.assertEqual(out["added"], [])
+        self.assertEqual(out["ambiguous"], ["81476"])
+
+    def test_removal_is_term_scoped_not_crn_only(self):
+        # Same CRN under two terms must NOT be removed by CRN alone.
+        a = classes.add_to_schedule([], [self.sections[0]], self.sections[0].crn,
+                                    term="202609")["schedule"]
+        b = classes.add_to_schedule(a, [_section(self.sections[0].crn, term="202612")],
+                                    self.sections[0].crn, term="202612")["schedule"]
+        self.assertEqual(len(b), 2)
+        blind = classes.remove_from_schedule(b, self.sections[0].crn)
+        self.assertEqual(blind["removed"], [])
+        self.assertEqual(blind["ambiguous"], [self.sections[0].crn])
+        self.assertEqual(len(blind["schedule"]), 2, "must not drop both terms")
+        scoped = classes.remove_from_schedule(b, self.sections[0].crn, term="202612")
+        self.assertEqual(scoped["removed"], [self.sections[0].crn])
+        self.assertEqual([r["term"] for r in scoped["schedule"]], ["202609"])
 
 
 # ===========================================================================
@@ -349,6 +414,24 @@ class TestRecurrence(unittest.TestCase):
         self.assertEqual([o.date.isoformat() for o in occ],
                          ["2026-09-15", "2026-09-17", "2026-09-22"])
 
+    def test_expansion_clamped_to_verified_term_window(self):
+        s = self.by_crn["81478"]
+        # Ask for a decade; must be clamped to the verified term window.
+        occ = classes.expand_section(s, start=date(2020, 1, 1),
+                                     end=date(2030, 1, 1), tz=TZ)
+        self.assertTrue(occ)
+        self.assertGreaterEqual(min(o.date for o in occ), date(2026, 8, 24))
+        self.assertLessEqual(max(o.date for o in occ), date(2026, 12, 9))
+
+    def test_unknown_term_expands_to_nothing_never_invents_window(self):
+        s = _section("55555", term="209999")
+        self.assertEqual(
+            classes.expand_section(s, start=date(2026, 1, 1),
+                                   end=date(2030, 1, 1), tz=TZ), [])
+        ok, reason = classes.term_expandability("209999")
+        self.assertFalse(ok)
+        self.assertIn("no known term window", reason)
+
 
 class TestConflicts(unittest.TestCase):
     def test_overlap_detected(self):
@@ -378,8 +461,6 @@ class TestConflicts(unittest.TestCase):
                                  meetings=(m1, m2))
         self.assertEqual(classes.schedule_conflicts([s], start=date(2026, 9, 14),
                                                     end=date(2026, 9, 14)), [])
-        self.assertEqual(len(classes.schedule_conflicts(
-            [s], start=date(2026, 9, 14), end=date(2026, 9, 14))), 0)
 
 
 class TestNextClass(unittest.TestCase):
@@ -418,6 +499,15 @@ class TestNextClass(unittest.TestCase):
         self.assertEqual(out["status"], "none")
         self.assertIsNone(out["deadline"])
 
+    def test_unverified_term_is_typed_unavailable_not_invented(self):
+        unknown = _section("77777", term="209999")
+        out = classes.next_class_json(
+            [unknown], datetime(2026, 9, 21, 12, 0, tzinfo=TZ))
+        self.assertEqual(out["status"], "unavailable")
+        self.assertIsNone(out["deadline"])
+        self.assertTrue(out["unverified_terms"])
+        self.assertIn("verified", out["reason"].lower())
+
     def test_skip_online(self):
         online = _section("90001", days=("M",), begin="09:00", end="10:00",
                           building="ONLINE", room=None, is_online=True)
@@ -432,6 +522,14 @@ class TestNextClass(unittest.TestCase):
                                      end=date(2026, 9, 14), tz=TZ,
                                      skip_online=True)
         self.assertEqual(skipped.occurrence.crn, "90002")
+
+    def test_buffer_bounds_rejected(self):
+        at = datetime(2026, 9, 14, 8, 0, tzinfo=TZ)
+        for bad in (-1, float("nan"), float("inf"), classes.MAX_BUFFER_MIN + 1):
+            with self.assertRaises(ValueError):
+                classes.next_class([], at, buffer_min=bad)
+        # A sane buffer still works.
+        self.assertIsNone(classes.next_class([], at, buffer_min=0))
 
 
 # ===========================================================================
@@ -482,8 +580,6 @@ class TestICS(unittest.TestCase):
                                            end=date(2026, 12, 1))
         self.assertEqual([o.date.isoformat() for o in all_occ],
                          ["2026-08-24", "2026-08-31", "2026-09-07"])
-        # COUNT is a property of the series, not the query: a later window
-        # still leaves only the two remaining occurrences.
         later = classes.expand_ics_event(ev, start=date(2026, 8, 31),
                                          end=date(2026, 12, 1))
         self.assertEqual([o.date.isoformat() for o in later],
@@ -518,6 +614,18 @@ class TestICS(unittest.TestCase):
         lines = classes.unfold_ics(folded)
         self.assertIn("SUMMARY:Long Summary", lines)
 
+    def test_text_escapes_decoded(self):
+        text = ("BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:esc\n"
+                "SUMMARY:Line1\\nLine2\\, with\\; punct\\\\slashes\n"
+                "LOCATION:Hahn Hall\\, Rm 101\n"
+                "DTSTART;TZID=America/New_York:20260824T100000\n"
+                "DTEND;TZID=America/New_York:20260824T110000\n"
+                "END:VEVENT\nEND:VCALENDAR\n")
+        ev = classes.parse_ics(text).events[0]
+        self.assertIn("Line1\nLine2", ev.summary)
+        self.assertIn(", with; punct\\slashes", ev.summary)
+        self.assertIn("Hahn Hall, Rm 101", ev.location)
+
     def test_malformed_dtstart_flagged_not_guessed(self):
         bad = ("BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:x\nDTSTART:garbage\n"
                "END:VEVENT\nEND:VCALENDAR\n")
@@ -550,12 +658,140 @@ class TestICS(unittest.TestCase):
         self.assertFalse(p.valid)
         self.assertTrue(p.errors)
 
-    def test_ics_event_to_section_flags_non_crn_identity(self):
-        ev = classes.parse_ics(ICS_SAMPLE.read_text(encoding="utf-8")).events[0]
-        sec = ev.to_section()
-        self.assertEqual(sec.source, "ics")
-        self.assertEqual(sec.crn, ev.uid)
-        self.assertTrue(any("not a VT CRN" in w for w in sec.warnings))
+    def test_interval_zero_rejected(self):
+        p = classes.parse_ics(
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:z\nSUMMARY:z\n"
+            "DTSTART;TZID=America/New_York:20260824T100000\n"
+            "DTEND;TZID=America/New_York:20260824T110000\n"
+            "RRULE:FREQ=WEEKLY;INTERVAL=0\nEND:VEVENT\nEND:VCALENDAR\n")
+        self.assertFalse(p.valid)
+        self.assertEqual(p.events, ())
+
+    def test_count_zero_and_huge_rejected(self):
+        for count in ("0", str(classes.MAX_ICS_OCCURRENCES + 1)):
+            p = classes.parse_ics(
+                "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:z\nSUMMARY:z\n"
+                "DTSTART;TZID=America/New_York:20260824T100000\n"
+                "DTEND;TZID=America/New_York:20260824T110000\n"
+                f"RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT={count}\n"
+                "END:VEVENT\nEND:VCALENDAR\n")
+            self.assertFalse(p.valid, count)
+            self.assertEqual(p.events, ())
+
+    def test_invalid_until_rejected(self):
+        p = classes.parse_ics(
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:z\nSUMMARY:z\n"
+            "DTSTART;TZID=America/New_York:20260824T100000\n"
+            "DTEND;TZID=America/New_York:20260824T110000\n"
+            "RRULE:FREQ=WEEKLY;UNTIL=not-a-date\nEND:VEVENT\nEND:VCALENDAR\n")
+        self.assertFalse(p.valid)
+        self.assertEqual(p.events, ())
+
+    def test_wkst_rdate_exdate_rejected(self):
+        for extra in ("RRULE:FREQ=WEEKLY;WKST=MO",
+                      "RDATE;TZID=America/New_York:20260831T100000",
+                      "EXDATE;TZID=America/New_York:20260831T100000"):
+            text = ("BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:z\nSUMMARY:z\n"
+                    "DTSTART;TZID=America/New_York:20260824T100000\n"
+                    "DTEND;TZID=America/New_York:20260824T110000\n"
+                    f"{extra}\nEND:VEVENT\nEND:VCALENDAR\n")
+            p = classes.parse_ics(text)
+            self.assertFalse(p.valid, extra)
+            self.assertEqual(p.events, (), extra)
+
+    def test_unknown_tzid_rejected(self):
+        p = classes.parse_ics(
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:z\nSUMMARY:z\n"
+            "DTSTART;TZID=Mars/Olympus:20260824T100000\n"
+            "DTEND;TZID=Mars/Olympus:20260824T110000\n"
+            "END:VEVENT\nEND:VCALENDAR\n")
+        self.assertFalse(p.valid)
+        self.assertEqual(p.events, ())
+        self.assertTrue(any("TZID" in e for e in p.errors))
+
+    def test_oversized_input_rejected(self):
+        huge = "X" * (classes.MAX_ICS_BYTES + 10)
+        p = classes.parse_ics(huge)
+        self.assertFalse(p.valid)
+        self.assertTrue(any("bytes" in e for e in p.errors))
+
+    def test_too_many_lines_rejected(self):
+        huge = "\n".join(["X"] * (classes.MAX_ICS_LINES + 1))
+        p = classes.parse_ics(huge)
+        self.assertFalse(p.valid)
+        self.assertTrue(any("lines" in e for e in p.errors))
+
+    def test_occurrence_cap_enforced(self):
+        # Weekly forever, tiny window bound -> must stop at the cap, no hang.
+        text = ("BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:cap\nSUMMARY:c\n"
+                "DTSTART;TZID=America/New_York:20200106T100000\n"
+                "DTEND;TZID=America/New_York:20200106T110000\n"
+                "RRULE:FREQ=WEEKLY;BYDAY=MO\nEND:VEVENT\nEND:VCALENDAR\n")
+        ev = classes.parse_ics(text).events[0]
+        occ = classes.expand_ics_event(ev, start=date(2020, 1, 6),
+                                       end=date(2035, 1, 6))
+        self.assertLessEqual(len(occ), classes.MAX_ICS_OCCURRENCES)
+
+    def test_malformed_event_never_crashes_expansion(self):
+        ev = classes.parse_ics(
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:z\n"
+            "DTSTART;TZID=America/New_York:20260824T100000\n"
+            "DTEND;TZID=America/New_York:20260824T110000\n"
+            "END:VEVENT\nEND:VCALENDAR\n").events[0]
+        broken = replace(ev, rrule={"FREQ": "WEEKLY", "INTERVAL": "x"},
+                         recurring=True, days=("M",))
+        self.assertEqual(classes.expand_ics_event(broken), [])
+
+
+class TestIcsScheduleSemantics(unittest.TestCase):
+    """P1 regression: ICS must never become a weekly Banner section."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.events = list(classes.parse_ics(
+            ICS_SAMPLE.read_text(encoding="utf-8")).events)
+        cls.recurring = next(e for e in cls.events if e.uid.startswith("cs-2114"))
+        cls.once = next(e for e in cls.events if e.uid.startswith("math-1225"))
+
+    def test_ics_event_has_no_banner_section_projection(self):
+        self.assertFalse(hasattr(self.recurring, "to_section"))
+
+    def test_add_by_uid_and_resolve_ignores_ics(self):
+        out = classes.add_to_schedule([], ics_events=[self.once])
+        self.assertEqual(out["schedule"][0]["kind"], "ics")
+        self.assertEqual(out["schedule"][0]["uid"], self.once.uid)
+        # resolve_schedule (Banner join) must ignore ICS records.
+        self.assertEqual(classes.resolve_schedule(out["schedule"], []), [])
+
+    def test_schedule_occurrences_use_dated_recurrence_not_term(self):
+        out = classes.add_to_schedule([], ics_events=[self.recurring])
+        occ = classes.schedule_occurrences(
+            out["schedule"], [], start=date(2026, 8, 24), end=date(2026, 9, 4))
+        self.assertEqual([o.date.isoformat() for o in occ],
+                         ["2026-08-24", "2026-08-26", "2026-08-28",
+                          "2026-08-31", "2026-09-02", "2026-09-04"])
+
+    def test_remove_by_uid_only(self):
+        out = classes.add_to_schedule([], ics_events=[self.once, self.recurring])
+        rem = classes.remove_from_schedule(out["schedule"], uids=[self.once.uid])
+        self.assertEqual(rem["removed"], [self.once.uid])
+        self.assertEqual([r["uid"] for r in rem["schedule"]], [self.recurring.uid])
+
+    def test_ics_and_banner_conflict_on_expanded_occurrences(self):
+        # Banner CS Wed 10:30-11:30 vs ICS MWF 10:00-11:15 -> overlap Wed.
+        banner = _section("10001", days=("W",), begin="10:30", end="11:30")
+        conflicts = classes.schedule_conflicts(
+            [banner], start=date(2026, 8, 24), end=date(2026, 8, 31),
+            ics_events=[self.recurring])
+        self.assertTrue(conflicts)
+
+    def test_next_class_consumes_ics_occurrence(self):
+        out = classes.next_class(
+            [], datetime(2026, 8, 24, 8, 0, tzinfo=TZ),
+            start=date(2026, 8, 24), end=date(2026, 9, 1), tz=TZ,
+            ics_events=[self.recurring], buffer_min=10)
+        self.assertEqual(out.occurrence.crn, self.recurring.uid)
+        self.assertEqual(out.leave_by.strftime("%H:%M"), "09:50")
 
 
 # ===========================================================================
@@ -601,35 +837,87 @@ class TestBuildingCrosswalk(unittest.TestCase):
         with self.assertRaises(ValueError):
             classes.attach_gis_coords(cw, {"CLMS": (999.0, -80.4)})
 
-    def test_exam_grid_parser_conservative(self):
-        html = ("<table class='plaintable'><tr><td>Friday, Dec 11</td>"
-                "<td>7:45AM to 9:45AM</td></tr>"
-                "<tr><td>12M</td><td>08M</td></tr></table>")
-        slots = classes.parse_exam_schedule_html(html)
-        self.assertTrue(any(s.code == "12M" for s in slots))
+    def test_exam_parser_is_not_exported(self):
+        # P1.6: the unreliable exam parser was removed, not shipped.
+        self.assertFalse(hasattr(classes, "parse_exam_schedule_html"))
+        self.assertFalse(hasattr(classes, "ExamSlot"))
 
 
 # ===========================================================================
 class TestSnapshot(unittest.TestCase):
-    def test_load_generated_snapshot(self):
-        snap = classes.load_snapshot(SNAPSHOT_JSON)
-        self.assertEqual(snap.term, "202609")
-        self.assertEqual(snap.query.get("subject"), "AS")
-        self.assertEqual(snap.fetched_at.tzinfo is not None, True)
+    def test_generated_snapshot_loads_and_parses(self):
+        snap = _make_snapshot()
+        with tempfile.TemporaryDirectory() as tmp:
+            loaded = classes.load_snapshot(_write_snapshot(tmp, snap))
+        self.assertEqual(loaded.term, "202609")
+        self.assertEqual(loaded.query.get("subject"), "AS")
+        self.assertIsNotNone(loaded.fetched_at.tzinfo)
+        self.assertEqual(loaded.content_sha1, snap["content_sha1"])
         parse = classes.snapshot_sections(
-            snap, classes.building_crosswalk(classes.load_buildings()))
+            loaded, classes.building_crosswalk(classes.load_buildings()))
         self.assertEqual(len(parse.sections), 15)
-        self.assertEqual(parse.snapshot_id, snap.snapshot_id)
+        self.assertEqual(parse.snapshot_id, loaded.snapshot_id)
+
+    def test_deterministic_generation_and_content_hash(self):
+        a = _make_snapshot()
+        b = _make_snapshot()
+        self.assertEqual(a["id"], b["id"])
+        self.assertEqual(a["content_sha1"], b["content_sha1"])
+        c = _make_snapshot(html="<html>different</html>")
+        self.assertNotEqual(a["id"], c["id"])
+        self.assertNotEqual(a["content_sha1"], c["content_sha1"])
+
+    def test_snapshot_id_changes_with_capture_time(self):
+        a = _make_snapshot(fetched_at=CAPTURED_AT)
+        b = _make_snapshot(fetched_at=CAPTURED_AT.replace(hour=16))
+        self.assertNotEqual(a["id"], b["id"])
+
+    def test_load_rejects_missing_fetched_at(self):
+        snap = _make_snapshot()
+        snap.pop("fetched_at")
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _write_snapshot(tmp, snap)
+            with self.assertRaises(ValueError):
+                classes.load_snapshot(p)
+
+    def test_load_rejects_naive_fetched_at(self):
+        snap = _make_snapshot()
+        snap["fetched_at"] = "2026-09-19T15:22:29"
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _write_snapshot(tmp, snap)
+            with self.assertRaises(ValueError):
+                classes.load_snapshot(p)
+
+    def test_load_rejects_tampered_content_hash(self):
+        snap = _make_snapshot()
+        snap["content_sha1"] = "0" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _write_snapshot(tmp, snap)
+            with self.assertRaises(ValueError):
+                classes.load_snapshot(p)
+
+    def test_load_sanitizes_query(self):
+        snap = _make_snapshot(query={"subject": "AS", "inst_name": "Smith",
+                                     "pid": "123", "unknown": "x"})
+        self.assertNotIn("inst_name", snap["query"])
+        # hand-edit the file to smuggle a forbidden key back in
+        snap["query"]["inst_name"] = "Smith"
+        with tempfile.TemporaryDirectory() as tmp:
+            loaded = classes.load_snapshot(_write_snapshot(tmp, snap))
+        self.assertNotIn("inst_name", loaded.query)
+        self.assertEqual(loaded.query, {"subject": "AS"})
 
     def test_staleness(self):
-        snap = classes.load_snapshot(SNAPSHOT_JSON)
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = classes.load_snapshot(_write_snapshot(tmp, _make_snapshot()))
         fresh = datetime(2026, 9, 19, 16, 0, tzinfo=timezone.utc)
         old = datetime(2026, 9, 21, 4, 0, tzinfo=timezone.utc)
         self.assertFalse(classes.snapshot_is_stale(snap, now=fresh))
         self.assertTrue(classes.snapshot_is_stale(snap, now=old))
 
     def test_search_result_json_states(self):
-        snap = classes.load_snapshot(SNAPSHOT_JSON)
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = classes.load_snapshot(_write_snapshot(tmp, _make_snapshot()))
         parse = classes.snapshot_sections(snap)
         ok = classes.search_result_json(
             parse, snap, query={"subject": "AS"},
@@ -643,20 +931,12 @@ class TestSnapshot(unittest.TestCase):
         self.assertTrue(stale["snapshot"]["is_stale"])
 
     def test_empty_parse_is_no_results(self):
-        snap = classes.load_snapshot(SNAPSHOT_JSON)
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = classes.load_snapshot(_write_snapshot(tmp, _make_snapshot()))
         empty = classes.parse_timetable_html("<html></html>", term="202609")
         out = classes.search_result_json(empty, snap)
         self.assertEqual(out["state"], "no_results")
         self.assertEqual(out["count"], 0)
-
-    def test_sanitize_query_drops_pii_and_unknown_keys(self):
-        q = classes.sanitize_query({
-            "subject": "AS", "term": "202609", "inst_name": "Smith",
-            "password": "x", "pid": "123", "whatever": "y",
-        })
-        self.assertEqual(q, {"subject": "AS", "term": "202609"})
-        for forbidden in ("inst_name", "password", "pid"):
-            self.assertNotIn(forbidden, q)
 
     def test_schedule_json_conflict_state(self):
         a = _section("10001", days=("M",), begin="10:00", end="11:00")
@@ -667,39 +947,10 @@ class TestSnapshot(unittest.TestCase):
         self.assertEqual(out["state"], "conflict")
         self.assertEqual(len(out["conflicts"]), 1)
         self.assertEqual(out["count"], 2)
+        self.assertEqual(out["unresolved"], [])
 
 
 # ===========================================================================
-class TestPrivacyAndBoundary(unittest.TestCase):
-    def test_module_never_imports_network_libraries(self):
-        src = (Path(classes.__file__)).read_text(encoding="utf-8")
-        tree = ast.parse(src)
-        banned = {"urllib", "requests", "socket", "httpx", "aiohttp",
-                  "http.client", "urllib3"}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    self.assertNotIn(alias.name.split(".")[0], banned,
-                                     f"banned import {alias.name}")
-            elif isinstance(node, ast.ImportFrom):
-                mod = node.module or ""
-                self.assertNotIn(mod.split(".")[0], banned if "." not in mod
-                                 else banned, f"banned import from {mod}")
-
-    def test_snapshot_envelope_has_no_forbidden_keys(self):
-        snap = json.loads(SNAPSHOT_JSON.read_text(encoding="utf-8"))
-        serialized = json.dumps(snap).lower()
-        for bad in ("password", "pid", '"gpa"', "roster", "bannerid"):
-            self.assertNotIn(bad, serialized)
-
-    def test_section_dict_roundtrips_json(self):
-        parse = classes.parse_timetable_html(
-            TIMETABLE_HTML.read_text(encoding="utf-8"), term="202609")
-        blob = json.dumps([s.to_dict() for s in parse.sections])
-        restored = json.loads(blob)
-        self.assertEqual(restored[0]["term"], "202609")
-
-
 class TestEdgeScript(unittest.TestCase):
     """The polite POST form is the one place urllib is allowed; verify its
     fields and offline snapshot writing without opening a socket."""
@@ -721,12 +972,35 @@ class TestEdgeScript(unittest.TestCase):
         self.assertEqual(data["BTN_PRESSED"], "FIND class sections")
         self.assertIn("inst_name", data)  # empty, never a real instructor
 
-    def test_subject_code_parser(self):
-        html = ('<script>subj_code.options[1]=new Option("AAD - Architecture","AAD");'
-                'subj_code.options[2]=new Option("AS - Aerospace","AS");</script>')
-        subs = self.mod.parse_subject_codes(html)
+    def test_subject_parser_only_reads_requested_term_block(self):
+        subs = self.mod.parse_subject_codes(FORM_HTML, term="202609")
         self.assertEqual(subs, [("AAD", "AAD - Architecture"),
                                 ("AS", "AS - Aerospace")])
+        winter = self.mod.parse_subject_codes(FORM_HTML, term="202612")
+        self.assertEqual(winter, [("AS", "AS - Aerospace")])
+        self.assertEqual(self.mod.parse_subject_codes(FORM_HTML, term="999999"), [])
+
+    def test_subject_parser_dedupes(self):
+        html = ('<script>switch(x){case "202609":'
+                'new Option("AS","AS");new Option("AS dup","AS");break;}</script>')
+        self.assertEqual(self.mod.parse_subject_codes(html, term="202609"),
+                         [("AS", "AS")])
+
+    def test_delay_must_be_at_least_one_second(self):
+        rc = self.mod.main(["--delay", "0.25"])
+        self.assertEqual(rc, 2)
+
+    def test_nothing_written_is_nonzero(self):
+        args = argparse.Namespace(
+            term="202609", subject="AS", all_subjects=False, yes_crawl=False,
+            list_subjects=False, campus="0", delay=2.0,
+            out=Path(tempfile.mkdtemp(prefix="hokie-classes-crawl-")),
+            max_subjects=0)
+        with mock.patch.object(self.mod, "_request", return_value=FORM_HTML), \
+                mock.patch.object(self.mod, "fetch_timetable",
+                                  side_effect=URLError("down")):
+            rc = self.mod._subject_mode(args)
+        self.assertEqual(rc, 1)
 
     def test_snapshot_written_offline_and_reloadable(self):
         html = TIMETABLE_HTML.read_text(encoding="utf-8")
@@ -738,8 +1012,41 @@ class TestEdgeScript(unittest.TestCase):
             snap = classes.load_snapshot(path)
             self.assertEqual(snap.term, "202609")
             self.assertEqual(len(classes.snapshot_sections(snap).sections), 15)
-            # The persisted query must not carry the instructor field.
             self.assertNotIn("inst_name", snap.query)
+
+
+# ===========================================================================
+class TestPrivacyAndBoundary(unittest.TestCase):
+    def test_module_never_imports_network_libraries(self):
+        src = (Path(classes.__file__)).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        banned = {"urllib", "requests", "socket", "httpx", "aiohttp",
+                  "http.client", "urllib3"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertNotIn(alias.name.split(".")[0], banned,
+                                     f"banned import {alias.name}")
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                self.assertNotIn(mod.split(".")[0], banned,
+                                 f"banned import from {mod}")
+
+    def test_section_dict_roundtrips_json(self):
+        parse = classes.parse_timetable_html(
+            TIMETABLE_HTML.read_text(encoding="utf-8"), term="202609")
+        blob = json.dumps([s.to_dict() for s in parse.sections])
+        restored = json.loads(blob)
+        self.assertEqual(restored[0]["term"], "202609")
+
+    def test_ics_record_roundtrips_recurrence(self):
+        events = classes.parse_ics(ICS_SAMPLE.read_text(encoding="utf-8")).events
+        recurring = next(e for e in events if e.uid.startswith("cs-2114"))
+        out = classes.add_to_schedule([], ics_events=[recurring])
+        rebuilt = classes.resolve_ics_schedule(out["schedule"])
+        self.assertEqual(len(rebuilt), 1)
+        self.assertEqual(rebuilt[0].days, recurring.days)
+        self.assertEqual(rebuilt[0].rrule.get("FREQ"), "WEEKLY")
 
 
 if __name__ == "__main__":
