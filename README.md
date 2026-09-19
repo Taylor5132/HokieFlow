@@ -40,7 +40,7 @@ The same code must run in three places: locally for tests, in a Databricks noteb
 | dir | who writes | who reads |
 |---|---|---|
 | `cache/` | any live fetch | `DEMO_MODE=live` |
-| `fixtures/` | **only** `scripts/seed_cache.py` | `DEMO_MODE=cache` (tests + offline demo) |
+| `fixtures/` | **only** `scripts/seed_cache.py` / `scripts/fetch_weather.py` | `DEMO_MODE=cache` (tests + offline demo) |
 
 They must never be the same directory. A live poll once overwrote the very
 fixture the tests read, which silently changed expected values mid-session
@@ -63,7 +63,7 @@ mean **+0.96 min** — physically sensible. Override with `DEMO_NOW=<iso8601>`.
 
 ```bash
 export DEMO_MODE=cache
-python3 -m unittest discover -s tests -v     # 249 tests, no network
+python3 -m unittest discover -s tests -v     # 312 tests, no network
 ```
 
 With `DEMO_MODE=cache` nothing touches the network and the clock is pinned. If a

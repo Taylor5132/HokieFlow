@@ -170,12 +170,14 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _write_envelope(path: Path, url: str, payload: Any) -> None:
+def _write_envelope(path: Path, url: str, payload: Any,
+                    *, fetched_at: str | None = None,
+                    mode: str | None = None) -> None:
     envelope = {
         "key": path.stem,
         "url": url,
-        "fetched_at": _now_iso(),
-        "mode": config.DEMO_MODE,
+        "fetched_at": fetched_at or _now_iso(),
+        "mode": mode or config.DEMO_MODE,
         "payload": payload,
     }
     data = json.dumps(envelope)
@@ -511,6 +513,135 @@ def put_json(name: str, url: str, payload: Any, *, params: dict | None = None) -
     if config.CACHE_ONLY:
         return
     _write_envelope(_json_path(name, params), url, payload)
+
+
+# ------------------------------------------------------------------ public metadata
+# These are the supported ways OUTSIDE cache.py to inspect or write provenance
+# envelopes. They exist so cache consumers never reach for `_read_envelope` /
+# `_json_path` / `_write_envelope` directly; those private names may change.
+def read_envelope(name: str, params: dict | None = None) -> dict | None:
+    """Public read of a cached envelope dict, or None when absent/unreadable.
+
+    Never touches the network and never raises for a missing/corrupt entry.
+    """
+    p = _json_path(name, params)
+    if not p.exists():
+        return None
+    try:
+        return _read_envelope(p)
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+def envelope_meta(name: str, params: dict | None = None) -> dict | None:
+    """Public provenance metadata for a cache entry, or None when absent.
+
+    Returns only the envelope's cheap metadata (never the payload), which is
+    what freshness/provenance consumers actually need.
+    """
+    env = read_envelope(name, params)
+    if env is None:
+        return None
+    return {k: env.get(k) for k in ("key", "url", "fetched_at", "mode")}
+
+
+def write_envelope_atomic(name: str, url: str, payload: Any, *,
+                          params: dict | None = None,
+                          fetched_at: str | None = None) -> Path:
+    """Publish one envelope atomically, keeping a caller-supplied real stamp.
+
+    Unlike put_json() this works in DEMO_MODE=cache too and never invents a
+    fresh timestamp when `fetched_at` is given -- important for fixtures that
+    must preserve their true acquisition time.
+    """
+    path = _json_path(name, params)
+    _write_envelope(path, url, payload, fetched_at=fetched_at)
+    return path
+
+
+def publish_envelopes(entries: list[dict], *,
+                      cache_dir: Path | str | None = None) -> list[Path]:
+    """Atomically publish a whole bundle of envelopes, all-or-none.
+
+    `entries` is a list of dicts: {name, url, payload, params?, fetched_at?}.
+    Every entry is staged to a unique temp file first; only when ALL stages are
+    written are they swapped into place. If any swap fails, the previously
+    published files are restored and the new ones removed, so a caller never
+    observes a half-written bundle. Returns the published paths.
+
+    This is the supported replacement for seeding several fixtures by hand and
+    rewriting envelope JSON with Path.write_text().
+    """
+    target = Path(cache_dir) if cache_dir is not None else config.CACHE_DIR
+    target.mkdir(parents=True, exist_ok=True)
+
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for entry in entries:
+            name = entry["name"]
+            params = entry.get("params")
+            final = target / f"{key(name, params)}.json"
+            envelope = {
+                "key": final.stem,
+                "url": entry.get("url"),
+                "fetched_at": entry.get("fetched_at") or _now_iso(),
+                "mode": entry.get("mode") or config.DEMO_MODE,
+                "payload": entry["payload"],
+            }
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=final.name + ".stage.", suffix=".tmp", dir=str(target))
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(envelope))
+            staged.append((Path(tmp_name), final))
+    except BaseException:
+        for tmp, _final in staged:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+
+    backups: dict[Path, Path | None] = {}
+    published: list[Path] = []
+    try:
+        for tmp, final in staged:
+            if final.exists():
+                bfd, backup_name = tempfile.mkstemp(
+                    prefix=final.name + ".bak.", suffix=".tmp", dir=str(target))
+                os.close(bfd)
+                os.replace(final, backup_name)
+                backups[final] = Path(backup_name)
+            else:
+                backups[final] = None
+            os.replace(tmp, final)
+            published.append(final)
+    except BaseException:
+        for final, backup in backups.items():
+            try:
+                if final.exists():
+                    final.unlink()
+            except OSError:
+                pass
+            if backup is not None and backup.exists():
+                try:
+                    os.replace(backup, final)
+                except OSError:
+                    pass
+        for tmp, _final in staged:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+        raise
+
+    for backup in backups.values():
+        if backup is not None and backup.exists():
+            try:
+                backup.unlink()
+            except OSError:
+                pass
+    return published
 
 
 def stats() -> dict:

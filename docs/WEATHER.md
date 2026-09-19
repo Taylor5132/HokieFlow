@@ -1,8 +1,8 @@
 # Weather integration (NWS) — backend contract
 
 **Owner: worker weather. Source: `api.weather.gov` (keyless, official NWS).**
-Implementation: `hokieday/weather.py`. Fixtures: `fixtures/weather_*`. Edge fetch:
-`scripts/fetch_weather.py`. Tests: `tests/test_weather.py` (offline).
+Implementation: `hokieday/weather.py`. Edge fetch/seed: `scripts/fetch_weather.py`.
+Tests: `tests/test_weather.py` (offline, no fixtures required).
 
 This doc is the contract the app/Figma consumes. It deliberately does **not**
 re-design the visual UI and does **not** use an LLM: risk is deterministic and
@@ -15,7 +15,7 @@ the UI shows evidence, not a verdict.
 Default point = official VT GIS **Burruss Hall centroid** `37.22924778,-80.42396247`.
 The grid is resolved at runtime from `/points/{lat},{lon}` — never assumed.
 
-| field | value from the captured response |
+| field | value from the live response |
 |---|---|
 | grid | `RNK` `gridX=57` `gridY=65` |
 | forecast zone | `VAZ014` (Montgomery) |
@@ -26,18 +26,18 @@ The grid is resolved at runtime from `/points/{lat},{lon}` — never assumed.
 
 **Honest label:** KBCB is the Virginia Tech Airport ASOS, an *airport* sensor,
 not an on-campus weather station. Every observation carries `station_note`
-saying so. Prior-research values (RNK grid, VAZ014, KBCB) are confirmed by the
-live response and stored in the fixtures.
+saying so. The nearest station is chosen by **normalized `distance_m`**, not by
+response order.
 
-NWS API notes: responses arrive with a `301` from the un-rounded URL; `urllib`
-follows it. A descriptive `User-Agent` is required — the shared
-`config.USER_AGENT` is used by the cache layer. NWS data is US-Government public
-domain; `ATTRIBUTION` ("Weather data from the National Weather Service
-(weather.gov)") is attached to every result anyway.
+NWS API notes: the un-rounded `/points` URL returns a `301`; `urllib` follows
+it. A descriptive `User-Agent` is required — the shared `config.USER_AGENT` is
+used by the cache layer. NWS data is US-Government public domain; `ATTRIBUTION`
+("Weather data from the National Weather Service (weather.gov)") is attached to
+every result anyway.
 
 ---
 
-## 2. Cache keys, TTLs, freshness
+## 2. Cache keys, TTLs, freshness, sources
 
 All HTTP goes through `hokieday.cache.get_json`; `weather.py` imports no urllib.
 
@@ -54,18 +54,30 @@ The cache layer already returns the last-good copy when upstream fails. On top
 of that, each result carries:
 
 ```
-status      : "ok" | "stale" | "unavailable"
+status      : "ok" | "stale" | "partial" | "unavailable"
 stale       : bool
 age_seconds : seconds since fetch, measured against config.now() (the replay clock)
 fetched_at  : provenance stamp from the cache envelope
 source      : the URL / grid that produced it
 attribution : NWS credit line
 reason      : human explanation when not "ok" (null when "ok")
+sources     : per-feed statuses, e.g. {"points": {...}, "hourly": {...}}
 ```
 
-Freshness is measured against `config.now()`, **not** real elapsed wall time, so
-a replayed demo is self-consistent. There is no `datetime.now()` in the module
-(the integration AST tripwire enforces this).
+Aggregate status is **truthful and non-contradictory**:
+
+- `ok` — every requested feed is fresh (so `stale` is always `false`).
+- `stale` — all feeds are present but at least one is past its TTL. A stale
+  **point** dependency propagates to the whole forecast result.
+- `partial` — at least one feed is available and at least one is unavailable
+  (e.g. the point alert feed works but the zone feed is down).
+- `unavailable` — no feed is available.
+
+`stale` is `true` whenever any source is stale *or* unavailable, so `status ==
+"ok"` can never carry `stale: true`. `sources` exposes each feed so the UI can
+name which one degraded. Freshness is measured against `config.now()` (the
+replay clock), **not** real elapsed time; there is no `datetime.now()` in the
+module (the integration AST tripwire enforces this).
 
 ---
 
@@ -113,14 +125,15 @@ prediction.
 
 | function | returns |
 |---|---|
-| `resolve_point(lat, lon)` | point metadata result (grid/zone/timezone/URLs) |
-| `hourly_windows(lat, lon)` | `{status, windows:[WeatherWindow], point, freshness}` |
-| `forecast_strip(lat, lon, hours=12, at=None)` | `{status, windows, hours, strip_start, freshness}` — next N whole hours |
-| `active_alerts(lat, lon, include_zone=True)` | `{status, alerts, count, by_severity, forecast_zone, freshness}` |
-| `observation_stations(lat, lon)` | `{status, stations:[…nearest first…]}` |
-| `latest_observation(lat, lon, station=None)` | `{status, observation, freshness}` |
+| `resolve_point(lat, lon)` | point metadata result (grid/zone/timezone/URLs) + `sources` |
+| `hourly_windows(lat, lon)` | `{status, windows:[WeatherWindow], point, sources}` |
+| `forecast_strip(lat, lon, hours=12, at=None)` | `{status, windows, hours, strip_start, sources}` — next N whole hours |
+| `active_alerts(lat, lon, include_zone=True)` | `{status, alerts, count, by_severity, forecast_zone, sources}` |
+| `observation_stations(lat, lon)` | `{status, stations:[…sorted nearest first…], sources}` |
+| `nearest_station(stations)` | pure nearest-by-`distance_m` pick (None-safe) |
+| `latest_observation(lat, lon, station=None)` | `{status, observation, sources}` |
 | `assess_leg(start, end, windows, alerts)` | one leg's risk (pure) |
-| `plan_risk(legs, lat, lon, windows=None, alerts=None)` | per-leg badges + overall |
+| `plan_risk(legs, lat, lon, windows=None, alerts=None)` | per-leg badges + overall + `sources` |
 | `overlapping_windows(start, end, windows)` | overlapping forecast hours (pure) |
 | `summarize_alerts(alerts)` | counts by severity |
 | `as_failure(result)` | typed `Failure` for a non-`ok` result, else `None` |
@@ -129,18 +142,20 @@ prediction.
 
 | state | trigger | UI treatment |
 |---|---|---|
-| `ok` | fresh fixture/cache | show strip + source + age |
-| `stale` | age > TTL (upstream down, stale copy served) | show data + "cached · updated HH:MM" |
-| `unavailable` | no copy and fetch failed | grey weather row + "forecast unavailable", never a guess |
-| level `none` | no threshold crossed | no badge / neutral |
+| `ok` | fresh cache | show strip + source + age |
+| `stale` | age > TTL (stale copy served) or a stale dependency | show data + "cached · updated HH:MM" |
+| `partial` | one feed down, another up | show available data + "some weather feeds unavailable" |
+| `unavailable` | no data (incl. replay with no coherent bundle) | grey weather row + "forecast unavailable", never a guess |
+| level `none` | thresholds not crossed and all fields present | no badge / neutral |
 | level `low`/`moderate` | minor/inconvenient | small info badge |
 | level `high` | precip ≥ 60 %, thunder token, Severe alert, heat/cold/wind high | warning badge on the **outdoor leg** |
 | level `severe` | Extreme alert or severe-band heat/cold/wind | loud badge + reason, suggest indoor/later |
-| `unknown` | no forecast hour covers the window | "no forecast for this window", not "clear" |
+| `unknown` | no forecast covers the window, or required fields are missing | "no forecast for this window", not "clear" |
 | `not_applicable` | indoor leg (eat, bus) | no badge |
 
 Each badge carries `reasons` (human) and `evidence` (structured) so the student
-can compare, e.g. "57% chance of rain during this 12-minute walk".
+can compare, e.g. "forecast shows a 57% chance of rain during this 12-minute
+walk".
 
 ---
 
@@ -148,7 +163,22 @@ can compare, e.g. "57% chance of rain during this 12-minute walk".
 
 `assess_leg` scores each overlapping forecast hour and any in-effect alert, then
 takes the **maximum** level. It returns `evidence`, `reasons`, the thresholds
-used, and a `basis` of `forecast` or `alert`. It never asserts an outcome.
+used, and a `basis` that names the winning evidence:
+
+- `forecast` — the top level came from forecast factors;
+- `alert` — the top level came only from an in-effect alert (never labelled
+  `forecast`);
+- `mixed` — alerts and forecast factors tie at the top level.
+
+**Missing data never reads as reassuring.** If required hazard fields
+(precipitation, temperature, wind) are absent across every overlapping hour and
+no stronger evidence exists, the result is `status: "unknown"`, not `none`. A
+forecast token like "Chance Rain Showers" with a null probability is scored
+conservatively (level `low`, factor `precip_token`), not dropped.
+
+**Wind ranges are read conservatively.** `25 to 45 mph` and `25-45 mph` are
+scored at 45 mph; `20 to 30 km/h` at 30 km/h; knots are converted. The unit is
+taken from the last token that carries one.
 
 `DEFAULT_THRESHOLDS` (override per call):
 
@@ -163,39 +193,69 @@ used, and a `basis` of `forecast` or `alert`. It never asserts an outcome.
 | warning-class event | — | — | **high** (floor) | Extreme alert |
 
 Levels: `none < low < moderate < high < severe`. `plan_risk` returns the
-per-leg level plus an overall `max`.
+per-leg level plus an overall `max`, and its aggregate `status`/`stale` come
+from the same rule as the fetchers, so they cannot contradict.
 
 **Prohibited certainty wording.** Generated text is risk language only. Tests
 reject `will`, `definitely`, `guaranteed`, `certain(ty)`, `no doubt`,
 `unconditional`, `always`, `never`, `100%` in every reason/summary. There is no
-"it will rain" — only "57% chance of precipitation during this window".
+"it will rain" — only a forecast-stated chance.
 
 ---
 
-## 6. Integration steps (parent, after this branch lands)
+## 6. Replay decision: no committed weather fixtures
+
+The frozen replay store (`fixtures/`) deliberately contains **NO** weather
+envelopes. The first NWS capture was acquired around 21:29 UTC while the bus
+replay clock is pinned at 15:22 UTC, and its hourly forecast did not cover the
+replay "now". Committing it (after rewriting `fetched_at` to match the bus
+stamp) would have been a falsified, incoherent snapshot. Therefore, in
+`DEMO_MODE=cache`, weather returns the typed `unavailable` state until all
+campus sources (including the bus snapshot) can be recaptured as one coherent
+bundle. Tests for cache-backed fetchers use a **temporary synthetic cache**, not
+committed fixtures.
+
+### Regenerating a coherent bundle (`scripts/fetch_weather.py`)
+
+```
+python3 scripts/fetch_weather.py --dry-run     # fetch + validate, no writes
+python3 scripts/fetch_weather.py               # validate + publish all-or-none
+```
+
+The script:
+
+1. **Controls DEMO_MODE explicitly.** It refuses to run if `DEMO_MODE` is set to
+   anything other than `cache` (no silent `setdefault`).
+2. **Preserves real acquisition times.** Each envelope's `fetched_at` is the
+   time that response was actually fetched; nothing is rewritten.
+3. **Stages the complete bundle in memory**, then validates temporal invariants:
+   required resources present; all fetched within a 10-minute span; hourly
+   forecast has periods and covers the acquisition time; the observation has a
+   parseable, non-future, ≤ 6 h timestamp.
+4. **Refuses an incoherent replay.** If the target store has a `bt_buses` replay
+   pin that the forecast does not cover, publishing is rejected (override only
+   with an explicit `--force-incoherent`).
+5. **Publishes all-or-none** through `cache.publish_envelopes()`, which stages
+   every file and rolls back on failure. It never edits envelopes with
+   `Path.write_text()`.
+
+---
+
+## 7. Integration steps (parent, after this branch lands)
 
 `tools.py` and `config.py` are parent-owned; this module does not edit them.
 
-1. In `tools.LocalSource`, add `forecast()` / `alerts()` thin wrappers that call
+1. In `tools.LocalSource`, add `forecast()` / `alerts()` thin wrappers around
    `weather.hourly_windows()` and `weather.active_alerts()`.
 2. In `_build_itinerary`, after each `walk` leg is created, call
    `weather.assess_leg(leg["start_time"], start + minutes, windows, alerts)` and
-   attach `weather_risk = {level, label, reasons, evidence}` to the leg.
-3. Add a plan-level `weather` block from `weather.plan_risk(itinerary["legs"])`.
+   attach `weather_risk = {level, label, reasons, evidence, basis, status}`.
+3. Add a plan-level `weather` block from `weather.plan_risk(itinerary["legs"])`,
+   carrying `sources`, `stale`, and `reason`.
 4. Replace the `# -- weather trigger: NOT IMPLEMENTED YET` comment in
-   `_replan_trigger` with: fire cause `"weather"` when a walk leg's level is
-   `high`/`severe`, detail from `reasons[0]`, and keep the existing walk-only
-   alternative (Plan B already exists).
+   `_replan_trigger` with: fire cause `"weather"` only when a walk leg's level is
+   `high`/`severe` and `status` is not `unavailable`, using `reasons[0]`; keep
+   the existing walk-only alternative (Plan B already exists).
 5. App: expose `GET /api/weather` → `forecast_strip()` + `active_alerts()` and
-   attach `plan_risk` output to `/api/ask`. No network at request time beyond
-   the cache layer.
-
-## 7. Regenerating fixtures
-
-```
-python3 scripts/fetch_weather.py --hours 36 --stations 10
-```
-
-Writes into `fixtures/` (the frozen replay store) with the same snapshot stamp
-as `bt_buses`, so tests and the offline demo stay deterministic. Alerts may be
-empty — that is a real, committed state. Network stays out of tests.
+   attach `plan_risk` output to `/api/ask`. In replay with no bundle, render the
+   `unavailable` state rather than weather.

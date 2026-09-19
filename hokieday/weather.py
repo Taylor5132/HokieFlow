@@ -13,7 +13,7 @@ Authoritative point
 `DEFAULT_LAT`/`DEFAULT_LON` are the official VT GIS Burruss Hall centroid
 (37.22924778, -80.42396247). The grid is NOT hard-coded: `resolve_point()` calls
 `/points/{lat},{lon}` and reads back `gridId`/`gridX`/`gridY`, the forecast zone
-and the station list. The fixture captured on 2026-09-19 resolved to:
+and the station list. The live capture on 2026-09-19 resolved to:
     RNK grid 57,65  ·  forecast zone VAZ014  ·  timezone America/New_York
     nearest observation station KBCB ("Virginia Tech Airport", ~1.8 km away)
 
@@ -111,6 +111,10 @@ SEVERE_ALERT_EVENTS = (
 )
 
 _THUNDER_RE = re.compile(r"thunder|tstm|t-storm|lightning|thunderstorm", re.I)
+# Tokens that mean precipitation is in the forecast even when the probability
+# field is null. They must not silently fall through to a reassuring "none".
+_PRECIP_TOKEN_RE = re.compile(
+    r"rain|shower|snow|sleet|drizzle|freezing|ice|wintry|precip", re.I)
 _WIND_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(mph|km/?h|kph|kt|knots)?", re.I)
 
 DEFAULT_THRESHOLDS: dict[str, Any] = {
@@ -175,7 +179,8 @@ class WeatherUnavailable(WeatherError):
 class Failure:
     """Typed failure state returned by API-ready functions.
 
-    `status` is a closed set: "ok", "stale", "unavailable", "unknown".
+    `status` is a closed set: "ok", "stale", "partial", "unavailable".
+    "unknown" is used by the pure risk function when a window cannot be scored.
     """
 
     status: str
@@ -278,15 +283,24 @@ def _speed_to_kph(value, unit) -> float | None:
 
 
 def _parse_wind_text(text) -> tuple[float | None, float | None, str | None]:
-    """'3 mph' / '10 to 15 mph' -> (kph, mph, original text)."""
+    """'3 mph' / '10 to 15 mph' / '25-45 mph' -> (kph, mph, original text).
+
+    Ranges are read CONSERVATIVELY: the highest number in the text is used, so
+    "25 to 45 mph" is scored as 45 mph. The unit is taken from the last token
+    that carries one ("10 to 15 mph" -> mph).
+    """
     if text is None:
         return None, None, None
     raw = str(text)
-    m = _WIND_RE.search(raw)
-    if not m:
+    matches = list(_WIND_RE.finditer(raw))
+    if not matches:
         return None, None, raw
-    val = float(m.group(1))
-    unit = (m.group(2) or "mph").lower()
+    values = [float(m.group(1)) for m in matches]
+    unit = "mph"
+    for m in matches:
+        if m.group(2):
+            unit = m.group(2).lower()
+    val = max(values)                       # top of any range, never the bottom
     if unit in ("km/h", "kmh", "kph"):
         kph = val
     elif unit in ("kt", "knots"):
@@ -305,14 +319,9 @@ def _point_url(lat: float, lon: float) -> str:
 
 
 def _envelope_fetched_at(name: str, params: dict | None = None) -> str | None:
-    # Read the provenance stamp cache wrote for this key. cache.get_json returns
-    # only the payload; the stamp lives in the envelope. Reaching for the
-    # envelope reader is intentional (cache.py is parent-owned; we do not edit
-    # it) and lets freshness be measured against config.now() in replay mode.
-    try:
-        return cache._read_envelope(cache._json_path(name, params)).get("fetched_at")
-    except Exception:                                          # noqa: BLE001
-        return None
+    # Public cache metadata API only -- no private cache helpers here.
+    meta = cache.envelope_meta(name, params)
+    return meta.get("fetched_at") if meta else None
 
 
 def _freshness(name: str, params: dict | None, max_age_s: float,
@@ -346,6 +355,60 @@ def _base_result(name: str, params: dict | None, max_age_s: float, *,
         "stale": bool(fresh["stale"]),
         "reason": reason,
     }
+
+
+AGGREGATE_STATUSES = ("ok", "stale", "partial", "unavailable")
+
+
+def _source_meta(result: dict) -> dict:
+    """Compact per-source status for aggregate results (public provenance)."""
+    if not isinstance(result, dict):
+        return {"status": "unavailable", "stale": True, "fetched_at": None,
+                "age_seconds": None, "reason": "no result"}
+    return {
+        "status": result.get("status") or "unavailable",
+        "stale": bool(result.get("stale")),
+        "fetched_at": result.get("fetched_at"),
+        "age_seconds": result.get("age_seconds"),
+        "reason": result.get("reason"),
+    }
+
+
+def _aggregate(sources: dict[str, dict], *,
+               default_reason: str | None = None) -> tuple[str, bool, str | None, dict]:
+    """Aggregate per-source statuses truthfully, so they cannot contradict.
+
+    Precedence: all-unavailable > any-unavailable (partial) > stale > ok.
+    `stale` is True when any source is stale or unavailable, so a status of
+    "ok" can never carry stale=True.
+    """
+    metas = {name: _source_meta(res) for name, res in sources.items()}
+    statuses = [m["status"] for m in metas.values()]
+    if not statuses:
+        status = "unavailable"
+    elif all(s == "unavailable" for s in statuses):
+        status = "unavailable"
+    elif any(s == "unavailable" for s in statuses):
+        status = "partial"
+    elif any(s == "stale" for s in statuses):
+        status = "stale"
+    else:
+        status = "ok"
+    stale = any(m["stale"] or m["status"] == "unavailable" for m in metas.values())
+    reason = None
+    if status != "ok":
+        for m in metas.values():
+            if m["reason"]:
+                reason = m["reason"]
+                break
+        if reason is None:
+            reason = default_reason or {
+                "stale": ("one or more weather sources are older than their "
+                          "freshness window"),
+                "partial": "one or more weather sources are unavailable",
+                "unavailable": "no weather source is available",
+            }.get(status)
+    return status, stale, reason, metas
 
 
 def _load(name: str, url: str, params: dict | None, max_age_s: float,
@@ -547,39 +610,59 @@ def resolve_point(lat: float = DEFAULT_LAT, lon: float = DEFAULT_LON,
 
 def hourly_windows(lat: float = DEFAULT_LAT, lon: float = DEFAULT_LON,
                    *, force: bool = False, now: datetime | None = None) -> dict:
-    """Hourly forecast -> {"status", "windows": [...], freshness...}."""
+    """Hourly forecast -> {"status", "windows": [...], freshness, sources}.
+
+    The resolved point is a dependency: if its cached copy is stale, the whole
+    forecast result is marked stale too, and `sources` exposes each feed.
+    """
     point_res = resolve_point(lat, lon, force=force, now=now)
-    if point_res["status"] == "unavailable":
-        return {**point_res, "windows": []}
-    meta = point_res["point"]
-    url = meta.get("forecast_hourly_url")
-    if not url:
-        return _base_result("weather_hourly", None, HOURLY_TTL_S,
-                            source="NWS hourly forecast", now=now,
-                            status="unavailable",
-                            reason="point metadata has no forecastHourly URL")
-    params = {"grid": str(meta.get("grid_id")), "x": str(meta.get("grid_x")),
-              "y": str(meta.get("grid_y"))}
-    try:
-        payload = _load("weather_hourly", url, params, HOURLY_TTL_S, force)
-    except WeatherUnavailable as exc:
-        return _base_result("weather_hourly", params, HOURLY_TTL_S,
-                            source="NWS hourly forecast", now=now,
-                            status="unavailable", reason=str(exc))
-    result = _base_result("weather_hourly", params, HOURLY_TTL_S,
-                          source="NWS hourly forecast", now=now)
-    result["windows"] = normalize_hourly(
-        payload,
-        fetched_at=result["fetched_at"],
-        stale=result["stale"],
-        source=f"NWS grid {meta.get('grid_id')}/{meta.get('grid_x')},{meta.get('grid_y')} hourly",
-    )
-    result["point"] = {
+    sources: dict[str, dict] = {"points": point_res}
+    meta = point_res.get("point") or {}
+    point_public = {
         "grid_id": meta.get("grid_id"), "grid_x": meta.get("grid_x"),
         "grid_y": meta.get("grid_y"), "forecast_zone": meta.get("forecast_zone"),
         "timezone": meta.get("timezone"),
     }
-    return result
+
+    def finish(result: dict) -> dict:
+        status, stale, reason, metas = _aggregate(sources)
+        out = {**result, "status": status, "stale": stale, "reason": reason,
+               "sources": metas, "point": point_public}
+        for window in out.get("windows") or []:
+            window["stale"] = stale
+        return out
+
+    if point_res["status"] == "unavailable":
+        return finish({**point_res, "windows": []})
+
+    url = meta.get("forecast_hourly_url")
+    params = {"grid": str(meta.get("grid_id")), "x": str(meta.get("grid_x")),
+              "y": str(meta.get("grid_y"))}
+    if not url:
+        hourly = _base_result("weather_hourly", params, HOURLY_TTL_S,
+                              source="NWS hourly forecast", now=now,
+                              status="unavailable",
+                              reason="point metadata has no forecastHourly URL")
+        sources["hourly"] = hourly
+        return finish({**hourly, "windows": []})
+    try:
+        payload = _load("weather_hourly", url, params, HOURLY_TTL_S, force)
+    except WeatherUnavailable as exc:
+        hourly = _base_result("weather_hourly", params, HOURLY_TTL_S,
+                              source="NWS hourly forecast", now=now,
+                              status="unavailable", reason=str(exc))
+        sources["hourly"] = hourly
+        return finish({**hourly, "windows": []})
+    hourly = _base_result("weather_hourly", params, HOURLY_TTL_S,
+                          source="NWS hourly forecast", now=now)
+    hourly["windows"] = normalize_hourly(
+        payload,
+        fetched_at=hourly["fetched_at"],
+        stale=hourly["stale"],
+        source=f"NWS grid {meta.get('grid_id')}/{meta.get('grid_x')},{meta.get('grid_y')} hourly",
+    )
+    sources["hourly"] = hourly
+    return finish(hourly)
 
 
 def forecast_strip(lat: float = DEFAULT_LAT, lon: float = DEFAULT_LON, *,
@@ -617,12 +700,16 @@ def active_alerts(lat: float = DEFAULT_LAT, lon: float = DEFAULT_LON, *,
                   now: datetime | None = None) -> dict:
     """Active alerts for the point and (optionally) its forecast zone.
 
-    Empty is a normal, committed state: `alerts` is [] and `status` is "ok".
+    Point and zone results are BOTH merged (a zone can raise an alert that the
+    point response does not list) and deduplicated by alert id. Empty is a
+    normal state: `alerts` is [] and `status` is "ok". If one feed is down the
+    aggregate is "partial", never "ok"; `sources` exposes each feed.
     """
     params = _coord_params(lat, lon)
     url = f"{NWS_API_BASE}/alerts/active?point={params['lat']},{params['lon']}"
+    sources: dict[str, dict] = {}
     alerts: list[dict] = []
-    statuses: list[tuple[str, dict]] = []
+
     try:
         payload = _load("weather_alerts_point", url, params, ALERTS_TTL_S, force)
         point_result = _base_result("weather_alerts_point", params, ALERTS_TTL_S,
@@ -631,12 +718,12 @@ def active_alerts(lat: float = DEFAULT_LAT, lon: float = DEFAULT_LON, *,
             payload, fetched_at=point_result["fetched_at"],
             stale=point_result["stale"], source="NWS active alerts (point)")
         alerts.extend(point_result["alerts"])
-        statuses.append(("point", point_result))
+        sources["point"] = point_result
     except WeatherUnavailable as exc:
-        statuses.append(("point", _base_result(
+        sources["point"] = _base_result(
             "weather_alerts_point", params, ALERTS_TTL_S,
             source="NWS active alerts (point)", now=now,
-            status="unavailable", reason=str(exc))))
+            status="unavailable", reason=str(exc))
 
     zone_id = None
     if include_zone:
@@ -654,54 +741,44 @@ def active_alerts(lat: float = DEFAULT_LAT, lon: float = DEFAULT_LON, *,
                 payload, fetched_at=zone_result["fetched_at"],
                 stale=zone_result["stale"],
                 source=f"NWS active alerts (zone {zone_id})")
-            statuses.append(("zone", zone_result))
+            alerts.extend(zone_result["alerts"])
+            sources["zone"] = zone_result
         except WeatherUnavailable as exc:
-            statuses.append(("zone", _base_result(
+            sources["zone"] = _base_result(
                 "weather_alerts_zone", zparams, ALERTS_TTL_S,
                 source=f"NWS active alerts (zone {zone_id})", now=now,
-                status="unavailable", reason=str(exc))))
+                status="unavailable", reason=str(exc))
 
     # Deduplicate by alert id; a critical alert is often listed by both point
-    # and zone. Prefer the point copy for provenance consistency.
+    # and zone. Point copies are appended first, so they win on provenance.
     deduped: list[dict] = []
     seen: set[str] = set()
     for alert in alerts:
-        key = str(alert.get("id") or f"{alert.get('event')}|{alert.get('onset')}")
-        if key in seen:
+        dedupe_key = str(
+            alert.get("id")
+            or f"{alert.get('event')}|{alert.get('onset')}|{alert.get('expires')}")
+        if dedupe_key in seen:
             continue
-        seen.add(key)
+        seen.add(dedupe_key)
         deduped.append(alert)
 
-    if all(s["status"] == "unavailable" for _, s in statuses):
-        status = "unavailable"
-    elif any(s["status"] == "stale" for _, s in statuses):
-        status = "stale"
-    else:
-        status = "ok"
-    primary = statuses[0][1] if statuses else {}
-    out = {
+    status, stale, reason, metas = _aggregate(sources)
+    primary = next((m for m in metas.values() if m.get("fetched_at")), {})
+    feeds = "+".join(sorted(metas)) or "none"
+    return {
         "status": status,
         "alerts": deduped,
         "count": len(deduped),
         "by_severity": summarize_alerts(deduped),
-        "source": primary.get("source", "NWS active alerts"),
+        "source": f"NWS active alerts ({feeds})",
         "attribution": ATTRIBUTION,
         "fetched_at": primary.get("fetched_at"),
         "age_seconds": primary.get("age_seconds"),
-        "stale": status == "stale",
+        "stale": stale,
         "forecast_zone": zone_id,
-        "reason": None if status == "ok" else _first_reason(statuses),
+        "sources": metas,
+        "reason": reason,
     }
-    return out
-
-
-def _first_reason(statuses: list[tuple[str, dict]]) -> str | None:
-    for _, result in statuses:
-        if result.get("reason"):
-            return result["reason"]
-    if any(result.get("stale") for _, result in statuses):
-        return "an active-alert feed copy is older than the freshness window"
-    return None
 
 
 def summarize_alerts(alerts: list[dict]) -> dict:
@@ -712,29 +789,57 @@ def summarize_alerts(alerts: list[dict]) -> dict:
     return counts
 
 
+def nearest_station(stations: list[dict]) -> dict | None:
+    """Pick the station with the smallest normalized distance (None last).
+
+    NWS returns the gridpoint stations in an order that happens to be nearest
+    first, but that is not a contract. Sorting by the reported `distance_m` is
+    deterministic and survives a reordering of the response.
+    """
+    usable = [s for s in stations or [] if isinstance(s, dict)]
+    if not usable:
+        return None
+    return min(
+        usable,
+        key=lambda s: (s.get("distance_m") is None,
+                       s.get("distance_m") if s.get("distance_m") is not None else 0.0),
+    )
+
+
 def observation_stations(lat: float = DEFAULT_LAT, lon: float = DEFAULT_LON, *,
                          force: bool = False, now: datetime | None = None) -> dict:
-    """Observation stations near the grid, nearest first (NWS order)."""
+    """Observation stations near the grid, nearest first (sorted by distance)."""
     point_res = resolve_point(lat, lon, force=force, now=now)
+    sources: dict[str, dict] = {"points": point_res}
     if point_res["status"] == "unavailable":
-        return {**point_res, "stations": []}
+        status, stale, reason, metas = _aggregate(sources)
+        return {**point_res, "stations": [], "status": status, "stale": stale,
+                "reason": reason, "sources": metas}
     meta = point_res["point"]
     url = meta.get("observation_stations_url")
     if not url:
-        return _base_result("weather_stations", None, STATIONS_TTL_S,
-                            source="NWS observation stations", now=now,
-                            status="unavailable",
-                            reason="point metadata has no observationStations URL")
+        stations_res = _base_result("weather_stations", None, STATIONS_TTL_S,
+                                    source="NWS observation stations", now=now,
+                                    status="unavailable",
+                                    reason="point metadata has no observationStations URL")
+        sources["stations"] = stations_res
+        status, stale, reason, metas = _aggregate(sources)
+        return {**stations_res, "stations": [], "status": status, "stale": stale,
+                "reason": reason, "sources": metas}
     params = {"grid": str(meta.get("grid_id")), "x": str(meta.get("grid_x")),
               "y": str(meta.get("grid_y"))}
     try:
         payload = _load("weather_stations", url, params, STATIONS_TTL_S, force)
     except WeatherUnavailable as exc:
-        return _base_result("weather_stations", params, STATIONS_TTL_S,
-                            source="NWS observation stations", now=now,
-                            status="unavailable", reason=str(exc))
-    result = _base_result("weather_stations", params, STATIONS_TTL_S,
-                          source="NWS observation stations", now=now)
+        stations_res = _base_result("weather_stations", params, STATIONS_TTL_S,
+                                    source="NWS observation stations", now=now,
+                                    status="unavailable", reason=str(exc))
+        sources["stations"] = stations_res
+        status, stale, reason, metas = _aggregate(sources)
+        return {**stations_res, "stations": [], "status": status, "stale": stale,
+                "reason": reason, "sources": metas}
+    stations_res = _base_result("weather_stations", params, STATIONS_TTL_S,
+                                source="NWS observation stations", now=now)
     stations = []
     for feature in (payload or {}).get("features") or []:
         props = feature.get("properties") or {}
@@ -747,8 +852,13 @@ def observation_stations(lat: float = DEFAULT_LAT, lon: float = DEFAULT_LON, *,
             "timezone": props.get("timeZone"),
             "source": "NWS /gridpoints/stations",
         })
-    result["stations"] = stations
-    return result
+    stations_res["stations"] = stations
+    stations.sort(key=lambda s: (s["distance_m"] is None,
+                                 s["distance_m"] if s["distance_m"] is not None else 0.0))
+    sources["stations"] = stations_res
+    status, stale, reason, metas = _aggregate(sources)
+    return {**stations_res, "status": status, "stale": stale,
+            "reason": reason, "sources": metas}
 
 
 def latest_observation(lat: float = DEFAULT_LAT, lon: float = DEFAULT_LON, *,
@@ -762,12 +872,15 @@ def latest_observation(lat: float = DEFAULT_LAT, lon: float = DEFAULT_LON, *,
     """
     if station is None:
         stations = observation_stations(lat, lon, force=force, now=now)
-        if stations["status"] == "unavailable" or not stations.get("stations"):
-            return _base_result("weather_observation", None, OBSERVATION_TTL_S,
-                                source="NWS latest observation", now=now,
-                                status="unavailable",
-                                reason="no observation station could be resolved")
-        station = stations["stations"][0]["station_id"]
+        choice = nearest_station(stations.get("stations") or [])
+        if stations["status"] == "unavailable" or choice is None:
+            result = _base_result("weather_observation", None, OBSERVATION_TTL_S,
+                                  source="NWS latest observation", now=now,
+                                  status="unavailable",
+                                  reason="no observation station could be resolved")
+            result["sources"] = {"stations": _source_meta(stations)}
+            return result
+        station = choice["station_id"]
     params = {"station": str(station)}
     url = f"{NWS_API_BASE}/stations/{station}/observations/latest"
     try:
@@ -888,6 +1001,23 @@ def _has_thunder(window: dict) -> bool:
     return bool(_THUNDER_RE.search(str(window.get("short_forecast") or "")))
 
 
+def _winning_basis(evidence: list[dict], level: str) -> str:
+    """Which evidence produced the winning level: forecast, alert, or mixed.
+
+    The label must not claim a forecast basis when only an alert fired.
+    """
+    if level in ("none", "unknown"):
+        return "forecast"
+    factors = {e.get("factor") for e in evidence if e.get("level") == level}
+    if not factors:
+        return "forecast"
+    if factors == {"alert"}:
+        return "alert"
+    if "alert" in factors:
+        return "mixed"
+    return "forecast"
+
+
 def assess_leg(start, end, *, windows: list[dict] | None = None,
                alerts: list[dict] | None = None,
                thresholds: dict | None = None) -> dict:
@@ -924,14 +1054,32 @@ def assess_leg(start, end, *, windows: list[dict] | None = None,
         })
         reasons.append("no hourly forecast covers this window")
 
+    # ---- hazard field presence: missing data must not read as reassuring ----
+    precip_values = [(w.get("precip_probability_pct"), w) for w in overlapping
+                     if w.get("precip_probability_pct") is not None]
+    temps = [w.get("temperature_c") for w in overlapping
+             if w.get("temperature_c") is not None]
+    winds = [w.get("wind_speed_kph") for w in overlapping
+             if w.get("wind_speed_kph") is not None]
+    precip_token_windows = [
+        w for w in overlapping
+        if _PRECIP_TOKEN_RE.search(str(w.get("short_forecast") or ""))]
+    thunder = [w for w in overlapping if _has_thunder(w)]
+    gaps: list[str] = []
+    if not precip_values and not precip_token_windows:
+        gaps.append("precipitation probability")
+    if not temps:
+        gaps.append("temperature")
+    if not winds:
+        gaps.append("wind")
+
     # precipitation probability: worst overlapping hour
-    precip = [(w.get("precip_probability_pct"), w) for w in overlapping
-              if w.get("precip_probability_pct") is not None]
-    if precip:
-        peak, peak_window = max(precip, key=lambda item: item[0])
+    if precip_values:
+        peak, peak_window = max(precip_values, key=lambda item: item[0])
         level = _band(peak, th["precip_probability_pct"])
         if level != "none":
-            detail = f"{peak:.0f}% chance of precipitation during this window"
+            detail = (f"forecast shows a {peak:.0f}% chance of precipitation "
+                      "during this window")
             evidence.append({
                 "factor": "precip_probability", "level": level,
                 "value": peak, "unit": "percent",
@@ -940,6 +1088,17 @@ def assess_leg(start, end, *, windows: list[dict] | None = None,
                 "window_end": peak_window.get("end"),
             })
             reasons.append(detail)
+    elif precip_token_windows:
+        # The forecast names precipitation but carries no probability: treat it
+        # conservatively rather than dropping to "no risk".
+        sample = precip_token_windows[0].get("short_forecast")
+        detail = (f"forecast mentions precipitation ({sample}) but no "
+                  "probability is reported")
+        evidence.append({
+            "factor": "precip_token", "level": "low", "value": sample,
+            "detail": detail, "basis": "forecast",
+        })
+        reasons.append(detail)
     else:
         evidence.append({
             "factor": "precip_probability", "level": "unknown",
@@ -948,7 +1107,6 @@ def assess_leg(start, end, *, windows: list[dict] | None = None,
         })
 
     # thunderstorm token
-    thunder = [w for w in overlapping if _has_thunder(w)]
     if thunder:
         sample = thunder[0].get("short_forecast")
         detail = f"thunderstorms are mentioned in the forecast ({sample})"
@@ -960,11 +1118,10 @@ def assess_leg(start, end, *, windows: list[dict] | None = None,
         reasons.append(detail)
 
     # heat / cold
-    temps = [w.get("temperature_c") for w in overlapping
-             if w.get("temperature_c") is not None]
     heat_level = _band(max(temps) if temps else None, th["temperature_high_c"])
     if heat_level != "none":
-        detail = f"temperature is around {max(temps):.0f} °C during this window"
+        detail = (f"forecast temperature is around {max(temps):.0f} °C "
+                  "during this window")
         evidence.append({
             "factor": "heat", "level": heat_level, "value": _round(max(temps), 1),
             "unit": "degC", "detail": detail, "basis": "forecast",
@@ -973,7 +1130,8 @@ def assess_leg(start, end, *, windows: list[dict] | None = None,
     cold_level = _band(min(temps) if temps else None, th["temperature_low_c"],
                        reverse=True)
     if cold_level != "none":
-        detail = f"temperature drops to about {min(temps):.0f} °C during this window"
+        detail = (f"forecast temperature drops to about {min(temps):.0f} °C "
+                  "during this window")
         evidence.append({
             "factor": "cold", "level": cold_level, "value": _round(min(temps), 1),
             "unit": "degC", "detail": detail, "basis": "forecast",
@@ -981,11 +1139,10 @@ def assess_leg(start, end, *, windows: list[dict] | None = None,
         reasons.append(detail)
 
     # wind
-    winds = [w.get("wind_speed_kph") for w in overlapping
-             if w.get("wind_speed_kph") is not None]
     wind_level = _band(max(winds) if winds else None, th["wind_kph"])
     if wind_level != "none":
-        detail = f"wind is around {max(winds):.0f} km/h during this window"
+        detail = (f"forecast wind is around {max(winds):.0f} km/h during this "
+                  "window")
         evidence.append({
             "factor": "wind", "level": wind_level, "value": _round(max(winds), 1),
             "unit": "km/h", "detail": detail, "basis": "forecast",
@@ -1016,6 +1173,7 @@ def assess_leg(start, end, *, windows: list[dict] | None = None,
         *([e["level"] for e in evidence if e["level"] != "unknown"] or ["none"]),
         *alert_levels,
     )
+    missing_fields = ", ".join(gaps)
     if not overlapping and level == "none":
         # No forecast covers the window and no alert applies: the honest answer
         # is "unknown", not the reassuring "none".
@@ -1027,8 +1185,30 @@ def assess_leg(start, end, *, windows: list[dict] | None = None,
             "overlap_count": 0, "basis": "forecast",
             "start": _iso(a), "end": _iso(b), "thresholds": th,
         }
+    if level == "none" and gaps:
+        # A mild-but-present signal is not enough when required fields are
+        # missing; do not present missing data as "no risk".
+        gaps_detail = (f"forecast hours for this window are missing: "
+                       f"{missing_fields}")
+        evidence.append({"factor": "data_gap", "level": "unknown",
+                         "detail": gaps_detail, "basis": "forecast"})
+        return {
+            "status": "unknown", "level": "unknown",
+            "label": LEVEL_LABELS["unknown"],
+            "reasons": [gaps_detail],
+            "evidence": evidence, "summary": SUMMARY_BY_LEVEL["unknown"],
+            "overlap_count": len(overlapping), "basis": "forecast",
+            "start": _iso(a), "end": _iso(b), "thresholds": th,
+        }
+    if gaps:
+        evidence.append({
+            "factor": "data_gap", "level": "unknown",
+            "detail": f"some forecast hours are missing: {missing_fields}",
+            "basis": "forecast",
+        })
     if not reasons:
         reasons = [SUMMARY_BY_LEVEL[level]]
+    basis = _winning_basis(evidence, level)
     return {
         "status": "ok",
         "level": level,
@@ -1037,7 +1217,7 @@ def assess_leg(start, end, *, windows: list[dict] | None = None,
         "evidence": evidence,
         "summary": SUMMARY_BY_LEVEL.get(level, SUMMARY_BY_LEVEL["none"]),
         "overlap_count": len(overlapping),
-        "basis": "forecast",
+        "basis": basis,
         "start": _iso(a),
         "end": _iso(b),
         "thresholds": th,
@@ -1057,20 +1237,19 @@ def plan_risk(legs: list[dict], lat: float = DEFAULT_LAT, lon: float = DEFAULT_L
     supplied they are fetched through the cache layer; supplying them keeps the
     whole call pure and offline-testable.
     """
-    provenance: dict = {"status": "ok", "source": None, "fetched_at": None,
-                        "age_seconds": None, "stale": False, "reason": None}
+    sources: dict[str, dict] = {}
     if windows is None:
         fetched = hourly_windows(lat, lon, force=force, now=now)
         windows = fetched.get("windows") or []
-        provenance = {k: fetched.get(k) for k in
-                      ("status", "source", "attribution", "fetched_at",
-                       "age_seconds", "stale", "reason")}
+        sources["forecast"] = fetched
     if alerts is None:
         fetched_alerts = active_alerts(lat, lon, force=force, now=now)
         alerts = fetched_alerts.get("alerts") or []
-        if provenance["status"] == "ok" and fetched_alerts["status"] != "ok":
-            provenance["status"] = fetched_alerts["status"]
-            provenance["reason"] = provenance.get("reason") or fetched_alerts.get("reason")
+        sources["alerts"] = fetched_alerts
+    if sources:
+        agg_status, agg_stale, agg_reason, metas = _aggregate(sources)
+    else:
+        agg_status, agg_stale, agg_reason, metas = "ok", False, None, {}
 
     results: list[dict] = []
     for index, leg in enumerate(legs or []):
@@ -1082,17 +1261,20 @@ def plan_risk(legs: list[dict], lat: float = DEFAULT_LAT, lon: float = DEFAULT_L
         overall = _max_level(overall, entry.get("level", "none"))
     if any(e["status"] == "unknown" for e in results) and overall == "none":
         overall = "unknown"
+    source = ((sources.get("forecast") or {}).get("source")
+              or (sources.get("alerts") or {}).get("source"))
     return {
-        "status": provenance["status"],
+        "status": agg_status,
         "level": overall,
         "label": LEVEL_LABELS.get(overall, "Unknown"),
         "legs": results,
-        "source": provenance.get("source"),
+        "source": source,
         "attribution": ATTRIBUTION,
-        "fetched_at": provenance.get("fetched_at"),
-        "age_seconds": provenance.get("age_seconds"),
-        "stale": bool(provenance.get("stale")),
-        "reason": provenance.get("reason"),
+        "fetched_at": ((sources.get("forecast") or {}).get("fetched_at")),
+        "age_seconds": ((sources.get("forecast") or {}).get("age_seconds")),
+        "stale": bool(agg_stale),
+        "reason": agg_reason,
+        "sources": metas,
         "thresholds": _thresholds(thresholds),
     }
 

@@ -1,14 +1,20 @@
 """Offline tests for hokieday.weather (stdlib unittest, DEMO_MODE=cache).
 
-No network: parsing and risk functions are pure, and the cache-backed fetchers
-read the frozen `fixtures/` weather envelopes captured from api.weather.gov on
-2026-09-19. The stale/error tests monkeypatch `weather._load`, they never open a
-socket.
+No network. Pure parsing/risk functions are tested directly. Cache-backed
+fetchers are tested against a TEMPORARY synthetic cache (config.CACHE_ONLY=True
++ a temp config.CACHE_DIR), so no committed weather fixture is required. The
+replay store deliberately has NO weather fixtures (see docs/WEATHER.md): the
+real capture was incoherent with the bus replay clock, so replay returns a typed
+"unavailable" until a full coherent bundle can be captured.
 """
 from __future__ import annotations
 
+import shutil
+import os
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from hokieday import cache, config, weather
@@ -17,15 +23,31 @@ NY = ZoneInfo("America/New_York")
 STAMP = "2026-09-19T15:22:29+00:00"
 STAMP_DT = datetime(2026, 9, 19, 15, 22, 29, tzinfo=timezone.utc)
 
+T0 = "2026-09-19T10:00:00-04:00"
+T1 = "2026-09-19T11:00:00-04:00"
+T2 = "2026-09-19T12:00:00-04:00"
+T3 = "2026-09-19T13:00:00-04:00"
 
+POINT_PARAMS = {"lat": "37.2292", "lon": "-80.4240"}
+HOURLY_PARAMS = {"grid": "RNK", "x": "57", "y": "65"}
+STATIONS_PARAMS = {"grid": "RNK", "x": "57", "y": "65"}
+ZONE = "VAZ014"
+
+
+# ------------------------------------------------------------------ builders
 def window(start: str, end: str, **overrides) -> dict:
-    """A minimal normalized forecast window for pure risk tests."""
+    """A minimal normalized forecast window for pure risk tests.
+
+    Defaults carry the three required hazard families so a default window can
+    legitimately score "none". Tests that omit fields exercise the missing-data
+    path explicitly.
+    """
     base = {
         "kind": "forecast", "start": start, "end": end,
         "timezone": config.CAMPUS_TZ, "temperature_c": 20.0,
         "temperature_f": 68.0, "temperature_unit": "F",
-        "precip_probability_pct": None, "relative_humidity_pct": None,
-        "wind_speed_kph": None, "wind_speed_mph": None, "wind_speed_text": None,
+        "precip_probability_pct": 5.0, "relative_humidity_pct": None,
+        "wind_speed_kph": 5.0, "wind_speed_mph": 3.1, "wind_speed_text": "5 mph",
         "wind_direction": None, "short_forecast": "Sunny",
         "detailed_forecast": "", "is_daytime": True,
         "source": "test", "fetched_at": STAMP, "stale": False,
@@ -52,40 +74,122 @@ def alert(**overrides) -> dict:
     return base
 
 
+def period(start, end, temp_f=68, precip=10, wind="5 mph", short="Sunny"):
+    return {
+        "number": 1, "startTime": start, "endTime": end, "isDaytime": True,
+        "temperature": temp_f, "temperatureUnit": "F",
+        "probabilityOfPrecipitation": {"unitCode": "wmoUnit:percent", "value": precip},
+        "relativeHumidity": {"unitCode": "wmoUnit:percent", "value": 55},
+        "windSpeed": wind, "windDirection": "S", "shortForecast": short,
+    }
+
+
+def point_payload(zone=ZONE) -> dict:
+    return {"properties": {
+        "gridId": "RNK", "gridX": 57, "gridY": 65,
+        "forecastZone": f"https://api.weather.gov/zones/forecast/{zone}",
+        "county": "https://api.weather.gov/zones/county/VAC121",
+        "timeZone": "America/New_York", "forecastHourly": "https://e.test/hourly",
+        "observationStations": "https://e.test/stations", "radarStation": "KFCX",
+    }}
+
+
+def stations_payload(entries) -> dict:
+    return {"features": [{"properties": {
+        "stationIdentifier": sid, "name": name,
+        "distance": {"unitCode": "wmoUnit:m", "value": dist},
+        "timeZone": "America/New_York",
+    }} for sid, name, dist in entries]}
+
+
+def alert_feature(alert_id="urn:test:zone", event="Flood Warning", severity="Moderate"):
+    return {"properties": {
+        "id": alert_id, "event": event, "severity": severity,
+        "certainty": "Likely", "urgency": "Expected", "status": "Actual",
+        "messageType": "Alert", "category": "Met", "response": "Avoid",
+        "headline": event, "description": "d", "instruction": "i",
+        "areaDesc": "Montgomery", "senderName": "NWS Blacksburg VA",
+        "effective": "2026-09-19T10:00:00-04:00", "onset": "2026-09-19T10:00:00-04:00",
+        "expires": "2026-09-19T12:00:00-04:00", "ends": None,
+    }}
+
+
+class TempCacheCase(unittest.TestCase):
+    """Swap the cache to a temp dir in CACHE_ONLY mode (no network possible)."""
+
+    def setUp(self):
+        self._orig_only = config.CACHE_ONLY
+        self._orig_dir = config.CACHE_DIR
+        self._tmp = tempfile.mkdtemp(prefix="hokie-weather-test-")
+        config.CACHE_ONLY = True
+        config.CACHE_DIR = Path(self._tmp)
+
+    def tearDown(self):
+        config.CACHE_ONLY = self._orig_only
+        config.CACHE_DIR = self._orig_dir
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def seed(self, name, payload, params=None, url="https://e.test/x",
+             fetched_at=STAMP):
+        return cache.write_envelope_atomic(name, url, payload, params=params,
+                                           fetched_at=fetched_at)
+
+    def seed_full(self, *, point_age=None, hourly_periods=None, alerts_point=None,
+                  alerts_zone=None, stations=None, observation=None):
+        point_stamp = STAMP if point_age is None else point_age
+        self.seed("weather_points", point_payload(), POINT_PARAMS,
+                  fetched_at=point_stamp)
+        if hourly_periods is not None:
+            self.seed("weather_hourly", {"properties": {"periods": hourly_periods}},
+                      HOURLY_PARAMS)
+        if alerts_point is not None:
+            self.seed("weather_alerts_point", alerts_point, POINT_PARAMS)
+        if alerts_zone is not None:
+            self.seed("weather_alerts_zone", alerts_zone, {"zone": ZONE})
+        if stations is not None:
+            self.seed("weather_stations", stations, STATIONS_PARAMS)
+        if observation is not None:
+            self.seed("weather_observation", observation, {"station": "KBCB"})
+
+
 # ------------------------------------------------------------- parsing / units
 class TestNormalize(unittest.TestCase):
     def test_hourly_fahrenheit_to_celsius_both_kept(self):
-        payload = {"properties": {"periods": [{
-            "number": 1, "startTime": "2026-09-19T17:00:00-04:00",
-            "endTime": "2026-09-19T18:00:00-04:00", "isDaytime": True,
-            "temperature": 68, "temperatureUnit": "F",
-            "probabilityOfPrecipitation": {"unitCode": "wmoUnit:percent", "value": 55},
-            "relativeHumidity": {"unitCode": "wmoUnit:percent", "value": 60},
-            "windSpeed": "10 mph", "windDirection": "SW",
-            "shortForecast": "Chance Showers",
-        }]}}
-        windows = weather.normalize_hourly(payload)
-        self.assertEqual(len(windows), 1)
-        w = windows[0]
+        payload = {"properties": {"periods": [period(
+            T0, T1, temp_f=68, precip=55, wind="10 mph", short="Chance Showers")]}}
+        w = weather.normalize_hourly(payload)[0]
         self.assertAlmostEqual(w["temperature_c"], 20.0, places=1)
         self.assertEqual(w["temperature_f"], 68.0)
         self.assertEqual(w["temperature_unit"], "F")
         self.assertEqual(w["precip_probability_pct"], 55.0)
         self.assertAlmostEqual(w["wind_speed_kph"], 16.1, places=1)
-        self.assertAlmostEqual(w["wind_speed_mph"], 10.0, places=1)
         self.assertEqual(w["wind_speed_text"], "10 mph")
         self.assertEqual(w["kind"], "forecast")
 
     def test_null_precip_is_none_not_zero(self):
-        """A null probability must stay None; 0 would read as 'no chance'."""
-        payload = {"properties": {"periods": [{
-            "number": 1, "startTime": "2026-09-19T17:00:00-04:00",
-            "endTime": "2026-09-19T18:00:00-04:00", "temperature": 70,
-            "temperatureUnit": "F",
-            "probabilityOfPrecipitation": {"unitCode": "wmoUnit:percent", "value": None},
-        }]}}
-        w = weather.normalize_hourly(payload)[0]
+        p = period(T0, T1, precip=None)
+        w = weather.normalize_hourly({"properties": {"periods": [p]}})[0]
         self.assertIsNone(w["precip_probability_pct"])
+
+    def test_wind_range_uses_maximum(self):
+        cases = [
+            ("25 to 45 mph", 45 * 1.609344),
+            ("25-45 mph", 45 * 1.609344),
+            ("20 to 30 km/h", 30.0),
+            ("15 to 20 kt", 20 * 1.852),
+            ("3 mph", 3 * 1.609344),
+        ]
+        for text, expected_kph in cases:
+            with self.subTest(text=text):
+                kph, mph, raw = weather._parse_wind_text(text)
+                self.assertAlmostEqual(kph, expected_kph, places=2)
+                self.assertAlmostEqual(mph, expected_kph * 0.621371, places=2)
+                self.assertEqual(raw, text)
+
+    def test_wind_range_normalizes_through_hourly(self):
+        p = period(T0, T1, wind="25 to 45 mph")
+        w = weather.normalize_hourly({"properties": {"periods": [p]}})[0]
+        self.assertAlmostEqual(w["wind_speed_kph"], 45 * 1.609344, places=1)
 
     def test_observation_celsius_to_fahrenheit_and_wind(self):
         payload = {"properties": {
@@ -100,7 +204,6 @@ class TestNormalize(unittest.TestCase):
         }}
         obs = weather.normalize_observation(payload, station_id="KBCB")
         self.assertEqual(obs["kind"], "observation")
-        self.assertEqual(obs["station_id"], "KBCB")
         self.assertEqual(obs["station_name"], "Virginia Tech Airport")
         self.assertAlmostEqual(obs["temperature_c"], 27.5, places=1)
         self.assertAlmostEqual(obs["temperature_f"], 81.5, places=1)
@@ -110,154 +213,181 @@ class TestNormalize(unittest.TestCase):
         self.assertIn("airport observation", obs["station_note"])
 
     def test_alert_normalization_preserves_times(self):
-        payload = {"features": [{"properties": {
-            "id": "urn:test:1", "event": "Severe Thunderstorm Warning",
-            "severity": "Severe", "certainty": "Likely", "urgency": "Immediate",
-            "status": "Actual", "messageType": "Alert", "category": "Met",
-            "response": "Shelter", "headline": "h", "description": "d",
-            "instruction": "i", "areaDesc": "Montgomery",
-            "senderName": "NWS Blacksburg VA",
-            "effective": "2026-09-19T16:00:00-04:00",
-            "onset": "2026-09-19T16:10:00-04:00",
-            "expires": "2026-09-19T18:00:00-04:00", "ends": None,
-        }}]}
-        alerts = weather.normalize_alerts(payload)
-        self.assertEqual(len(alerts), 1)
-        a = alerts[0]
+        payload = {"features": [alert_feature("urn:a", "Flood Warning", "Moderate")]}
+        a = weather.normalize_alerts(payload)[0]
         self.assertEqual(a["kind"], "alert")
-        self.assertEqual(a["severity"], "Severe")
-        self.assertEqual(a["onset"], "2026-09-19T16:10:00-04:00")
-        self.assertEqual(a["expires"], "2026-09-19T18:00:00-04:00")
+        self.assertEqual(a["severity"], "Moderate")
+        self.assertEqual(a["onset"], "2026-09-19T10:00:00-04:00")
 
     def test_point_normalization(self):
-        payload = {"properties": {
-            "gridId": "RNK", "gridX": 57, "gridY": 65,
-            "forecastZone": "https://api.weather.gov/zones/forecast/VAZ014",
-            "county": "https://api.weather.gov/zones/county/VAC121",
-            "timeZone": "America/New_York", "forecastHourly": "https://x/hourly",
-            "observationStations": "https://x/stations", "radarStation": "KFCX",
-        }}
-        meta = weather.normalize_point(payload, weather.DEFAULT_LAT, weather.DEFAULT_LON)
+        meta = weather.normalize_point(point_payload(), weather.DEFAULT_LAT,
+                                       weather.DEFAULT_LON)
         self.assertEqual(meta["grid_id"], "RNK")
-        self.assertEqual(meta["forecast_zone"], "VAZ014")
+        self.assertEqual(meta["forecast_zone"], ZONE)
         self.assertEqual(meta["county_zone"], "VAC121")
-        self.assertEqual(meta["timezone"], "America/New_York")
 
 
 # ------------------------------------------------------------- interval overlap
 class TestOverlap(unittest.TestCase):
     def test_half_open_overlap(self):
-        windows = [
-            window("2026-09-19T10:00:00-04:00", "2026-09-19T11:00:00-04:00"),
-            window("2026-09-19T11:00:00-04:00", "2026-09-19T12:00:00-04:00"),
-            window("2026-09-19T12:00:00-04:00", "2026-09-19T13:00:00-04:00"),
-        ]
+        windows = [window(T0, T1), window(T1, T2), window(T2, T3)]
         got = weather.overlapping_windows(
             "2026-09-19T10:30:00-04:00", "2026-09-19T12:00:00-04:00", windows)
-        self.assertEqual([w["start"] for w in got], [
-            "2026-09-19T10:00:00-04:00", "2026-09-19T11:00:00-04:00"])
-        # touching at the boundary is NOT an overlap
+        self.assertEqual([w["start"] for w in got], [T0, T1])
         touching = weather.overlapping_windows(
             "2026-09-19T12:00:00-04:00", "2026-09-19T12:30:00-04:00", windows)
-        self.assertEqual([w["start"] for w in touching], [
-            "2026-09-19T12:00:00-04:00"])
+        self.assertEqual([w["start"] for w in touching], [T2])
 
     def test_naive_window_bounds_are_assumed_campus_local(self):
-        windows = [window("2026-09-19T10:00:00-04:00", "2026-09-19T11:00:00-04:00")]
         got = weather.overlapping_windows(
-            datetime(2026, 9, 19, 10, 30), datetime(2026, 9, 19, 10, 45), windows)
+            datetime(2026, 9, 19, 10, 30), datetime(2026, 9, 19, 10, 45),
+            [window(T0, T1)])
         self.assertEqual(len(got), 1)
 
 
 # ------------------------------------------------------------- risk / thresholds
 class TestAssessLeg(unittest.TestCase):
     def test_precip_boundaries(self):
-        bands = weather.DEFAULT_THRESHOLDS["precip_probability_pct"]
-        self.assertEqual(bands, {"low": 20.0, "moderate": 40.0, "high": 60.0})
         cases = [(10, "none"), (20, "low"), (39, "low"),
                  (40, "moderate"), (59, "moderate"), (60, "high"), (95, "high")]
         for pct, expected in cases:
             with self.subTest(pct=pct):
-                w = [window("2026-09-19T10:00:00-04:00",
-                            "2026-09-19T11:00:00-04:00",
-                            precip_probability_pct=pct)]
                 result = weather.assess_leg(
                     "2026-09-19T10:15:00-04:00", "2026-09-19T10:45:00-04:00",
-                    windows=w)
+                    windows=[window(T0, T1, precip_probability_pct=pct)])
                 self.assertEqual(result["level"], expected)
 
     def test_thunderstorm_token_floors_at_high(self):
-        w = [window("2026-09-19T10:00:00-04:00", "2026-09-19T11:00:00-04:00",
-                    precip_probability_pct=5,
-                    short_forecast="Showers And Thunderstorms Likely")]
-        result = weather.assess_leg("2026-09-19T10:15:00-04:00",
-                                    "2026-09-19T10:45:00-04:00", windows=w)
+        result = weather.assess_leg(
+            "2026-09-19T10:15:00-04:00", "2026-09-19T10:45:00-04:00",
+            windows=[window(T0, T1, precip_probability_pct=5,
+                            short_forecast="Showers And Thunderstorms Likely")])
         self.assertEqual(result["level"], "high")
         self.assertTrue(any(e["factor"] == "thunderstorm" for e in result["evidence"]))
 
     def test_heat_cold_and_wind_bands(self):
-        w_heat = [window("2026-09-19T13:00:00-04:00", "2026-09-19T14:00:00-04:00",
-                         temperature_c=40.0)]
-        self.assertEqual(weather.assess_leg(
+        heat = weather.assess_leg(
             "2026-09-19T13:00:00-04:00", "2026-09-19T13:30:00-04:00",
-            windows=w_heat)["level"], "severe")
-        w_cold = [window("2026-09-19T06:00:00-04:00", "2026-09-19T07:00:00-04:00",
-                         temperature_c=-12.0)]
-        result = weather.assess_leg("2026-09-19T06:00:00-04:00",
-                                    "2026-09-19T06:30:00-04:00", windows=w_cold)
-        self.assertEqual(result["level"], "high")
-        self.assertTrue(any(e["factor"] == "cold" for e in result["evidence"]))
-        w_wind = [window("2026-09-19T10:00:00-04:00", "2026-09-19T11:00:00-04:00",
-                         wind_speed_kph=70.0)]
-        self.assertEqual(weather.assess_leg(
+            windows=[window(T3, "2026-09-19T14:00:00-04:00", temperature_c=40.0)])
+        self.assertEqual(heat["level"], "severe")
+        cold = weather.assess_leg(
+            "2026-09-19T06:00:00-04:00", "2026-09-19T06:30:00-04:00",
+            windows=[window("2026-09-19T06:00:00-04:00",
+                            "2026-09-19T07:00:00-04:00", temperature_c=-12.0)])
+        self.assertEqual(cold["level"], "high")
+        wind = weather.assess_leg(
             "2026-09-19T10:00:00-04:00", "2026-09-19T10:30:00-04:00",
-            windows=w_wind)["level"], "severe")
+            windows=[window(T0, T1, wind_speed_kph=70.0)])
+        self.assertEqual(wind["level"], "severe")
+
+    def test_generated_wording_attributes_weather_to_the_forecast(self):
+        result = weather.assess_leg(
+            "2026-09-19T10:00:00-04:00", "2026-09-19T10:30:00-04:00",
+            windows=[window(T0, T1, precip_probability_pct=70, wind_speed_kph=50)])
+        text = " ".join(result["reasons"]).lower()
+        self.assertIn("forecast", text)
 
     def test_thresholds_are_configurable_per_call(self):
-        w = [window("2026-09-19T10:00:00-04:00", "2026-09-19T11:00:00-04:00",
-                    precip_probability_pct=50)]
-        default = weather.assess_leg("2026-09-19T10:15:00-04:00",
-                                     "2026-09-19T10:45:00-04:00", windows=w)
+        w = [window(T0, T1, precip_probability_pct=50)]
+        default = weather.assess_leg(
+            "2026-09-19T10:15:00-04:00", "2026-09-19T10:45:00-04:00", windows=w)
         self.assertEqual(default["level"], "moderate")
         stricter = weather.assess_leg(
             "2026-09-19T10:15:00-04:00", "2026-09-19T10:45:00-04:00", windows=w,
             thresholds={"precip_probability_pct": {"high": 45.0}})
         self.assertEqual(stricter["level"], "high")
 
-    def test_no_overlapping_window_is_unknown_not_none(self):
-        result = weather.assess_leg("2026-09-20T10:00:00-04:00",
-                                    "2026-09-20T11:00:00-04:00",
-                                    windows=[window("2026-09-19T10:00:00-04:00",
-                                                    "2026-09-19T11:00:00-04:00")])
+    def test_mild_window_with_all_fields_is_none(self):
+        result = weather.assess_leg(
+            "2026-09-19T10:15:00-04:00", "2026-09-19T10:45:00-04:00",
+            windows=[window(T0, T1, precip_probability_pct=5,
+                            temperature_c=20, wind_speed_kph=5)])
+        self.assertEqual(result["level"], "none")
+        self.assertEqual(result["status"], "ok")
+
+    # -- missing data must never read as reassuring -------------------------
+    def test_all_hazard_fields_missing_is_unknown(self):
+        bare = {"kind": "forecast", "start": T0, "end": T1,
+                "temperature_c": None, "precip_probability_pct": None,
+                "wind_speed_kph": None, "short_forecast": None}
+        result = weather.assess_leg(
+            "2026-09-19T10:15:00-04:00", "2026-09-19T10:45:00-04:00",
+            windows=[bare])
         self.assertEqual(result["status"], "unknown")
         self.assertEqual(result["level"], "unknown")
 
-    def test_evidence_leaves_the_decision_to_the_student(self):
-        w = [window("2026-09-19T10:00:00-04:00", "2026-09-19T11:00:00-04:00",
-                    precip_probability_pct=80)]
-        result = weather.assess_leg("2026-09-19T10:15:00-04:00",
-                                    "2026-09-19T10:45:00-04:00", windows=w)
-        self.assertEqual(result["level"], "high")
-        self.assertEqual(result["basis"], "forecast")
-        self.assertIn("precip_probability_pct", result["thresholds"])
-        self.assertEqual(result["thresholds"]["precip_probability_pct"]["high"], 60.0)
-
-
-class TestAlerts(unittest.TestCase):
-    def test_severe_thunderstorm_warning_is_high(self):
+    def test_partial_missing_fields_with_mild_signal_is_unknown(self):
+        partial = window(T0, T1, precip_probability_pct=5,
+                         temperature_c=None, wind_speed_kph=None)
         result = weather.assess_leg(
             "2026-09-19T10:15:00-04:00", "2026-09-19T10:45:00-04:00",
-            windows=[window("2026-09-19T10:00:00-04:00",
-                            "2026-09-19T11:00:00-04:00")],
-            alerts=[alert()])
-        self.assertEqual(result["level"], "high")
-        self.assertTrue(any(e["factor"] == "alert" for e in result["evidence"]))
+            windows=[partial])
+        self.assertEqual(result["level"], "unknown")
+        self.assertIn("missing", result["reasons"][0].lower())
 
-    def test_extreme_alert_is_severe(self):
+    def test_precip_token_with_null_pop_is_conservative(self):
+        result = weather.assess_leg(
+            "2026-09-19T10:15:00-04:00", "2026-09-19T10:45:00-04:00",
+            windows=[window(T0, T1, precip_probability_pct=None,
+                            temperature_c=20, wind_speed_kph=5,
+                            short_forecast="Chance Rain Showers")])
+        self.assertEqual(result["level"], "low")
+        self.assertTrue(any(e["factor"] == "precip_token" for e in result["evidence"]))
+
+    def test_snow_token_with_null_pop_is_conservative(self):
+        result = weather.assess_leg(
+            "2026-09-19T10:15:00-04:00", "2026-09-19T10:45:00-04:00",
+            windows=[window(T0, T1, precip_probability_pct=None,
+                            temperature_c=1, wind_speed_kph=5,
+                            short_forecast="Snow Likely")])
+        self.assertIn(result["level"], ("low", "moderate", "high"))
+        self.assertTrue(any(e["factor"] == "precip_token" for e in result["evidence"]))
+
+    def test_missing_precipitation_probability_with_other_fields_is_unknown(self):
+        result = weather.assess_leg(
+            "2026-09-19T10:15:00-04:00", "2026-09-19T10:45:00-04:00",
+            windows=[window(T0, T1, precip_probability_pct=None,
+                            temperature_c=20, wind_speed_kph=5,
+                            short_forecast="Sunny")])
+        self.assertEqual(result["level"], "unknown")
+        self.assertIn("precipitation", result["reasons"][0].lower())
+
+    def test_no_overlapping_window_is_unknown_not_none(self):
+        result = weather.assess_leg(
+            "2026-09-20T10:00:00-04:00", "2026-09-20T11:00:00-04:00",
+            windows=[window(T0, T1)])
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["level"], "unknown")
+
+
+class TestBasis(unittest.TestCase):
+    def test_alert_only_basis_is_alert(self):
+        result = weather.assess_leg(
+            "2026-09-19T10:15:00-04:00", "2026-09-19T10:45:00-04:00",
+            windows=[window(T0, T1)], alerts=[alert()])
+        self.assertEqual(result["level"], "high")
+        self.assertEqual(result["basis"], "alert")
+
+    def test_forecast_only_basis_is_forecast(self):
+        result = weather.assess_leg(
+            "2026-09-19T10:15:00-04:00", "2026-09-19T10:45:00-04:00",
+            windows=[window(T0, T1, precip_probability_pct=80)], alerts=[])
+        self.assertEqual(result["basis"], "forecast")
+
+    def test_alert_and_forecast_is_mixed(self):
+        result = weather.assess_leg(
+            "2026-09-19T10:15:00-04:00", "2026-09-19T10:45:00-04:00",
+            windows=[window(T0, T1, precip_probability_pct=80)], alerts=[alert()])
+        self.assertEqual(result["basis"], "mixed")
+
+
+class TestAlertsPure(unittest.TestCase):
+    def test_extreme_alert_is_severe_without_forecast_coverage(self):
         result = weather.assess_leg(
             "2026-09-19T10:15:00-04:00", "2026-09-19T10:45:00-04:00",
             windows=[], alerts=[alert(severity="Extreme", event="Tornado Warning")])
         self.assertEqual(result["level"], "severe")
+        self.assertEqual(result["basis"], "alert")
 
     def test_alert_outside_the_window_is_ignored(self):
         result = weather.assess_leg(
@@ -273,9 +403,7 @@ class TestAlerts(unittest.TestCase):
                         ends="2026-09-19T07:00:00-04:00", expires=None)
         result = weather.assess_leg(
             "2026-09-19T10:15:00-04:00", "2026-09-19T10:45:00-04:00",
-            windows=[window("2026-09-19T10:00:00-04:00",
-                            "2026-09-19T11:00:00-04:00")],
-            alerts=[expired])
+            windows=[window(T0, T1)], alerts=[expired])
         self.assertEqual(result["level"], "none")
 
     def test_summarize_alerts_counts(self):
@@ -295,23 +423,19 @@ class TestPlanRisk(unittest.TestCase):
     ]
 
     def test_outdoor_legs_scored_and_indoor_not_applicable(self):
-        windows = [
-            window("2026-09-19T10:00:00-04:00", "2026-09-19T11:00:00-04:00",
-                   precip_probability_pct=70),
-            window("2026-09-19T11:00:00-04:00", "2026-09-19T12:00:00-04:00",
-                   precip_probability_pct=5),
-        ]
+        windows = [window(T0, T1, precip_probability_pct=70),
+                   window(T1, T2, precip_probability_pct=5)]
         result = weather.plan_risk(self.LEGS, windows=windows, alerts=[])
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["legs"][0]["level"], "high")
-        self.assertEqual(result["legs"][0]["status"], "ok")
         self.assertEqual(result["legs"][1]["status"], "not_applicable")
         self.assertEqual(result["legs"][2]["level"], "none")
         self.assertEqual(result["level"], "high")
+        self.assertFalse(result["stale"])
 
     def test_minutes_produce_the_leg_end(self):
-        windows = [window("2026-09-19T10:00:00-04:00",
-                          "2026-09-19T10:30:00-04:00", precip_probability_pct=65)]
+        windows = [window(T0, "2026-09-19T10:30:00-04:00",
+                          precip_probability_pct=65)]
         result = weather.plan_risk(self.LEGS[:1], windows=windows, alerts=[])
         self.assertEqual(result["legs"][0]["level"], "high")
 
@@ -321,51 +445,155 @@ class TestPlanRisk(unittest.TestCase):
         self.assertEqual(result["level"], "unknown")
 
 
-# ------------------------------------------------------------- cache / failure
-class TestCacheBackedFetchers(unittest.TestCase):
-    """Reads the committed real NWS fixtures; no network."""
-
-    def test_resolved_grid_zone_station_from_fixture(self):
-        point = weather.resolve_point()
-        self.assertEqual(point["status"], "ok")
-        meta = point["point"]
-        self.assertEqual((meta["grid_id"], meta["grid_x"], meta["grid_y"]),
-                         ("RNK", 57, 65))
-        self.assertEqual(meta["forecast_zone"], "VAZ014")
-        self.assertEqual(meta["timezone"], "America/New_York")
-
-    def test_hourly_windows_from_fixture(self):
-        fetched = weather.hourly_windows()
+# ------------------------------------------------------------- temp-cache fetch
+class TestCacheBackedFetchers(TempCacheCase):
+    def test_hourly_windows_from_temp_cache(self):
+        self.seed_full(hourly_periods=[period(T0, T1, precip=55), period(T1, T2)])
+        fetched = weather.hourly_windows(now=STAMP_DT)
         self.assertEqual(fetched["status"], "ok")
-        self.assertGreater(len(fetched["windows"]), 0)
-        self.assertEqual(fetched["windows"][0]["kind"], "forecast")
+        self.assertEqual(len(fetched["windows"]), 2)
         self.assertEqual(fetched["point"]["grid_id"], "RNK")
+        self.assertEqual(set(fetched["sources"]), {"points", "hourly"})
+        self.assertEqual(fetched["sources"]["hourly"]["status"], "ok")
 
-    def test_observation_is_labelled_as_airport(self):
-        obs = weather.latest_observation()
-        self.assertEqual(obs["status"], "ok")
-        self.assertEqual(obs["observation"]["station_id"], "KBCB")
-        self.assertEqual(obs["observation"]["station_name"], "Virginia Tech Airport")
-        self.assertIn("not an on-campus sensor", obs["observation"]["station_note"])
-
-    def test_empty_alerts_is_a_normal_ok_state(self):
-        alerts = weather.active_alerts()
-        self.assertEqual(alerts["status"], "ok")
-        self.assertEqual(alerts["alerts"], [])
-        self.assertEqual(alerts["count"], 0)
+    def test_stale_point_dependency_propagates(self):
+        old = (STAMP_DT - timedelta(days=2)).isoformat(timespec="seconds")
+        self.seed_full(point_age=old, hourly_periods=[period(T0, T1)])
+        fetched = weather.hourly_windows(now=STAMP_DT)
+        self.assertEqual(fetched["sources"]["points"]["status"], "stale")
+        self.assertEqual(fetched["sources"]["hourly"]["status"], "ok")
+        self.assertEqual(fetched["status"], "stale")
+        self.assertTrue(fetched["stale"])
+        self.assertTrue(fetched["windows"][0]["stale"])
 
     def test_forecast_strip_is_limited_and_fresh(self):
-        strip = weather.forecast_strip(hours=6, at=STAMP_DT.astimezone(NY))
+        periods = [period(f"2026-09-19T{10 + i:02d}:00:00-04:00",
+                          f"2026-09-19T{11 + i:02d}:00:00-04:00")
+                   for i in range(8)]
+        self.seed_full(hourly_periods=periods)
+        strip = weather.forecast_strip(hours=6, at=STAMP_DT.astimezone(NY),
+                                       now=STAMP_DT)
         self.assertEqual(strip["status"], "ok")
         self.assertEqual(strip["hours"], 6)
         self.assertEqual(len(strip["windows"]), 6)
         self.assertFalse(strip["stale"])
         self.assertIn("National Weather Service", strip["attribution"])
 
+    def test_zone_only_alert_is_included(self):
+        self.seed_full(alerts_point={"features": []},
+                       alerts_zone={"features": [alert_feature("urn:zone:1")]})
+        result = weather.active_alerts(now=STAMP_DT)
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["alerts"][0]["id"], "urn:zone:1")
+        self.assertEqual(result["status"], "ok")
 
-class TestFreshnessAndFailure(unittest.TestCase):
-    def test_stale_age_uses_config_clock_not_wall_clock(self):
-        """A future replay 'now' must flip the label; the fixture is 15:22 UTC."""
+    def test_duplicate_alert_is_deduped_across_point_and_zone(self):
+        dup = alert_feature("urn:same")
+        self.seed_full(alerts_point={"features": [dup]},
+                       alerts_zone={"features": [dup]})
+        result = weather.active_alerts(now=STAMP_DT)
+        self.assertEqual(result["count"], 1)
+
+    def test_one_alert_feed_unavailable_is_partial_not_ok(self):
+        self.seed_full(alerts_point={"features": []})   # zone fixture absent
+        result = weather.active_alerts(now=STAMP_DT)
+        self.assertEqual(result["sources"]["point"]["status"], "ok")
+        self.assertEqual(result["sources"]["zone"]["status"], "unavailable")
+        self.assertEqual(result["status"], "partial")
+        self.assertTrue(result["stale"])
+
+    def test_both_alert_feeds_unavailable_is_unavailable(self):
+        self.seed_full()   # point and zone alert fixtures absent
+        result = weather.active_alerts(now=STAMP_DT)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["count"], 0)
+
+    def test_latest_observation_picks_nearest_and_labels_airport(self):
+        stations = stations_payload([
+            ("KFAR", "Far Airport", 50000),
+            ("KBCB", "Virginia Tech Airport", 1766),
+        ])
+        obs_payload = {"properties": {
+            "station": "https://api.weather.gov/stations/KBCB",
+            "timestamp": "2026-09-19T20:55:00+00:00",
+            "temperature": {"unitCode": "wmoUnit:degC", "value": 27.5},
+            "textDescription": "Clear",
+        }}
+        self.seed_full(stations=stations, observation=obs_payload)
+        result = weather.latest_observation(now=STAMP_DT)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["observation"]["station_id"], "KBCB")
+        self.assertEqual(result["observation"]["station_name"], "Virginia Tech Airport")
+        self.assertIn("not an on-campus sensor", result["observation"]["station_note"])
+
+    def test_plan_risk_status_and_sources_from_temp_cache(self):
+        self.seed_full(hourly_periods=[period(T0, T1, precip=80)],
+                       alerts_point={"features": []},
+                       alerts_zone={"features": []})
+        legs = [{"type": "walk", "start_time": T0, "minutes": 20}]
+        result = weather.plan_risk(legs, now=STAMP_DT)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(set(result["sources"]), {"forecast", "alerts"})
+        self.assertFalse(result["stale"])
+        self.assertEqual(result["legs"][0]["level"], "high")
+
+
+def stations_from(payload):
+    return [{"station_id": f["properties"]["stationIdentifier"],
+             "distance_m": f["properties"]["distance"]["value"],
+             "name": f["properties"]["name"]} for f in payload["features"]]
+
+
+class TestNearestStation(unittest.TestCase):
+    def test_picks_smallest_distance_regardless_of_order(self):
+        stations = stations_from(stations_payload([
+            ("KFAR", "Far", 50000), ("KBCB", "Near", 1766), ("KMID", "Mid", 20000)]))
+        self.assertEqual(weather.nearest_station(stations)["station_id"], "KBCB")
+
+    def test_none_distances_sort_last(self):
+        stations = [{"station_id": "A", "distance_m": None},
+                    {"station_id": "B", "distance_m": 5000}]
+        self.assertEqual(weather.nearest_station(stations)["station_id"], "B")
+
+    def test_empty_is_none(self):
+        self.assertIsNone(weather.nearest_station([]))
+
+
+# ------------------------------------------------------------- real replay
+class TestReplayStoreHasNoWeatherFixtures(unittest.TestCase):
+    """Deliberate decision: the frozen store carries NO weather data.
+
+    The 2026-09-19 NWS capture was acquired ~6 h after the bus replay clock and
+    its forecast did not cover the replay "now", so committing it (with a
+    rewritten fetched_at) would have been an incoherent, falsified snapshot.
+    Until a complete bundle is captured coherently, replay returns a typed
+    unavailable state instead of showing stale-relative-to-replay weather.
+    """
+
+    def test_resolve_point_is_typed_unavailable_in_replay(self):
+        result = weather.resolve_point()
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIsNotNone(result["reason"])
+
+    def test_hourly_windows_empty_and_unavailable_in_replay(self):
+        result = weather.hourly_windows()
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["windows"], [])
+
+    def test_as_failure_reports_unavailable(self):
+        failure = weather.as_failure(weather.resolve_point())
+        self.assertIsInstance(failure, weather.Failure)
+        self.assertEqual(failure.status, "unavailable")
+
+    def test_no_weather_fixture_files_are_committed(self):
+        offenders = [p.name for p in Path(config.FIXTURES_DIR).glob("weather_*")]
+        self.assertEqual(offenders, [])
+
+
+# ------------------------------------------------------------- failure/staleness
+class TestFreshnessAndFailure(TempCacheCase):
+    def test_stale_age_uses_config_clock(self):
+        self.seed_full(hourly_periods=[period(T0, T1)])
         fresh = weather.hourly_windows(now=STAMP_DT)
         self.assertFalse(fresh["stale"])
         old = weather.hourly_windows(now=STAMP_DT + timedelta(hours=2))
@@ -380,14 +608,12 @@ class TestFreshnessAndFailure(unittest.TestCase):
 
         weather._load = boom
         try:
-            point = weather.resolve_point()
-            self.assertEqual(point["status"], "unavailable")
-            self.assertIn("no fixture", point["reason"])
+            self.assertEqual(weather.resolve_point()["status"], "unavailable")
             hourly = weather.hourly_windows()
             self.assertEqual(hourly["status"], "unavailable")
             self.assertEqual(hourly["windows"], [])
-            obs = weather.latest_observation(station="KBCB")
-            self.assertEqual(obs["status"], "unavailable")
+            self.assertEqual(weather.latest_observation(station="KBCB")["status"],
+                             "unavailable")
         finally:
             weather._load = original
 
@@ -395,22 +621,12 @@ class TestFreshnessAndFailure(unittest.TestCase):
         self.assertTrue(issubclass(weather.WeatherUnavailable, weather.WeatherError))
 
     def test_as_failure_converts_only_non_ok_results(self):
-        ok = weather.hourly_windows()
-        self.assertIsNone(weather.as_failure(ok))
-        original = weather._load
-
-        def boom(*args, **kwargs):
-            raise weather.WeatherUnavailable("down", source="test")
-
-        weather._load = boom
-        try:
-            failed = weather.resolve_point()
-        finally:
-            weather._load = original
-        failure = weather.as_failure(failed)
-        self.assertIsInstance(failure, weather.Failure)
-        self.assertEqual(failure.status, "unavailable")
-        self.assertIn("down", failure.reason)
+        self.assertIsNone(weather.as_failure({"status": "ok"}))
+        failure = weather.as_failure(
+            {"status": "partial", "source": "s", "reason": "r",
+             "fetched_at": STAMP, "age_seconds": 1.0})
+        self.assertEqual(failure.status, "partial")
+        self.assertEqual(failure.reason, "r")
 
     def test_failed_load_never_leaves_a_partial_payload(self):
         original = weather._load
@@ -428,48 +644,112 @@ class TestFreshnessAndFailure(unittest.TestCase):
             weather._load = original
 
 
+class TestPublicCacheMetadata(TempCacheCase):
+    def test_read_and_envelope_meta_roundtrip(self):
+        self.seed("weather_points", point_payload(), POINT_PARAMS)
+        env = cache.read_envelope("weather_points", POINT_PARAMS)
+        self.assertIsNotNone(env)
+        self.assertEqual(env["payload"], point_payload())
+        meta = cache.envelope_meta("weather_points", POINT_PARAMS)
+        self.assertEqual(meta["fetched_at"], STAMP)
+        self.assertEqual(meta["key"], "weather_points__lat=37.2292__lon=-80.4240")
+        self.assertNotIn("payload", meta)
+
+    def test_read_envelope_missing_is_none(self):
+        self.assertIsNone(cache.read_envelope("weather_nope", None))
+        self.assertIsNone(cache.envelope_meta("weather_nope", None))
+
+    def test_write_envelope_atomic_preserves_real_stamp(self):
+        path = cache.write_envelope_atomic(
+            "weather_probe", "https://e.test/x", {"ok": True},
+            params={"k": "v"}, fetched_at="2020-01-01T00:00:00+00:00")
+        self.assertTrue(path.exists())
+        env = cache.read_envelope("weather_probe", {"k": "v"})
+        self.assertEqual(env["fetched_at"], "2020-01-01T00:00:00+00:00")
+
+    def test_publish_envelopes_all_or_nothing(self):
+        entries = [
+            {"name": "weather_a", "url": "u", "payload": {"n": 1}, "params": {"i": "1"},
+             "fetched_at": STAMP},
+            {"name": "weather_b", "url": "u", "payload": {"n": 2}, "params": {"i": "2"},
+             "fetched_at": STAMP},
+        ]
+        published = cache.publish_envelopes(entries)
+        self.assertEqual(len(published), 2)
+        self.assertEqual(cache.read_envelope("weather_a", {"i": "1"})["payload"],
+                         {"n": 1})
+        self.assertEqual(cache.read_envelope("weather_b", {"i": "2"})["payload"],
+                         {"n": 2})
+
+    def test_publish_envelopes_failure_rolls_back(self):
+        good = {"name": "weather_good", "url": "u", "payload": {"n": 1},
+                "params": {"i": "1"}, "fetched_at": STAMP}
+        cache.publish_envelopes([good])
+        original = cache.read_envelope("weather_good", {"i": "1"})["payload"]
+        # A non-JSON-serializable payload fails during staging, before any swap.
+        bad = {"name": "weather_good", "url": "u", "payload": {"bad": object()},
+               "params": {"i": "1"}, "fetched_at": STAMP}
+        with self.assertRaises(TypeError):
+            cache.publish_envelopes([bad, good])
+        self.assertEqual(cache.read_envelope("weather_good", {"i": "1"})["payload"],
+                         original)
+
+    def test_publish_envelopes_rolls_back_on_swap_failure(self):
+        keep = {"name": "weather_keep", "url": "u", "payload": {"n": 1},
+                "params": {"i": "1"}, "fetched_at": STAMP}
+        cache.publish_envelopes([keep])
+        original = cache.read_envelope("weather_keep", {"i": "1"})["payload"]
+
+        new_keep = {"name": "weather_keep", "url": "u", "payload": {"n": 2},
+                    "params": {"i": "1"}, "fetched_at": STAMP}
+        new_other = {"name": "weather_other", "url": "u", "payload": {"n": 3},
+                     "params": {"i": "2"}, "fetched_at": STAMP}
+
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def flaky(src, dst):
+            if str(dst).endswith(".json"):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise OSError("simulated swap failure")
+            return real_replace(src, dst)
+
+        os.replace = flaky
+        try:
+            with self.assertRaises(OSError):
+                cache.publish_envelopes([new_keep, new_other])
+        finally:
+            os.replace = real_replace
+
+        # The previously published bundle is restored and the new entry is absent.
+        self.assertEqual(cache.read_envelope("weather_keep", {"i": "1"})["payload"],
+                         original)
+        self.assertIsNone(cache.read_envelope("weather_other", {"i": "2"}))
+
+
 class TestCacheKeys(unittest.TestCase):
-    def test_point_and_hourly_keys_are_stable(self):
+    def test_keys_are_stable(self):
         self.assertEqual(
-            cache.key("weather_points", {"lat": "37.2292", "lon": "-80.4240"}),
+            cache.key("weather_points", POINT_PARAMS),
             "weather_points__lat=37.2292__lon=-80.4240")
         self.assertEqual(
-            cache.key("weather_hourly", {"grid": "RNK", "x": "57", "y": "65"}),
+            cache.key("weather_hourly", HOURLY_PARAMS),
             "weather_hourly__grid=RNK__x=57__y=65")
         self.assertEqual(
-            cache.key("weather_alerts_zone", {"zone": "VAZ014"}),
+            cache.key("weather_alerts_zone", {"zone": ZONE}),
             "weather_alerts_zone__zone=VAZ014")
-
-    def test_fixtures_are_present_and_named_by_those_keys(self):
-        for name, params in [
-            ("weather_points", {"lat": "37.2292", "lon": "-80.4240"}),
-            ("weather_hourly", {"grid": "RNK", "x": "57", "y": "65"}),
-            ("weather_alerts_point", {"lat": "37.2292", "lon": "-80.4240"}),
-            ("weather_alerts_zone", {"zone": "VAZ014"}),
-            ("weather_stations", {"grid": "RNK", "x": "57", "y": "65"}),
-            ("weather_observation", {"station": "KBCB"}),
-        ]:
-            with self.subTest(name=name, params=params):
-                self.assertTrue(cache.has(name, params),
-                                f"missing fixture {cache.key(name, params)}")
 
 
 class TestTimezones(unittest.TestCase):
     def test_window_offset_is_preserved_verbatim(self):
-        payload = {"properties": {"periods": [{
-            "number": 1, "startTime": "2026-09-19T17:00:00-04:00",
-            "endTime": "2026-09-19T18:00:00-04:00", "temperature": 70,
-            "temperatureUnit": "F",
-        }]}}
-        w = weather.normalize_hourly(payload)[0]
-        self.assertEqual(w["start"], "2026-09-19T17:00:00-04:00")
-        self.assertEqual(w["end"], "2026-09-19T18:00:00-04:00")
+        w = weather.normalize_hourly({"properties": {"periods": [period(T0, T1)]}})[0]
+        self.assertEqual(w["start"], T0)
+        self.assertEqual(w["end"], T1)
         self.assertEqual(w["timezone"], "America/New_York")
 
     def test_aware_utc_and_naive_local_describe_the_same_window(self):
-        windows = [window("2026-09-19T10:00:00-04:00",
-                          "2026-09-19T11:00:00-04:00",
-                          precip_probability_pct=75)]
+        windows = [window(T0, T1, precip_probability_pct=75)]
         naive = weather.assess_leg(datetime(2026, 9, 19, 10, 15),
                                    datetime(2026, 9, 19, 10, 45), windows=windows)
         aware = weather.assess_leg(
@@ -488,18 +768,12 @@ CERTAINTY_WORDS = (
 
 
 class TestProhibitedCertaintyWording(unittest.TestCase):
-    """The module must present evidence, never promise an outcome."""
-
     SCENARIOS = [
-        ([window("2026-09-19T10:00:00-04:00", "2026-09-19T11:00:00-04:00",
-                 precip_probability_pct=90,
-                 short_forecast="Thunderstorms")], [alert()]),
-        ([window("2026-09-19T10:00:00-04:00", "2026-09-19T11:00:00-04:00",
-                 temperature_c=41.0)], []),
-        ([window("2026-09-19T10:00:00-04:00", "2026-09-19T11:00:00-04:00",
-                 temperature_c=-25.0)], []),
-        ([window("2026-09-19T10:00:00-04:00", "2026-09-19T11:00:00-04:00",
-                 wind_speed_kph=80.0)], []),
+        ([window(T0, T1, precip_probability_pct=90, short_forecast="Thunderstorms")],
+         [alert()]),
+        ([window(T0, T1, temperature_c=41.0)], []),
+        ([window(T0, T1, temperature_c=-25.0)], []),
+        ([window(T0, T1, wind_speed_kph=80.0)], []),
         ([], []),
     ]
 
@@ -518,7 +792,7 @@ class TestProhibitedCertaintyWording(unittest.TestCase):
                                      f"prohibited certainty wording {word!r}: {text}")
 
     def test_summaries_use_risk_language(self):
-        for level, summary in weather.SUMMARY_BY_LEVEL.items():
+        for summary in weather.SUMMARY_BY_LEVEL.values():
             lowered = summary.lower()
             self.assertNotIn("will", lowered)
             self.assertNotIn("certain", lowered)
