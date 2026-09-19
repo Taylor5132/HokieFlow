@@ -88,12 +88,18 @@ FUNCTIONS: list[tuple[str, str, str, str]] = [
         "p_location_num STRING COMMENT 'FoodPro location, e.g. 15 for D2 at Dietrick Hall. NULL searches all.', "
         "p_diet STRING COMMENT 'Diet tag to require, e.g. vegetarian or vegan. NULL means any.', "
         "p_avoid STRING COMMENT 'Comma-separated allergens to EXCLUDE, e.g. ''Peanuts,Tree Nuts''.', "
-        "p_max_kcal DOUBLE COMMENT 'Maximum calories per item. Items with unknown calories are excluded.'",
+        "p_max_kcal DOUBLE COMMENT 'Maximum calories per item. Items with unknown calories are excluded.', "
+        "p_include_unknown BOOLEAN DEFAULT false COMMENT 'Set true to ALSO return items whose allergens are unknown. They are unsafe by default and must be labelled unverified.'",
         "Returns dining menu items matching diet, allergen and caloried limits as "
         "a JSON array, each with name, kcal, protein_g, allergens, diet_tags and "
-        "allergens_known. SAFETY: `avoid` is a HARD filter. A row with an empty "
-        "allergens array means its allergens are UNKNOWN, not absent -- check "
-        "allergens_known and never call such a row safe.",
+        "allergens_known and venue_allergen_free. SAFETY: `avoid` is a HARD "
+        "filter with a THREE-WAY policy -- (1) an item stating an avoided "
+        "allergen is excluded; (2) an item with a BLANK allergen field is "
+        "excluded as UNKNOWN unless venue_allergen_free is true; (3) a blank "
+        "field in a documented allergen-free kitchen (Viridian, which VT states "
+        "is free from the top nine allergens with separate preparation space) "
+        "is treated as safe and IS returned. Never describe an item with "
+        "allergens_known=false as safe.",
         f"""
         SELECT COALESCE(to_json(collect_list(s)), '[]') FROM (
           SELECT named_struct(
@@ -105,17 +111,23 @@ FUNCTIONS: list[tuple[str, str, str, str]] = [
                    'protein_g', protein_g,
                    'allergens', allergens,
                    'diet_tags', diet_tags,
-                   'allergens_known', allergens_known) AS s
+                   'allergens_known', allergens_known,
+                   'venue_allergen_free', venue_allergen_free) AS s
           FROM {F}.eat_options e
           WHERE (p_location_num IS NULL OR p_location_num = ''
                  OR e.location_num = p_location_num)
             AND (p_diet IS NULL OR p_diet = ''
                  OR array_contains(e.diet_tags, lower(trim(p_diet))))
             AND (p_avoid IS NULL OR p_avoid = ''
-                 OR size(array_intersect(
+                 OR (
+                   size(array_intersect(
                         transform(e.allergens, x -> lower(trim(x))),
                         transform(split(p_avoid, ','), x -> lower(trim(x)))
-                    )) = 0)
+                   )) = 0
+                   AND (size(e.allergens) > 0
+                        OR e.venue_allergen_free
+                        OR COALESCE(p_include_unknown, false))
+                 ))
             AND (p_max_kcal IS NULL
                  OR (e.kcal IS NOT NULL AND e.kcal <= p_max_kcal))
           ORDER BY e.kcal ASC NULLS LAST
@@ -144,7 +156,12 @@ CHECKS: list[tuple[str, str, str | None, str | None]] = [
     ("get_next_departures", "'1600', 180, NULL", "11:48:29", "11:23:29"),
     ("get_live_bus", "NULL", "sched_delta_min", None),
     ("get_live_bus", "'SME'", "SME", None),
-    ("find_food", "'15', 'vegetarian', 'Peanuts,Tree Nuts', 800", "allergens_known", None),
+    ("find_food", "'15', 'vegetarian', 'Peanuts,Tree Nuts', 800, false", "allergens_known", "Peanuts"),
+    # The three-way safety policy, checked in BOTH directions:
+    #  - a documented allergen-free kitchen must SURVIVE an avoid filter
+    #    (all 48 Viridian items have a blank allergen field)
+    #  - and no avoided allergen may appear in the output
+    ("find_food", "'15', NULL, 'Peanuts,Tree Nuts', NULL, false", "Viridian", "Peanuts"),
     ("get_hours", "'15'", "15:00:00", None),
 ]
 

@@ -452,11 +452,29 @@ def eat_options(
 
     if avoid:
         # HARD SAFETY FILTER — never a preference. Substring, case-insensitive.
+        #
+        # THREE-WAY POLICY (SDD risk R8, corrected). A naive filter gets this
+        # wrong in both directions:
+        #
+        #   * treating a BLANK allergen field as "safe" keeps 140 genuinely
+        #     UNKNOWN items (condiments, beverages, yogurt bars) — the dangerous
+        #     failure, and what this code used to do.
+        #   * excluding every blank field also drops all 48 VIRIDIAN items, whose
+        #     blank is explained by a documented top-nine-free kitchen — hiding
+        #     the safest food on the menu.
+        #
+        # So: exclude on a stated match; keep a blank field ONLY when the venue
+        # guarantees it; exclude other blank fields as UNKNOWN.
         bad = tuple(a.strip().lower() for a in avoid if a and a.strip())
-        items = [
-            it for it in items
-            if not any(b in alg.lower() for alg in it.allergens for b in bad)
-        ]
+        kept = []
+        for it in items:
+            stated = [alg.lower() for alg in it.allergens]
+            if any(b in alg for alg in stated for b in bad):
+                continue                      # definitely contains it
+            if not stated and not config.is_venue_allergen_free(it.section):
+                continue                      # UNKNOWN -> excluded by default
+            kept.append(it)
+        items = kept
 
     if max_kcal is not None:
         # Look nutrition up for the WHOLE MENU (menu order, cached per location),

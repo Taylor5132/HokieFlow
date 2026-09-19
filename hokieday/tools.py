@@ -190,6 +190,10 @@ class LocalSource:
                     # UNKNOWN, never allergen-free. The flag -- not the
                     # absence -- is what the agent must surface.
                     "allergens_known": bool(it.allergens),
+                    # True when the blank allergen field is EXPLAINED by a
+                    # documented allergen-free kitchen (Viridian), rather than
+                    # being genuinely unknown. The agent must surface which.
+                    "venue_allergen_free": config.is_venue_allergen_free(it.section),
                     "recipe_id": it.recipe_id,
                     "portion": f"{it.portion_size} {it.portion_unit}".strip(),
                 })

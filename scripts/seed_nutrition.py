@@ -21,7 +21,6 @@ cache layer refuses to touch the network, so it cannot seed.)
 """
 from __future__ import annotations
 
-import os
 import sys
 from datetime import date
 from pathlib import Path

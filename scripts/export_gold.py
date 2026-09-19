@@ -23,7 +23,6 @@ import argparse
 import json
 import os
 import sys
-from datetime import date
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -102,8 +101,11 @@ def build_bundle() -> dict:
                     "kcal": round(n.cals, 1) if n is not None else None,
                     "protein_g": round(n.protein_g, 1) if n is not None else None,
                     "allergens": list(it.allergens), "diet_tags": list(it.diet_tags),
-                    # SAFETY: blank allergens are UNKNOWN, never "safe" (SDD risk R8)
+                    # SAFETY: blank allergens are UNKNOWN, never "safe" -- EXCEPT
+                    # in a documented allergen-free kitchen (Viridian), where the
+                    # blank is explained by a venue-level guarantee (SDD risk R8).
                     "allergens_known": bool(it.allergens),
+                    "venue_allergen_free": config.is_venue_allergen_free(it.section),
                 })
         except Exception as exc:                       # noqa: BLE001
             print(f"  WARN menu {loc}: {exc}")
@@ -150,8 +152,9 @@ def build_bundle() -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--live", action="store_true", help="use the live cache instead of fixtures")
-    args = ap.parse_args()
+    ap.add_argument("--live", action="store_true",
+                    help="use the live cache instead of fixtures (also read at import time)")
+    ap.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     bundle = build_bundle()

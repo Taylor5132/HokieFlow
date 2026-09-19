@@ -175,3 +175,24 @@ KNOWN_ALLERGENS = [
     "Peanuts", "Wheat", "Soybeans", "Gluten", "Sesame",
 ]
 DIET_CODES = {"wcveg": "Vegan", "wcvtn": "Vegetarian", "wcha": "Halal Certified Meat", "wcal": "Alcohol"}
+
+# ---------------------------------------------------------------- allergen policy
+# Sections whose kitchen Virginia Tech documents as free from the TOP NINE
+# allergens, with separate storage / preparation / cooking / serving space.
+# Source: dining.vt.edu Dietrick Hall page (verified 2026-09-19): Viridian is
+# "a dedicated kitchen serving menu items that are free from the top nine
+# allergens (dairy, egg, fish, shellfish, peanut, tree nuts, soy, sesame, wheat
+# and gluten)".
+#
+# WHY THIS IS LOAD-BEARING: all 48 Viridian items carry a BLANK allergen field.
+# Blank normally means UNKNOWN, but here the blank is EXPLAINED by a documented
+# venue-level guarantee -- which makes these the safest items on the menu. A
+# blanket "blank means unknown, exclude it" rule would hide exactly the food a
+# peanut-allergic student needs.
+VENUE_ALLERGEN_FREE_SECTIONS = ("viridian",)
+
+
+def is_venue_allergen_free(section: str | None) -> bool:
+    """True when an item's section belongs to a documented allergen-free kitchen."""
+    s = (section or "").strip().lower()
+    return any(s.startswith(p) for p in VENUE_ALLERGEN_FREE_SECTIONS)
