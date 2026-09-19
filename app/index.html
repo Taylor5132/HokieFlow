@@ -26,7 +26,7 @@ body{
   margin:0;background:var(--bg);color:var(--ink);
   font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
   overflow-x:hidden;
-  padding-bottom:calc(150px + var(--safe-b));   /* room for the sticky ask bar */
+  padding-bottom:calc(206px + var(--safe-b));   /* room for the sticky ask bar */
 }
 .shell{max-width:720px;margin:0 auto;padding:calc(var(--pad) + var(--safe-t)) var(--pad) 0}
 
@@ -115,6 +115,16 @@ input[type=text]:focus{outline:none;border-color:var(--accent)}
       background:#2a1620;color:var(--ink);font:16px inherit;font-weight:600}
 .send:active{transform:scale(.98)}
 
+/* location row: thumb-reachable, with a fallback when GPS is unavailable */
+.locrow{display:flex;gap:8px;align-items:center;padding-top:8px}
+.locbtn{min-height:40px;padding:0 13px;border-radius:999px;border:1px solid var(--line);
+        background:var(--card2);color:var(--ink);font:14px inherit;white-space:nowrap}
+.locbtn.on{border-color:var(--ok);color:var(--ok)}
+.locbtn.warn{border-color:var(--warn);color:var(--warn)}
+.locrow select{flex:1;min-width:0;min-height:40px;font:14px inherit;border-radius:999px;
+        border:1px solid var(--line);background:var(--card2);color:var(--ink);padding:0 10px}
+.origin-note{font-size:12.5px;color:var(--warn);margin-top:6px}
+
 details{margin-top:4px}
 summary{color:var(--dim);font-size:13px;cursor:pointer;list-style:none;padding:6px 0}
 summary::-webkit-details-marker{display:none}
@@ -129,7 +139,7 @@ details[open] summary::before{content:" "}
 @media (min-width:760px){
   .shell{max-width:1000px;padding-top:28px}
   .plans{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:start}
-  body{padding-bottom:132px}
+  body{padding-bottom:188px}
   .ask .inner{max-width:1000px}
 }
 /* respect users who ask for less motion */
@@ -158,6 +168,10 @@ details[open] summary::before{content:" "}
              placeholder="Ask in your own words…">
       <button class="send" onclick="ask()">Ask</button>
     </div>
+    <div class="locrow">
+      <button class="locbtn" id="locbtn" onclick="useLocation()">📍 Use my location</button>
+      <select id="from" aria-label="starting point"></select>
+    </div>
   </div>
 </div>
 
@@ -166,6 +180,37 @@ const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const ICON = {walk:"🚶", bus:"🚌", eat:"🍽️"};
 const hhmm = s => (s || "").slice(11,16);
+
+// Device position (when the browser will give one) and the fallback origin.
+// Geolocation requires a SECURE CONTEXT: it works on localhost and over HTTPS,
+// but NOT over plain-HTTP LAN, which is why the picker exists as a fallback.
+let ORIGIN = null;              // {lat, lon, accuracy}
+let FROM_PLACE = "auto";
+
+function useLocation(){
+  const b = $("#locbtn");
+  if(!navigator.geolocation){ b.className = "locbtn warn"; b.textContent = "no geolocation here"; return; }
+  if(!window.isSecureContext){
+    b.className = "locbtn warn";
+    b.textContent = "📍 needs https or localhost";
+    return;
+  }
+  b.className = "locbtn"; b.textContent = "locating…";
+  navigator.geolocation.getCurrentPosition(
+    p => {
+      ORIGIN = {lat:p.coords.latitude, lon:p.coords.longitude, accuracy:p.coords.accuracy};
+      b.className = "locbtn on";
+      b.textContent = "📍 ±" + Math.round(p.coords.accuracy) + " m";
+      ask();
+    },
+    err => {
+      b.className = "locbtn warn";
+      b.textContent = "📍 " + (err.code === 1 ? "permission denied"
+                                             : (err.message || "unavailable"));
+    },
+    {enableHighAccuracy:true, timeout:8000, maximumAge:30000}
+  );
+}
 
 function provenance(l){
   if(l.type === "bus")  return '<div class="ptag sched">scheduled · service-filtered</div>';
@@ -210,14 +255,20 @@ function plan(it, title, state){
 function render(r){
   if(r.error){ $("#out").innerHTML = `<div class="card err">Error: ${esc(r.error)}</div>`; return; }
   const it = r.itinerary, trg = r.replan_trigger;
+  const og = r._origin || {};
+  const where = og.source === "device"
+      ? `from your location${og.accuracy_m ? " ±" + Math.round(og.accuracy_m) + " m" : ""}`
+      : (og.label ? `from ${og.label}` : "from the default origin");
   let h = "";
 
   h += `<div class="card"><div class="k">answer</div>
      <div class="answer">${esc(r.rationale)}</div>
      <div class="pill-row">
+       <span class="metric">${esc(where)}</span>
        <span class="metric">profile ${esc(r.student_ref)}</span>
        <span class="metric">${esc((r._request||{}).start)}–${esc((r._request||{}).end)}</span>
-     </div></div>`;
+     </div>
+     ${og.note ? `<div class="origin-note">⚠ ${esc(og.note)}</div>` : ""}</div>`;
 
   const planA = (r.alternatives||[]).find(a => a.type === "previous_itinerary_a");
 
@@ -246,6 +297,8 @@ function render(r){
 
 async function ask(id){
   const body = id ? {scenario_id:id} : {text:$("#q").value};
+  body.from_place = FROM_PLACE;
+  if(ORIGIN){ body.lat = ORIGIN.lat; body.lon = ORIGIN.lon; body.accuracy = ORIGIN.accuracy; }
   if(id) $("#q").value = "";
   $("#out").innerHTML = '<div class="card muted">planning…</div>';
   try{
@@ -281,6 +334,15 @@ async function boot(){
     const sc = await (await fetch("/api/scenarios")).json();
     $("#scen").innerHTML = sc.map((x,i) =>
       `<button class="${i===1?"hot":""}" onclick="ask('${esc(x.id)}')">${esc(x.label)}</button>`).join("");
+
+    try{
+      const os = await (await fetch("/api/origins")).json();
+      const sel = $("#from");
+      sel.innerHTML = '<option value="auto">default origin</option>' +
+        os.map(o => `<option value="${esc(o.key)}">${esc(o.key)}${o.verified ? " ✓" : ""}</option>`).join("");
+      sel.onchange = () => { FROM_PLACE = sel.value; ORIGIN = null;
+        $("#locbtn").className = "locbtn"; $("#locbtn").textContent = "📍 Use my location"; ask(); };
+    }catch(e){ /* picker is optional */ }
   }catch(e){
     $("#chips").innerHTML = `<span class="chip warn">status unavailable</span>`;
   }

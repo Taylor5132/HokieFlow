@@ -145,12 +145,79 @@ def parse_free_text(text: str) -> dict:
     return call
 
 
-def run_plan(call: dict) -> dict:
+def _static_or_none(payload: dict, info: dict) -> tuple[str | None, dict]:
+    """Fall back to a selected campus place (or the planner default).
+
+    Used whenever a device position is absent or rejected, so the caller always
+    gets a usable origin and the reason travels with it.
+    """
+    sel = payload.get("from_place")
+    if sel and str(sel) not in ("auto", "default"):
+        row = config.PLACES.get(str(sel))
+        if row and not row.get("dynamic"):
+            if info.get("note"):
+                info["note"] += f" \u2014 using {sel} instead"
+            info["source"] = "selected"
+            info["label"] = str(sel)
+            return str(sel), info
+    return None, info
+
+
+def resolve_origin(payload: dict) -> tuple[str | None, dict]:
+    """Turn an optional device position into a place key.
+
+    NEVER raises and never silently accepts a bad origin: a wrong origin yields a
+    confidently wrong plan, so every rejection carries a stated reason.
+
+    The rejection that matters in practice: a LAPTOP's Wi-Fi geolocation often
+    resolves to the ISP, hundreds of km from campus. Accepting that would produce
+    a plan with a multi-day walk, so anything beyond MAX_ORIGIN_KM falls back.
+    """
+    info: dict = {"source": "default", "label": None, "accuracy_m": None,
+                  "note": None}
+    if payload.get("lat") is None or payload.get("lon") is None:
+        return _static_or_none(payload, info)
+    try:
+        lat, lon = float(payload["lat"]), float(payload["lon"])
+    except (TypeError, ValueError):
+        info["note"] = "device position was not numeric; using the default origin"
+        return _static_or_none(payload, info)
+    if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
+        info["note"] = (f"device position {lat}, {lon} is out of range; "
+                        f"using the default origin")
+        return _static_or_none(payload, info)
+
+    km = tools._haversine_m((lat, lon), config.CAMPUS_REFERENCE) / 1000.0
+    if km > config.MAX_ORIGIN_KM:
+        info["note"] = (f"your device reports a position {km:,.0f} km from campus — "
+                        f"that is Wi-Fi/network geolocation rather than GPS, so the "
+                        f"plan uses the default origin instead")
+        info["rejected_km_from_campus"] = round(km, 1)
+        return _static_or_none(payload, info)
+
+    try:
+        acc = float(payload["accuracy"]) if payload.get("accuracy") is not None else None
+    except (TypeError, ValueError):
+        acc = None
+
+    key = config.register_dynamic_place(lat, lon, "your location", acc)
+    info.update({"source": "device", "label": "your location",
+                 "lat": round(lat, 6), "lon": round(lon, 6),
+                 "accuracy_m": acc, "km_from_campus": round(km, 3)})
+    if acc is not None and acc > 100:
+        info["note"] = (f"device accuracy is only ±{acc:,.0f} m, so walk times "
+                        f"are approximate")
+    return key, info
+
+
+def run_plan(call: dict, origin: dict | None = None) -> dict:
     result = tools.plan_day(call["student_ref"], call["start"], call["end"],
                             call.get("prefs") or {})
     result["_request"] = {"student_ref": call["student_ref"],
                           "start": call["start"], "end": call["end"],
                           "prefs": call.get("prefs") or {}}
+    result["_origin"] = origin or {"source": "default", "label": None,
+                                    "accuracy_m": None, "note": None}
     return result
 
 
@@ -226,6 +293,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/scenarios":
             self._json([{k: s[k] for k in ("id", "label", "text")} for s in SCENARIOS])
             return
+        if path == "/api/origins":
+            # Static campus places, for when the device will not give a position
+            # (geolocation needs a SECURE CONTEXT: localhost or HTTPS).
+            self._json([{"key": k, "verified": bool(v.get("verified"))}
+                        for k, v in config.PLACES.items()
+                        if not v.get("dynamic")])
+            return
         if path == "/manifest.webmanifest":
             self._send(200, json.dumps(MANIFEST).encode("utf-8"),
                        "application/manifest+json; charset=utf-8")
@@ -257,6 +331,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:                                  # noqa: BLE001
             payload = {}
         try:
+            origin_key, origin = resolve_origin(payload)
             if payload.get("scenario_id"):
                 match = next((s for s in SCENARIOS
                               if s["id"] == payload["scenario_id"]), None)
@@ -266,7 +341,11 @@ class Handler(BaseHTTPRequestHandler):
                 call = dict(match)
             else:
                 call = parse_free_text(payload.get("text", ""))
-            self._json(run_plan(call))
+            # Copy prefs rather than mutating the shared SCENARIOS entry.
+            if origin_key:
+                call["prefs"] = {**(call.get("prefs") or {}),
+                                 "from_place": origin_key}
+            self._json(run_plan(call, origin))
         except Exception as exc:                           # noqa: BLE001
             self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
 

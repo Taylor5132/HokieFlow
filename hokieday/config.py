@@ -159,6 +159,49 @@ PLACES: dict[str, dict] = {
     "Squires Student Center": {"lat": 37.22936, "lon": -80.41785, "verified": False},
 }
 
+# --------------------------------------------------------------- dynamic places
+# A device position is just another place, so GPS needs no new planner code path:
+# register the coordinate here and pass its key as `from_place`. Keys are derived
+# from the rounded coordinates, so two requests from the same spot share one entry
+# and concurrent requests never race on each other's data (a single mutable
+# "current location" key WOULD race, since the demo server is threaded).
+#
+# Coordinates from a device are NOT survey-grade: 'verified' stays False and the
+# reported accuracy is carried through so the UI can disclose it.
+CAMPUS_REFERENCE = (37.22957, -80.41394)     # Burruss Hall, verified
+MAX_ORIGIN_KM = 5.0                          # beyond this the position is not campus
+MAX_DYNAMIC_PLACES = 64                      # bounded; evict oldest
+_DYNAMIC_ORDER: list[str] = []
+
+
+def register_dynamic_place(lat: float, lon: float,
+                           label: str = "your location",
+                           accuracy_m: float | None = None) -> str:
+    """Register a device position as a place and return its lookup key.
+
+    Returns a stable key per (rounded) coordinate pair. Raises ValueError for
+    coordinates that are not on Earth.
+    """
+    lat, lon = float(lat), float(lon)
+    if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
+        raise ValueError(f"coordinate out of range: lat={lat}, lon={lon}")
+    key = f"{label} ({lat:.5f}, {lon:.5f})"
+    if key not in PLACES:
+        PLACES[key] = {
+            "lat": lat, "lon": lon, "verified": False,
+            "dynamic": True, "accuracy_m": accuracy_m,
+        }
+        _DYNAMIC_ORDER.append(key)
+        while len(_DYNAMIC_ORDER) > MAX_DYNAMIC_PLACES:
+            PLACES.pop(_DYNAMIC_ORDER.pop(0), None)
+    else:
+        PLACES[key]["accuracy_m"] = accuracy_m
+    return key
+
+
+def is_dynamic(place_key: str) -> bool:
+    return bool(PLACES.get(place_key, {}).get("dynamic"))
+
 # ---------------------------------------------------------------- dining ids
 # Verified from Locations.aspx and the hours API on 2026-09-19.
 DINING_LOCATIONS: dict[str, str] = {
