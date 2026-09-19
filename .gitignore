@@ -1,11 +1,20 @@
+# Python
 __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
 venv/
-data/*.jsonlcache/
+
+# Generated at runtime -- never committed. fixtures/ IS committed: it is the
+# frozen replay snapshot that makes the offline demo and the tests reproducible.
+cache/
+data/
 gold/
+
+# Derivable from fixtures/bt_gtfs.bin by hokieday.gtfs.ensure_extracted()
+fixtures/gtfs/
+
+# Credentials -- never commit
 .env
 databrickscfg
 token*
-fixtures/gtfs/
