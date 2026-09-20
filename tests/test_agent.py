@@ -412,6 +412,29 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(provider.calls, 0)
         self.assertNotIn("answer", result)
 
+    def test_a_provider_hiccup_still_says_something(self):
+        """A catalog question has no bounded-parser answer, and an empty card
+        after a transient 503 looks like the app is broken."""
+        provider = FakeProvider([response(text="unused")])
+        unavailable = agent.AgentUnavailable("provider_unavailable",
+                                             "provider unavailable",
+                                             {"code": "http_503"})
+        with mock.patch.object(server.config, "CACHE_ONLY", False), \
+                mock.patch.object(server.hokie_agent, "run_agent",
+                                  side_effect=unavailable), \
+                mock.patch.object(server, "run_plan",
+                                  lambda *a, **k: {"answer": "", "feasible": None}):
+            result, status = server.handle_ask(
+                {"text": "Find me a CS 3114 section this fall"}, now=NOW,
+                live=True, provider=provider)
+        self.assertEqual(status, 200)
+        self.assertEqual(provider.calls, 0, "the fake provider never ran")
+        self.assertEqual(result["provenance"]["provider"], "unavailable")
+        self.assertEqual(result["provenance"]["fallback"], "bounded_parser")
+        self.assertTrue(result["answer"].strip(), "never render an empty answer")
+        self.assertIn("try again", result["answer"].lower())
+        self.assertNotIn("911", result["answer"])
+
     def test_tool_text_cannot_inject_a_second_call(self):
         provider = FakeProvider([
             response(calls=[ToolCall("get_events", {
@@ -533,6 +556,25 @@ class LocalEnvTests(unittest.TestCase):
 
 
 class GeminiAdapterTests(unittest.TestCase):
+    def setUp(self):
+        """Isolate the persisted call ledger.
+
+        The adapter guards the shared account quota through a JSON ledger in
+        cache/, so without this the tests depend on how much live testing this
+        machine has already done and fail with local_budget_exhausted instead of
+        exercising the HTTP paths they are about.
+        """
+        import tempfile
+        from pathlib import Path
+        from app import gemini_provider
+        self._tmp = tempfile.TemporaryDirectory()
+        self._ledger = Path(self._tmp.name) / "ai_provider_calls.json"
+        self._patch = mock.patch.object(gemini_provider, "_budget_state_path",
+                                        lambda: self._ledger)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+        self.addCleanup(self._tmp.cleanup)
+
     def test_function_call_parsing_and_secret_header(self):
         captured = {}
 

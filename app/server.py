@@ -1210,6 +1210,14 @@ def handle_ask(payload: dict, now: datetime | None = None,
             "provider": "unavailable", "model": None, "tool_names": [],
             "replay": not live, "fallback": "bounded_parser",
         }
+        if not str(result.get("answer") or "").strip() and not result.get("clarification"):
+            # The bounded parser only answers route/schedule shapes, so a catalog
+            # question (or any other free-text ask) would otherwise render as an
+            # empty card when the provider hiccups. Say what happened instead of
+            # showing nothing, and never invent an answer to fill the space.
+            result["answer"] = ("I couldn't reach HokieFlow AI just now, and that "
+                               "question is outside what the offline parser can "
+                               "answer. Please try again in a moment.")
     return result, 200
 
 
