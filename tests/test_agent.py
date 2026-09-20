@@ -515,6 +515,32 @@ class ServerBudgetTests(unittest.TestCase):
         gemini_provider.budget_snapshot()
         self.assertEqual(before, gemini_provider.budget_snapshot()["calls_today"])
 
+    def test_the_shipped_limits_suit_a_room_not_a_person(self):
+        """A venue shares one public IP, and a 10/hour cap answered a whole room
+        with client_rate_limit; the ledger caps were similarly small. Pin the
+        defaults so they cannot quietly shrink back to demo-breaking values."""
+        from app import gemini_provider
+        self.assertGreaterEqual(server.DEFAULT_AI_QUESTIONS_PER_IP_HOUR, 60)
+        self.assertGreaterEqual(gemini_provider.DEFAULT_CALLS_PER_HOUR, 120)
+        self.assertGreaterEqual(gemini_provider.DEFAULT_CALLS_PER_DAY, 600)
+
+    def test_status_says_whether_a_limit_came_from_env_or_default(self):
+        """A deployment pinning the old values as app settings must be visible."""
+        block = server.status()["agent"]
+        self.assertIn(block["questions_per_ip_hour_source"], ("env", "default"))
+        self.assertIn("limits_source", block["budget"])
+        with mock.patch.dict(os.environ,
+                             {"HOKIEFLOW_AI_QUESTIONS_PER_IP_HOUR": "25"}):
+            self.assertEqual(server.status()["agent"]["questions_per_ip_hour"], 25)
+            self.assertEqual(server.status()["agent"]["questions_per_ip_hour_source"],
+                             "env")
+        with mock.patch.dict(os.environ,
+                             {"HOKIEFLOW_AI_QUESTIONS_PER_IP_HOUR": ""}):
+            self.assertEqual(server.status()["agent"]["questions_per_ip_hour"],
+                             server.DEFAULT_AI_QUESTIONS_PER_IP_HOUR)
+            self.assertEqual(server.status()["agent"]["questions_per_ip_hour_source"],
+                             "default")
+
     def test_per_client_question_budget_is_bounded(self):
         with server._CLIENT_BUDGET_LOCK:
             server._CLIENT_QUESTION_TIMES.clear()

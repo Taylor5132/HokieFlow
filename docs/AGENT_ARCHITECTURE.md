@@ -116,7 +116,7 @@ The app agent is deliberately not named HokieAI. Virginia Tech's HokieAI is a
 separate university-supported multi-model platform and is not inherently
 trained on HokieFlow campus data.
 
-Gemini usage is capped by default at 30 calls/hour and 200/day per server
+Gemini usage is capped by default at 600 calls/hour and 3000/day per server
 process, with 512 output tokens per call and no automatic retry. Real Gemini
 access is separate and explicit:
 
@@ -175,5 +175,9 @@ A real `HTTP 429` was observed during testing. It surfaces as a typed
 `provider_unavailable`, `/api/ask` falls back to the bounded parser, and the
 battery stops instead of retrying. The budget guard is persisted in
 `cache/ai_provider_calls.json` so a server restart cannot hand out a fresh
-allowance while the account quota keeps draining. Defaults: 30 calls/hour and
-120/day per account, 10 AI questions/hour per client IP.
+allowance while the account quota keeps draining. Defaults: 600 calls/hour and
+3000/day per account, 240 AI questions/hour per client IP (one public IP usually
+means a whole room, so the per-IP cap is sized like a per-room one). `/api/status`
+publishes both the caps and whether each came from the environment or the code
+default (`agent.budget.limits_source`), because a deployment that pins the old
+small values as app settings would otherwise silently ignore a new default.

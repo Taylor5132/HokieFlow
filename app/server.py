@@ -1007,13 +1007,21 @@ def _agent_hard_constraints(text: str) -> dict:
 _CLIENT_BUDGET_LOCK = threading.Lock()
 _CLIENT_QUESTION_TIMES: dict[str, deque[float]] = defaultdict(deque)
 
+# A venue shares one public IP, so this is a per-ROOM limit rather than a
+# per-person one: at 10/hour a room of judges answered a whole hour's worth of
+# questions and then got client_rate_limit. It stays finite because it is the
+# guard that stops one client draining the key; Google's own account quota is
+# the backstop behind it. Override with HOKIEFLOW_AI_QUESTIONS_PER_IP_HOUR.
+DEFAULT_AI_QUESTIONS_PER_IP_HOUR = 240
+
 
 def _client_agent_budget_available(client_ip: str) -> bool:
     """Per-process/IP guard in front of the shared Gemini call budget."""
     try:
-        limit = int(os.environ.get("HOKIEFLOW_AI_QUESTIONS_PER_IP_HOUR", "10"))
+        limit = int(os.environ.get("HOKIEFLOW_AI_QUESTIONS_PER_IP_HOUR",
+                                   str(DEFAULT_AI_QUESTIONS_PER_IP_HOUR)))
     except ValueError:
-        limit = 10
+        limit = DEFAULT_AI_QUESTIONS_PER_IP_HOUR
     limit = min(max(limit, 1), 1000)
     now_mono = time.monotonic()
     key = str(client_ip or "unknown")
@@ -1301,7 +1309,12 @@ def status() -> dict:
             "fallback": "bounded_parser",
             "reason": agent_reason,
             "budget": _agent_budget_snapshot(),
-            "questions_per_ip_hour": _bounded_env_int("HOKIEFLOW_AI_QUESTIONS_PER_IP_HOUR", 10, 1000),
+            "questions_per_ip_hour": _bounded_env_int(
+                "HOKIEFLOW_AI_QUESTIONS_PER_IP_HOUR",
+                DEFAULT_AI_QUESTIONS_PER_IP_HOUR, 1000),
+            "questions_per_ip_hour_source": (
+                "env" if (os.environ.get("HOKIEFLOW_AI_QUESTIONS_PER_IP_HOUR") or "").strip()
+                else "default"),
         },
         "auth": {
             "available": AUTH_AVAILABLE,

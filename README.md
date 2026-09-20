@@ -202,10 +202,11 @@ record is sent.
 To protect free-tier quota, one question normally uses two Gemini calls (tool
 selection and grounded narration), with a hard maximum of three turns and four
 tool calls. Responses are capped at 512 tokens. The server also defaults to 30
-Gemini calls/hour and 200/day per process, with no automatic retry. Override only
+Gemini calls/hour and 3000/day per process, with no automatic retry. Override only
 when intentional with `HOKIEFLOW_GEMINI_CALLS_PER_HOUR` and
-`HOKIEFLOW_GEMINI_CALLS_PER_DAY` (default 120/day). Live HTTP requests also
-default to 10 AI questions/hour per client IP
+`HOKIEFLOW_GEMINI_CALLS_PER_DAY` (default 3000/day). Live HTTP requests also
+default to 240 AI questions/hour per client IP (a venue shares one IP, so this is
+really a per-room cap)
 (`HOKIEFLOW_AI_QUESTIONS_PER_IP_HOUR`). The guard is stored in
 `cache/ai_provider_calls.json`, so restarting the server cannot silently reset
 the allowance. Google AI Studio quota controls remain the stronger

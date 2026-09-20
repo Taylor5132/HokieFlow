@@ -25,6 +25,13 @@ _MODEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 _MAX_RESPONSE_BYTES = 2_000_000
 _BUDGET_LOCK = threading.Lock()
 
+# Local ledger caps. Sized so the per-IP question guard trips first and Google's
+# account quota stays the real ceiling: the old 30/120 answered a busy demo with
+# local_budget_exhausted while the account was nowhere near its own limit. Both
+# are env-overridable (HOKIEFLOW_GEMINI_CALLS_PER_HOUR / _PER_DAY).
+DEFAULT_CALLS_PER_HOUR = 600
+DEFAULT_CALLS_PER_DAY = 3000
+
 
 def _bounded_env_int(name: str, default: int, maximum: int) -> int:
     try:
@@ -84,6 +91,25 @@ def _save_budget_state(stamps: list[float]) -> None:
         pass
 
 
+def _budget_limits() -> tuple[int, int]:
+    """(calls per hour, calls per day) for the local ledger."""
+    return (
+        _bounded_env_int("HOKIEFLOW_GEMINI_CALLS_PER_HOUR",
+                         DEFAULT_CALLS_PER_HOUR, 10_000),
+        _bounded_env_int("HOKIEFLOW_GEMINI_CALLS_PER_DAY",
+                         DEFAULT_CALLS_PER_DAY, 100_000),
+    )
+
+
+def _limit_source(name: str) -> str:
+    """Whether a limit came from the environment or from the code default.
+
+    A deployment can pin the old small values as app settings, which would leave
+    a new default with no effect -- and nothing in the response would say so.
+    """
+    return "env" if (os.environ.get(name) or "").strip() else "default"
+
+
 def budget_snapshot() -> dict:
     """How much of the local call budget is left, without spending any of it.
 
@@ -92,8 +118,7 @@ def budget_snapshot() -> dict:
     this guard or the per-client question throttle, not the Gemini key.
     """
     now = time.time()
-    hourly = _bounded_env_int("HOKIEFLOW_GEMINI_CALLS_PER_HOUR", 30, 10_000)
-    daily = _bounded_env_int("HOKIEFLOW_GEMINI_CALLS_PER_DAY", 120, 100_000)
+    hourly, daily = _budget_limits()
     stamps = [s for s in _load_budget_state() if now - s < 86_400]
     in_hour = sum(1 for stamp in stamps if now - stamp < 3_600)
     return {
@@ -103,14 +128,17 @@ def budget_snapshot() -> dict:
         "calls_today_limit": daily,
         "remaining_this_hour": max(0, hourly - in_hour),
         "remaining_today": max(0, daily - len(stamps)),
+        "limits_source": {
+            "calls_per_hour": _limit_source("HOKIEFLOW_GEMINI_CALLS_PER_HOUR"),
+            "calls_per_day": _limit_source("HOKIEFLOW_GEMINI_CALLS_PER_DAY"),
+        },
     }
 
 
 def _reserve_budget() -> None:
     """Guard the shared account quota, across processes and restarts."""
     now = time.time()
-    hourly = _bounded_env_int("HOKIEFLOW_GEMINI_CALLS_PER_HOUR", 30, 10_000)
-    daily = _bounded_env_int("HOKIEFLOW_GEMINI_CALLS_PER_DAY", 120, 100_000)
+    hourly, daily = _budget_limits()
     with _BUDGET_LOCK:
         stamps = [s for s in _load_budget_state() if now - s < 86_400]
         in_hour = sum(1 for stamp in stamps if now - stamp < 3_600)
