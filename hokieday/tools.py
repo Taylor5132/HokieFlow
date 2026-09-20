@@ -305,8 +305,14 @@ class LocalSource:
         statuses: list[dict] = []
         for num in nums:
             name = config.DINING_LOCATIONS.get(num, "")
+            # `at` is the request clock, NAIVE campus-local because dining
+            # compares it against hours-api wall-clock times (an aware value
+            # raises inside open_windows and silently degrades hours to
+            # "unknown"). Without the pin, a plan and its own status disagree
+            # about whether the hall is open at the instant being planned for.
             statuses.append(dining.location_status(
-                num, today, max_age_s=max_age_s).as_dict())
+                num, today, at=_now_naive(),
+                max_age_s=max_age_s).as_dict())
             # Prove calories BEFORE filtering when a hard ceiling is requested:
             # a future-captured/absent nutrition source must surface as a typed
             # skipped state, not as a silent "no items matched".
@@ -330,6 +336,7 @@ class LocalSource:
                 items = dining.eat_options(
                     num, today, diet=diet, avoid=tuple(avoid or ()),
                     max_kcal=max_kcal,
+                    at=_now_naive(),
                     open_only=open_only,
                     max_age_s=max_age_s,
                 )
@@ -949,6 +956,43 @@ def get_events(date: str = "today", tags: tuple[str, ...] = (),
             "coverage": result.get("coverage") or {},
             "fetched_at": result.get("fetched_at"),
             "month": result.get("month")}
+
+
+def resolve_stop(value: Any) -> str | None:
+    """Map a stop id OR a student-facing stop name to a GTFS stop id.
+
+    A language model cannot be expected to know that "Tennis Courts" is stop
+    1125, so names are resolved here against the loaded feed (cached on the
+    shared LocalSource, never re-read per call).
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        g = _LOCAL._g()                                       # noqa: SLF001
+    except Exception:                                        # noqa: BLE001
+        return None
+    if text in g.stops:
+        return text
+    want = text.lower()
+    exact = [sid for sid, s in g.stops.items() if str(s.name).strip().lower() == want]
+    if len(exact) == 1:
+        return exact[0]
+    prefix = [sid for sid, s in g.stops.items()
+              if str(s.name).strip().lower().startswith(want)]
+    if len(prefix) == 1:
+        return prefix[0]
+    partial = [sid for sid, s in g.stops.items() if want in str(s.name).lower()]
+    return partial[0] if len(partial) == 1 else None
+
+
+def known_stop_names(limit: int = 8) -> list[str]:
+    """A few real stop names, for an honest "I don't know that stop" reply."""
+    try:
+        names = sorted({str(s.name).strip() for s in _LOCAL._g().stops.values()})
+    except Exception:                                        # noqa: BLE001
+        return []
+    return names[:max(1, int(limit))]
 
 
 def predict_bus_delay(route_id: str, hour: int, source: Any = None) -> dict:
