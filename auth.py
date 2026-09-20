@@ -326,6 +326,22 @@ def _redirect_uri() -> str:
     return raw + GOOGLE_CALLBACK_PATH
 
 
+def canonical_origin() -> Optional[str]:
+    """The origin the OAuth callback is registered for, taken from APP_URL.
+
+    The state cookie is host-scoped, so the browser has to start and finish the
+    sign-in on this origin. Returns None when APP_URL is unset (local dev),
+    which disables the hand-over redirect.
+    """
+    raw = (os.getenv("APP_URL") or "").strip()
+    if not raw:
+        return None
+    parsed = urllib.parse.urlsplit(raw)
+    if not parsed.hostname:
+        return None
+    return f"{parsed.scheme or 'https'}://{parsed.netloc}"
+
+
 def _supabase_url() -> str:
     url = (os.getenv("SUPABASE_URL") or "").strip()
     if not url:

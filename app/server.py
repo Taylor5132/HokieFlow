@@ -60,6 +60,7 @@ try:                                                          # noqa: SIM105
     from auth import (
         clear_oauth_state_cookie,
         clear_session_cookie,
+        canonical_origin,
         get_oauth_state_cookie,
         get_session_cookie,
         handle_google_oauth_callback,
@@ -88,6 +89,7 @@ except Exception as _auth_exc:                                 # noqa: BLE001
             f"Import failed with {AUTH_UNAVAILABLE_REASON}")
 
     clear_oauth_state_cookie = _auth_unavailable
+    canonical_origin = lambda *a, **k: None  # noqa: E731
     clear_session_cookie = _auth_unavailable
     get_oauth_state_cookie = _auth_unavailable
     get_session_cookie = _auth_unavailable
@@ -1435,6 +1437,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"user": None}, 200)
             return
         if path == "/api/auth/google":
+            # The state cookie is scoped to the host that set it, so starting the
+            # flow on an alias host (say *.azurewebsites.net) would send the
+            # browser to APP_URL's callback with no cookie. Hand over to the
+            # canonical origin first so both ends of the flow share one host.
+            origin = canonical_origin()
+            host = (self.headers.get("Host") or "").split(":")[0].strip().lower()
+            if origin and host and host != (urlparse(origin).hostname or ""):
+                self._send(302, b"", "text/plain; charset=utf-8",
+                           [("Location", f"{origin}/api/auth/google"),
+                            ("Cache-Control", "no-store")])
+                return
             state = secrets.token_urlsafe(32)
             redirect = start_google_oauth({"state": state})
             self._send(302, b"", "text/plain; charset=utf-8",

@@ -13,10 +13,13 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from pathlib import Path
 
 os.environ.setdefault("DEMO_MODE", "cache")   # must precede hokieday imports
 
 from app import server, ui_files  # noqa: E402
+
+REPO = Path(__file__).resolve().parents[1]
 
 
 class DiningPlacesContract(unittest.TestCase):
@@ -434,3 +437,92 @@ class ReplayStoreIsReadOnlyContract(unittest.TestCase):
                 cache._write_envelope(target, "https://example.test/buses",
                                       {"data": [{"bus_id": "live"}]})
             self.assertTrue(target.exists(), "live caching still works")
+
+
+class OAuthHostContract(unittest.TestCase):
+    """Google sign-in has to start and finish on one host.
+
+    The OAuth state is an HttpOnly cookie, so it is scoped to the host that set
+    it, while Supabase returns the browser to APP_URL. Starting the flow on the
+    Azure alias therefore dropped the cookie: the callback answered "Missing
+    OAuth state", sent the browser to /?auth_error=..., and the home screen
+    rendered signed out with no explanation because the login screen (the only
+    place that showed the message) was never opened.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import threading
+        from http.server import ThreadingHTTPServer
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def _google_start(self, host):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
+        conn.request("GET", "/api/auth/google", headers={"Host": host})
+        response = conn.getresponse()
+        headers = dict(response.getheaders())
+        response.read()
+        conn.close()
+        return response.status, headers
+
+    @unittest.skipIf(not server.AUTH_AVAILABLE,
+                     "auth needs supabase + python-dotenv (pip install -r requirements.txt)")
+    def test_canonical_origin_is_read_from_app_url(self):
+        from unittest import mock
+        from auth import canonical_origin
+        for value, expected in {
+            "https://hokieflow.tech": "https://hokieflow.tech",
+            "https://hokieflow.tech/": "https://hokieflow.tech",
+            "https://hokieflow.tech/api/auth/google/callback": "https://hokieflow.tech",
+            "http://127.0.0.1:8321": "http://127.0.0.1:8321",
+        }.items():
+            with mock.patch.dict(os.environ, {"APP_URL": value}):
+                self.assertEqual(canonical_origin(), expected, value)
+        with mock.patch.dict(os.environ, {"APP_URL": ""}):
+            self.assertIsNone(canonical_origin(),
+                              "an unset APP_URL leaves local dev alone")
+
+    def test_alias_host_is_handed_to_the_canonical_origin(self):
+        from unittest import mock
+        with mock.patch.object(server, "AUTH_AVAILABLE", True), \
+                mock.patch.object(server, "canonical_origin",
+                                  lambda: "https://hokieflow.tech"):
+            status, headers = self._google_start("hokie-5132.azurewebsites.net")
+        self.assertEqual(status, 302)
+        self.assertEqual(headers["Location"], "https://hokieflow.tech/api/auth/google")
+        self.assertNotIn("Set-Cookie", headers,
+                         "a state cookie outside the callback host is useless")
+
+    def test_canonical_host_runs_the_normal_flow(self):
+        from unittest import mock
+        seen = []
+
+        def fake_start(request_state=None):
+            seen.append(request_state)
+            return "https://project.supabase.co/auth/v1/authorize?provider=google"
+
+        with mock.patch.object(server, "AUTH_AVAILABLE", True), \
+                mock.patch.object(server, "canonical_origin",
+                                  lambda: "https://hokieflow.tech"), \
+                mock.patch.object(server, "start_google_oauth", fake_start), \
+                mock.patch.object(server, "set_oauth_state_cookie",
+                                  lambda state: f"hokieflow_oauth_state={state}; Path=/"):
+            status, headers = self._google_start("HOKIEFLOW.TECH")
+        self.assertEqual(status, 302, "case differences are not another host")
+        self.assertIn("supabase", headers["Location"])
+        self.assertTrue(seen and seen[0].get("state"), "state is generated per browser")
+        self.assertIn("hokieflow_oauth_state", headers.get("Set-Cookie", ""))
+
+    def test_the_browser_says_why_sign_in_failed(self):
+        source = (REPO / "ui" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("escape(googleAuthErrorMessage)", source,
+                      "auth_error must be rendered, not captured and dropped")
