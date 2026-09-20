@@ -380,6 +380,45 @@ def canonical_origin() -> Optional[str]:
     return f"{parsed.scheme or 'https'}://{parsed.netloc}"
 
 
+def allowed_auth_hosts() -> set[str]:
+    """Hosts allowed to run the sign-in flow (APP_URL host and its www twin).
+
+    Supabase returns the browser to the host that started the flow, so the
+    callback has to be built from the request rather than assumed. Only hosts
+    derived from APP_URL (plus HOKIEFLOW_AUTH_HOSTS extras) are accepted, so
+    this can never become an open redirect.
+    """
+    hosts: set[str] = set()
+    origin = canonical_origin()
+    if origin:
+        host = (urllib.parse.urlsplit(origin).hostname or "").lower()
+        if host:
+            hosts.add(host)
+            hosts.add(host[4:] if host.startswith("www.") else f"www.{host}")
+    for extra in (os.getenv("HOKIEFLOW_AUTH_HOSTS") or "").split(","):
+        extra = extra.strip().lower()
+        if extra:
+            hosts.add(extra)
+    return hosts
+
+
+def redirect_uri_for(request_host: Optional[str] = None) -> str:
+    """Callback URL for the host the browser is on, falling back to APP_URL.
+
+    A flow that starts on www.hokieflow.tech but is told to come back to
+    hokieflow.tech loses its state cookie: the browser is now on a different
+    host than the one that set it. Matching the request host keeps the cookie
+    and the callback together, and APP_URL still anchors the allowed set.
+    """
+    default = _redirect_uri()
+    raw = (request_host or "").strip()
+    name = raw.split(":")[0].strip().lower()
+    if not raw or not name or name not in allowed_auth_hosts():
+        return default
+    scheme = urllib.parse.urlsplit(default).scheme or "https"
+    return f"{scheme}://{raw.lower()}{GOOGLE_CALLBACK_PATH}"
+
+
 def _supabase_url() -> str:
     url = (os.getenv("SUPABASE_URL") or "").strip()
     if not url:
@@ -404,12 +443,13 @@ def _pkce_challenge(verifier: str) -> str:
     return _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
 
 
-def start_google_oauth(request_state: Optional[Mapping[str, Any]] = None) -> str:
+def start_google_oauth(request_state: Optional[Mapping[str, Any]] = None,
+                       request_host: Optional[str] = None) -> str:
     """Return the Supabase URL that starts the Google sign-in flow."""
     state_value = (request_state or {}).get("state") or secrets.token_urlsafe(32)
     query = {
         "provider": "google",
-        "redirect_to": _redirect_uri(),
+        "redirect_to": redirect_uri_for(request_host),
         "state": state_value,
         "code_challenge": _pkce_challenge(_pkce_verifier(state_value)),
         "code_challenge_method": "s256",
@@ -420,7 +460,6 @@ def start_google_oauth(request_state: Optional[Mapping[str, Any]] = None) -> str
 
 def login_with_google(request_state: Optional[Mapping[str, Any]] = None) -> str:
     return start_google_oauth(request_state)
-
 
 def handle_google_oauth_callback(
     callback_params: Optional[Mapping[str, Any]],

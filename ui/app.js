@@ -20,13 +20,21 @@ let preferenceStorage;try{preferenceStorage=window.localStorage;}catch{}
 const preferences=loadPreferences(preferenceStorage);document.documentElement.dataset.theme=preferences.theme;let notificationMessage='',notificationBusy=false;const sentReminders=new Set();
 const state = {tab:'home',answer:null,clock:null,clockFailed:false,busy:false,error:'',query:'',review:'fits',status:null, savedClass:null, homeData:null, homeError:'',user:null,accountReady:false,accountError:'',accountData:{savedClass:null,reduceMotion:false,plans:[],events:[]},accountVersion:0,accountSaving:false};
 let googleAuthErrorMessage = (() => {
+  // Supabase reports OAuth failures by sending the browser to the Site URL with
+  // error / error_code / error_description in the query (or the fragment),
+  // never to our callback. Read both, or the failure is invisible.
   const params = new URLSearchParams(window.location.search);
-  const message = params.get('auth_error');
+  const hash = new URLSearchParams((window.location.hash || '').replace(/^#/, ''));
+  const message = [params.get('auth_error'),
+                   params.get('error_description') || params.get('error'),
+                   hash.get('error_description') || hash.get('error')]
+                  .filter(Boolean).join(' — ');
   if (!message) return '';
   const url = new URL(window.location.href);
-  url.searchParams.delete('auth_error');
-  history.replaceState({}, '', url);
-  return decodeURIComponent(message);
+  for (const key of ['auth_error','error','error_code','error_description']) url.searchParams.delete(key);
+  url.hash = '';
+  history.replaceState({}, '', url.pathname + url.search);
+  return message;
 })();
 let calendarMonth=new Date(new Date().getFullYear(),new Date().getMonth(),1),selectedDay=dateKey(new Date());
 let diningPlaces=[],diningLocation=null,diningLoading=false,diningError='',diningLoaded=false;

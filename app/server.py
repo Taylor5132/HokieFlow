@@ -62,6 +62,7 @@ try:                                                          # noqa: SIM105
         clear_session_cookie,
         canonical_origin,
         funnel,
+        allowed_auth_hosts,
         to_session_user,
         get_oauth_state_cookie,
         get_session_cookie,
@@ -92,6 +93,7 @@ except Exception as _auth_exc:                                 # noqa: BLE001
 
     clear_oauth_state_cookie = _auth_unavailable
     canonical_origin = lambda *a, **k: None  # noqa: E731
+    allowed_auth_hosts = lambda *a, **k: set()  # noqa: E731
     to_session_user = _auth_unavailable
 
     def funnel(*_args, **_kwargs):
@@ -1256,6 +1258,7 @@ def status() -> dict:
         "auth": {
             "available": AUTH_AVAILABLE,
             "canonical_origin": canonical_origin(),
+            "allowed_hosts": sorted(allowed_auth_hosts()),
             "funnel": funnel(),
         },
         "assumptions": {
@@ -1477,19 +1480,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"user": None}, 200)
             return
         if path == "/api/auth/google":
-            # The state cookie is scoped to the host that set it, so starting the
-            # flow on an alias host (say *.azurewebsites.net) would send the
-            # browser to APP_URL's callback with no cookie. Hand over to the
-            # canonical origin first so both ends of the flow share one host.
-            origin = canonical_origin()
-            host = (self.headers.get("Host") or "").split(":")[0].strip().lower()
-            if origin and host and host != (urlparse(origin).hostname or ""):
-                self._send(302, b"", "text/plain; charset=utf-8",
-                           [("Location", f"{origin}/api/auth/google"),
-                            ("Cache-Control", "no-store")])
-                return
+            # Build the callback from the host the browser is actually using.
+            # Forcing a different host (www -> apex, say) moves the state cookie
+            # to a host the OAuth redirect never returns to.
             state = secrets.token_urlsafe(32)
-            redirect = start_google_oauth({"state": state})
+            redirect = start_google_oauth({"state": state},
+                                          request_host=self.headers.get("Host"))
             self._send(302, b"", "text/plain; charset=utf-8",
                        [("Location", redirect),
                         ("Set-Cookie", set_oauth_state_cookie(state))])
