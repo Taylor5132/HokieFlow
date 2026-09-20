@@ -435,29 +435,28 @@ class LocalSource:
                     "fetched_at": None}
 
         day = _event_date_filter(date, self._now_local().date())
-        if day is not None and not (
-                day.year == events_mod.MONTH_YEAR and day.month == events_mod.MONTH_NUMBER):
-            return {"events": [], "state": events_mod.STATE_OUT_OF_SCOPE,
-                    "reason": (f"events scope is {events_mod.MONTH_KEY} "
-                               f"(Blacksburg); requested {day.isoformat()} is outside it"),
-                    "coverage": snap.coverage, "month": snap.month,
-                    "fetched_at": snap.fetched_at}
-
         result = events_mod.browse(snap, date_=day, now=self._now_local())
         rows = list(result.events)
         if tags:
             rows = [e for e in rows if _event_matches_tags(e, tags)]
 
-        if rows:
+        # Snapshot health (partial/stale) and scope (out-of-scope) take
+        # precedence over a filter producing zero rows: never report a
+        # degraded/unscoped snapshot as a clean no-match.
+        if result.state == events_mod.STATE_OUT_OF_SCOPE:
+            state = events_mod.STATE_OUT_OF_SCOPE
+        elif rows:
             state = result.state
-        elif result.state == events_mod.STATE_EMPTY:
-            state = events_mod.STATE_EMPTY
+        elif result.state in (events_mod.STATE_EMPTY, events_mod.STATE_PARTIAL,
+                              events_mod.STATE_STALE):
+            state = result.state
         else:
             state = events_mod.STATE_NO_MATCH
         notices = list(result.notices)
         if not rows and state == events_mod.STATE_NO_MATCH:
             notices.append("no events match the requested date/tags")
         return {"events": [e.to_dict() for e in rows], "state": state,
+                "match_state": result.match_state,
                 "reason": (" | ".join(notices) or None),
                 "coverage": snap.coverage, "month": snap.month,
                 "fetched_at": snap.fetched_at}
@@ -945,6 +944,7 @@ def get_events(date: str = "today", tags: tuple[str, ...] = (),
     return {"date": str(date), "tags": list(tags), "events": rows,
             "state": result.get("state") or (
                 events_mod.STATE_OK if rows else events_mod.STATE_EMPTY),
+            "match_state": result.get("match_state"),
             "reason": result.get("reason"),
             "coverage": result.get("coverage") or {},
             "fetched_at": result.get("fetched_at"),

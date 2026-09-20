@@ -23,15 +23,58 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import config
 
 
 class CacheMiss(RuntimeError):
     """Raised in cache-only mode when a fixture is not present."""
+
+
+# Explicit fetch outcomes. Callers must branch on these instead of inferring
+# freshness from ``age_seconds``: a failed refresh that fell back to a recent
+# cached copy has a small age but is NOT fresh.
+FETCH_FRESH = "fresh"        # this call refreshed the bytes from upstream
+FETCH_REUSED = "reused"      # served from disk without attempting upstream
+FETCH_STALE = "stale"        # upstream attempted and failed; stale copy served
+
+
+@dataclass(frozen=True)
+class CacheFetch:
+    """Result of a cache fetch with EXPLICIT provenance metadata.
+
+    ``status`` is one of ``fresh`` / ``reused`` / ``stale``. ``stale`` means an
+    upstream refresh was attempted and failed (or was suppressed) and an older
+    copy was served: the caller MUST treat that as a fetch failure, never as a
+    fresh read. ``fetched_at`` is the content timestamp from the on-disk
+    envelope (never inferred from the current clock).
+    """
+
+    value: Any
+    status: str
+    url: str
+    fetched_at: str | None = None
+    age_s: float | None = None
+    error: str | None = None
+    suppressed: bool = False
+    final_url: str | None = None
+
+    @property
+    def is_fresh(self) -> bool:
+        return self.status == FETCH_FRESH
+
+    @property
+    def is_stale(self) -> bool:
+        return self.status == FETCH_STALE
+
+    @property
+    def fetch_failed(self) -> bool:
+        """True when upstream could not be read and a stale copy was served."""
+        return self.status == FETCH_STALE
 
 
 class CacheRefreshError(RuntimeError):
@@ -172,11 +215,12 @@ def _now_iso() -> str:
 
 def _write_envelope(path: Path, url: str, payload: Any,
                     *, fetched_at: str | None = None,
-                    mode: str | None = None) -> None:
+                    mode: str | None = None) -> str:
+    actual_fetched_at = fetched_at or _now_iso()
     envelope = {
         "key": path.stem,
         "url": url,
-        "fetched_at": fetched_at or _now_iso(),
+        "fetched_at": actual_fetched_at,
         "mode": mode or config.DEMO_MODE,
         "payload": payload,
     }
@@ -200,6 +244,7 @@ def _write_envelope(path: Path, url: str, payload: Any,
             pass
         raise
     _cleanup_stale_tmp(path)
+    return actual_fetched_at
 
 
 def _cleanup_stale_tmp(path: Path) -> None:
@@ -258,10 +303,8 @@ def _http(url: str, timeout: int) -> bytes:
 def _http_post(url: str, data: bytes, timeout: int) -> bytes:
     """POST an application/x-www-form-urlencoded body.
 
-    Kept separate from ``_http`` so every existing GET caller (and the tests
-    that monkeypatch ``cache._http`` with a ``(url, timeout)`` callable) stays
-    untouched. The POST body is what makes it a *different* operation: an
-    ArcGIS route solve cannot be represented as a cache key by URL alone.
+    Kept separate from ``_http`` so existing GET callers and monkeypatch seams
+    remain stable. The encoded body participates in the POST cache identity.
     """
     req = urllib.request.Request(
         url, data=data,
@@ -269,6 +312,42 @@ def _http_post(url: str, data: bytes, timeout: int) -> bytes:
                  "Content-Type": "application/x-www-form-urlencoded"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
+
+
+def _http_final(url: str, timeout: int) -> tuple[bytes, str]:
+    """Like ``_http`` but also returns the final URL after redirects."""
+    req = urllib.request.Request(url, headers={"User-Agent": config.USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read(), r.geturl()
+
+
+def _envelope_fetched_at(path: Path) -> str | None:
+    """The content timestamp straight from the envelope, or None on error."""
+    try:
+        ts = _read_envelope(path).get("fetched_at")
+    except Exception:                          # noqa: BLE001 - corrupt/missing
+        return None
+    return ts or None
+
+
+def _reuse_result(path: Path, url: str, value: Any,
+                  name: str | None = None,
+                  params: dict | None = None) -> "CacheFetch":
+    ts = _envelope_fetched_at(path)
+    return CacheFetch(value=value, status=FETCH_REUSED, url=url,
+                      fetched_at=ts,
+                      age_s=age_seconds(name, params) if name else None,
+                      final_url=url)
+
+
+def _stale_result(path: Path, url: str, value: Any, exc: BaseException,
+                  name: str | None = None, params: dict | None = None,
+                  *, suppressed: bool = False) -> "CacheFetch":
+    ts = _envelope_fetched_at(path)
+    return CacheFetch(value=value, status=FETCH_STALE, url=url,
+                      fetched_at=ts,
+                      age_s=age_seconds(name, params) if name else None,
+                      error=str(exc), suppressed=suppressed, final_url=url)
 
 
 def _fetch_failed(exc: Exception) -> bool:
@@ -284,11 +363,25 @@ def age_seconds(name: str, params: dict | None = None) -> float | None:
     p = _json_path(name, params)
     if not p.exists():
         return None
+    ts = _envelope_fetched_at(p)
+    if ts is None:
+        return None
     try:
-        ts = datetime.fromisoformat(_read_envelope(p)["fetched_at"])
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds()
     except Exception:
         return None
-    return (datetime.now(timezone.utc) - ts).total_seconds()
+
+
+def fetched_at(name: str, params: dict | None = None) -> str | None:
+    """Content timestamp recorded for this key, or None.
+
+    Public replacement for reconstructing a timestamp from ``age_seconds``:
+    callers that must preserve the actual page fetch time read it directly.
+    """
+    p = _json_path(name, params)
+    if not p.exists():
+        return None
+    return _envelope_fetched_at(p)
 
 
 def is_stale(name: str, max_age_s: float, params: dict | None = None) -> bool:
@@ -304,12 +397,33 @@ def get_json(name: str, url: str, *, params: dict | None = None,
     live mode : fresh cache -> use it; else fetch; on failure -> stale copy.
     cache mode: read only; raise CacheMiss if nothing is on disk.
     """
+    return get_json_result(name, url, params=params, max_age_s=max_age_s,
+                           force=force, timeout=timeout).value
+
+
+def get_json_result(name: str, url: str, *, params: dict | None = None,
+                    max_age_s: float | None = None, force: bool = False,
+                    timeout: int = 30,
+                    require_final_url: Callable[[str], bool] | None = None,
+                    ) -> "CacheFetch":
+    """Like ``get_json`` but returns a ``CacheFetch`` with explicit provenance.
+
+    ``status`` distinguishes a real upstream refresh (``fresh``) from a cache
+    hit (``reused``) and from a failed refresh served from stale bytes
+    (``stale``). Callers must branch on ``status``/``fetch_failed`` rather than
+    infer freshness from the clock: a failed refresh over a recently cached
+    copy still reports ``stale``.
+
+    When ``require_final_url`` is given, the URL actually returned after any
+    redirects is revalidated and a disallowed final URL is treated as a failed
+    fetch (stale fallback / raise on cold cache).
+    """
     p = _json_path(name, params)
     k = key(name, params)
 
     if config.CACHE_ONLY:
         if p.exists():
-            return _read_envelope(p)["payload"]
+            return _reuse_result(p, url, _read_envelope(p)["payload"], name, params)
         raise CacheMiss(f"DEMO_MODE=cache and no fixture for {k}")
 
     # Fast path: a fresh on-disk entry needs no lock -- os.replace() publishes
@@ -317,7 +431,7 @@ def get_json(name: str, url: str, *, params: dict | None = None,
     if (not force and p.exists()
             and (max_age_s is None
                  or (age_seconds(name, params) or 1e18) <= max_age_s)):
-        return _read_envelope(p)["payload"]
+        return _reuse_result(p, url, _read_envelope(p)["payload"], name, params)
 
     with _key_lock(k):
         # Re-check INSIDE the lock: the caller that was waiting must observe the
@@ -326,29 +440,32 @@ def get_json(name: str, url: str, *, params: dict | None = None,
         fresh = have and (max_age_s is None
                           or (age_seconds(name, params) or 1e18) <= max_age_s)
         if fresh and not force:
-            return _read_envelope(p)["payload"]
+            return _reuse_result(p, url, _read_envelope(p)["payload"], name, params)
 
         suppressed = None if force else _suppress_retry(k, max_age_s)
         if suppressed is not None:
             if have:
                 print(f"[cache] WARN {k}: refresh skipped after recent failure "
                       f"({suppressed}); using cached copy")
-                return _read_envelope(p)["payload"]
+                return _stale_result(p, url, _read_envelope(p)["payload"], suppressed,
+                                     name, params, suppressed=True)
             # Cold cache + recent failure: do NOT hit upstream a second time.
             raise CacheRefreshError(
                 f"{k}: refresh suppressed after recent failure ({suppressed})") from suppressed
 
         try:
-            payload = json.loads(_http(url, timeout).decode("utf-8", "replace"))
+            data, final_url = _read_upstream(url, timeout, require_final_url)
+            payload = json.loads(data.decode("utf-8", "replace"))
         except Exception as exc:                 # noqa: BLE001 - deliberate breadth
             _record_failure(k, exc)
             if have:
                 print(f"[cache] WARN {k}: fetch failed ({exc}); using cached copy")
-                return _read_envelope(p)["payload"]
+                return _stale_result(p, url, _read_envelope(p)["payload"], exc, name, params)
             raise
         _clear_failure(k)
-        _write_envelope(p, url, payload)
-        return payload
+        ts = _write_envelope(p, url, payload)
+        return CacheFetch(value=payload, status=FETCH_FRESH, url=url,
+                          fetched_at=ts, age_s=0.0, final_url=final_url)
 
 
 def get_bytes(name: str, url: str, *, params: dict | None = None,
@@ -361,12 +478,27 @@ def get_bytes(name: str, url: str, *, params: dict | None = None,
     and its JSON metadata envelope share the same cache key, so the one lock
     serializes both publications without any nested acquisition (no deadlock).
     """
+    return get_bytes_result(name, url, params=params, max_age_s=max_age_s,
+                            force=force, timeout=timeout).value
+
+
+def get_bytes_result(name: str, url: str, *, params: dict | None = None,
+                     max_age_s: float | None = None, force: bool = False,
+                     timeout: int = 120,
+                     require_final_url: Callable[[str], bool] | None = None,
+                     ) -> "CacheFetch":
+    """Like ``get_bytes`` but returns a ``CacheFetch`` with explicit provenance.
+
+    Same contract as ``get_json_result``: ``status`` is authoritative and a
+    failed refresh over a recent cached blob still reports ``stale``.
+    """
     p = _bin_path(name, params)
     k = key(name, params)
 
     if config.CACHE_ONLY:
         if p.exists():
-            return p.read_bytes()
+            return _reuse_result(_json_path(name, params), url,
+                                 p.read_bytes(), name, params)
         raise CacheMiss(f"DEMO_MODE=cache and no binary fixture for {k}")
 
     # Fast path: a fresh on-disk entry needs no lock -- os.replace() publishes
@@ -374,7 +506,8 @@ def get_bytes(name: str, url: str, *, params: dict | None = None,
     if (not force and p.exists()
             and (max_age_s is None
                  or (age_seconds(name, params) or 1e18) <= max_age_s)):
-        return p.read_bytes()
+        return _reuse_result(_json_path(name, params), url,
+                             p.read_bytes(), name, params)
 
     with _key_lock(k):
         # Re-check INSIDE the lock: the caller that was waiting must observe the
@@ -383,31 +516,53 @@ def get_bytes(name: str, url: str, *, params: dict | None = None,
         fresh = have and (max_age_s is None
                           or (age_seconds(name, params) or 1e18) <= max_age_s)
         if fresh and not force:
-            return p.read_bytes()
+            return _reuse_result(_json_path(name, params), url,
+                                 p.read_bytes(), name, params)
 
         suppressed = None if force else _suppress_retry(k, max_age_s)
         if suppressed is not None:
             if have:
                 print(f"[cache] WARN {k}: refresh skipped after recent failure "
                       f"({suppressed}); using cached copy")
-                return p.read_bytes()
+                return _stale_result(_json_path(name, params), url,
+                                     p.read_bytes(), suppressed, name, params,
+                                     suppressed=True)
             # Cold cache + recent failure: do NOT hit upstream a second time.
             raise CacheRefreshError(
                 f"{k}: refresh suppressed after recent failure ({suppressed})") from suppressed
 
         try:
-            data = _http(url, timeout)
+            data, final_url = _read_upstream(url, timeout, require_final_url)
         except Exception as exc:                 # noqa: BLE001 - deliberate breadth
             _record_failure(k, exc)
             if have:
                 print(f"[cache] WARN {k}: fetch failed ({exc}); using cached copy")
-                return p.read_bytes()
+                return _stale_result(_json_path(name, params), url,
+                                     p.read_bytes(), exc, name, params)
             raise
         _clear_failure(k)
         _write_bytes_atomic(p, data)
-        _write_envelope(_json_path(name, params), url,
-                        {"bytes": len(data), "file": p.name})
-        return data
+        ts = _write_envelope(_json_path(name, params), url,
+                             {"bytes": len(data), "file": p.name})
+        return CacheFetch(value=data, status=FETCH_FRESH, url=url,
+                          fetched_at=ts, age_s=0.0, final_url=final_url)
+
+
+def _read_upstream(url: str, timeout: int,
+                   require_final_url: Callable[[str], bool] | None,
+                   ) -> tuple[bytes, str]:
+    """Fetch upstream bytes and, when required, revalidate the redirect target.
+
+    When no validator is supplied we call the module-level ``_http`` seam the
+    tests monkeypatch; when redirect revalidation is requested we use the
+    final-URL-aware variant and reject a disallowed destination.
+    """
+    if require_final_url is None:
+        return _http(url, timeout), url
+    data, final_url = _http_final(url, timeout)
+    if not require_final_url(final_url):
+        raise ValueError(f"redirected to disallowed URL: {final_url}")
+    return data, final_url
 
 
 def _post_cache_params(url: str, encoded_form: bytes,

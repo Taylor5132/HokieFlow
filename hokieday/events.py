@@ -35,13 +35,14 @@ from __future__ import annotations
 import hashlib
 import html as _html
 import json
+import posixpath
 import re
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 from . import config
@@ -79,6 +80,10 @@ STATE_STALE = "stale"
 STATE_PARTIAL = "partial"
 STATE_NO_MATCH = "no-match"
 STATE_OUT_OF_SCOPE = "out-of-scope"
+# Independent of health state: did the filters/query match anything? A partial
+# or stale snapshot may have zero matches, and it must stay partial/stale rather
+# than collapse to no-match.
+STATE_MATCH = "match"
 
 ADMISSION_FREE = "free"
 ADMISSION_PAID = "paid"
@@ -102,23 +107,53 @@ def validate_month(month: str | None) -> bool:
 
 
 def allowed_fetch_url(url: str) -> bool:
-    """True when ``url`` is a safe, public events.vt.edu GET target."""
+    """True when ``url`` is a safe, public events.vt.edu GET target.
+
+    Strict HTTPS + exact host + public content paths. Ports (including
+    malformed/out-of-range ones), userinfo, percent-encoded or normalized
+    traversal, backslashes and NUL bytes are all rejected before any socket is
+    opened. Redirect targets must be revalidated with this same predicate.
+    """
     try:
         p = urlparse(url)
-    except ValueError:
+        if p.scheme != "https" or p.hostname != ALLOWED_HOST:
+            return False
+        if p.username or p.password:
+            return False
+        # ``.port`` raises ValueError for non-numeric/out-of-range ports.
+        if p.port not in (None, 443):
+            return False
+    except (ValueError, AttributeError):
         return False
-    if p.scheme != "https" or p.hostname != ALLOWED_HOST:
-        return False
-    if p.username or p.password:
-        return False
-    if p.port not in (None, 443):
-        return False
-    path = p.path or "/"
-    if ".." in path or "\\" in path:
+    path = _safe_decoded_path(p.path or "/")
+    if path is None:
         return False
     if path in ALLOWED_EXACT_PATHS:
         return True
     return any(path.startswith(pref) for pref in ALLOWED_PATH_PREFIXES)
+
+
+def _safe_decoded_path(path: str) -> str | None:
+    """Percent-decode and normalize a URL path, or None if it escapes the root.
+
+    ``%2e%2e`` / ``%2f`` / backslash encodings are decoded (repeatedly, to
+    defeat double-encoding) before the traversal check, so no encoded form can
+    smuggle ``..`` past the allowlist.
+    """
+    decoded = path
+    for _ in range(4):
+        nxt = unquote(decoded)
+        if nxt == decoded:
+            break
+        decoded = nxt
+    if "\x00" in decoded or "\\" in decoded:
+        return None
+    if any(seg == ".." for seg in decoded.split("/")):
+        return None
+    normalized = posixpath.normpath(decoded)
+    if normalized == ".." or normalized.startswith("../") or "/../" in normalized:
+        return None
+    return decoded
 
 
 def resolve_url(base_url: str, href: str | None) -> str | None:
@@ -305,7 +340,19 @@ class Event:
         """True when HokieFlow must not recommend this into a free gap."""
         return (self.status in (STATUS_CANCELLED, STATUS_CANCELLED_UNCERTAIN,
                                 STATUS_PARSER_FAILED)
-                or self.duration_unknown)
+                or self.duration_unknown
+                or self.invalid_range)
+
+    @property
+    def invalid_range(self) -> bool:
+        """True when the source states an end before the start.
+
+        Such a row can still list in browse (the source page is what it is) but
+        it is never recommendable and never fits a gap: the interval is
+        nonsense, so we refuse to reason about it.
+        """
+        s, e = self.start_dt, self.end_dt
+        return s is not None and e is not None and e < s
 
     def to_dict(self) -> dict:
         return {
@@ -330,6 +377,7 @@ class Event:
             "in_person": self.in_person,
             "free_food": self.free_food,
             "duration_unknown": self.duration_unknown,
+            "invalid_range": self.invalid_range,
             "not_recommendable": self.not_recommendable,
             "miss_streak": self.miss_streak,
             "all_day": self.all_day,
@@ -378,12 +426,14 @@ class BrowseResult:
     total: int
     state: str
     notices: tuple[str, ...] = ()
+    match_state: str = STATE_MATCH
 
     def to_dict(self) -> dict:
         return {
             "events": [e.to_dict() for e in self.events],
             "total": self.total,
             "state": self.state,
+            "match_state": self.match_state,
             "notices": list(self.notices),
         }
 
@@ -624,10 +674,12 @@ def parse_listing(html_text: str, base_url: str = "") -> list[EventCard]:
         cat = _class_value(classes, "categories")
         admission = _admission_from_class(classes)
         types = re.findall(r"(?:^|\s)types ([\w-]+)", classes)
-        if "online" in types:
-            in_person: bool | None = False
-        elif "in-person" in types or "hybrid" in types:
-            in_person = True
+        # A physical signal (in-person/hybrid) overrides an online signal; only a
+        # pure online listing is treated as not-in-person.
+        if "in-person" in types or "hybrid" in types:
+            in_person: bool | None = True
+        elif "online" in types or "virtual" in types:
+            in_person = False
         else:
             in_person = None
         feats = re.findall(r"(?:^|\s)features ([\w-]+)", classes)
@@ -868,11 +920,17 @@ def _category_from_tags(tags: Sequence[str]) -> str | None:
 
 
 def _in_person_from_tags(tags: Sequence[str]) -> bool | None:
+    """Tri-state physical-presence signal.
+
+    A physical tag (in-person/hybrid) wins over an online/virtual tag, so a
+    hybrid event is not mislabelled online. Only a page with online/virtual and
+    NO physical tag is treated as online-only.
+    """
     lowered = {_norm(t) for t in tags}
-    if "online" in lowered or "virtual" in lowered:
-        return False
-    if "in-person" in lowered or "in person" in lowered or "hybrid" in lowered:
+    if lowered & {"in-person", "in person", "hybrid"}:
         return True
+    if lowered & {"online", "virtual"}:
+        return False
     return None
 
 
@@ -920,14 +978,18 @@ def is_blacksburg(address: str = "", location_name: str = "",
                   tags: Sequence[str] = ()) -> bool:
     """Blacksburg-area predicate (order matters).
 
-    1. Online-only events are never Blacksburg.
+    1. Only an ONLINE-ONLY event is rejected: an online/virtual tag with no
+       in-person/hybrid tag. A hybrid/in-person signal overrides online, so a
+       hybrid event at a Blacksburg venue is kept.
     2. An explicit non-Blacksburg city in the address overrides any venue-name
        fallback (e.g. the Arlington VT Research Center).
     3. A Blacksburg address hint, a Blacksburg tag, or a known campus venue
        makes it Blacksburg.
     """
     lowered_tags = [_norm(t) for t in tags]
-    if any(t in ("online", "virtual") for t in lowered_tags):
+    online = any(t in ("online", "virtual") for t in lowered_tags)
+    physical = any(t in ("in-person", "in person", "hybrid") for t in lowered_tags)
+    if online and not physical:
         return False
     if any("blacksburg" in t for t in lowered_tags):
         return True
@@ -1025,6 +1087,36 @@ def filter_events(events: Iterable[Event], *,
     return sorted(out, key=_sort_key)
 
 
+def _month_bounds() -> tuple[datetime, datetime]:
+    """Campus-local [start, end) of the fixed September 2026 scope."""
+    start = datetime(MONTH_YEAR, MONTH_NUMBER, 1, tzinfo=_EVT_TZ)
+    end = datetime(MONTH_YEAR, MONTH_NUMBER + 1, 1, tzinfo=_EVT_TZ)
+    return start, end
+
+
+def _out_of_scope_reason(date_: date | str | None, start: Any, end: Any) -> str | None:
+    """Return a human reason when the requested date/range is outside 2026-09.
+
+    ``browse`` enforces the fixed scope ITSELF, so a direct caller cannot get
+    September-filtered facts labelled against an October request.
+    """
+    if date_ is not None:
+        day = date.fromisoformat(date_) if isinstance(date_, str) else date_
+        if not (day.year == MONTH_YEAR and day.month == MONTH_NUMBER):
+            return (f"events scope is {MONTH_KEY} (Blacksburg); requested "
+                    f"{day.isoformat()} is outside it")
+    lo = _as_datetime(start)
+    hi = _as_datetime(end)
+    month_start, month_end = _month_bounds()
+    if lo is not None and lo >= month_end:
+        return (f"events scope is {MONTH_KEY} (Blacksburg); requested range "
+                f"starts {lo.date().isoformat()}, after the covered month")
+    if hi is not None and hi < month_start:
+        return (f"events scope is {MONTH_KEY} (Blacksburg); requested range "
+                f"ends {hi.date().isoformat()}, before the covered month")
+    return None
+
+
 def browse(snapshot: "Snapshot", *,
            query: str | None = None,
            date_: date | str | None = None,
@@ -1042,10 +1134,20 @@ def browse(snapshot: "Snapshot", *,
     """The single browse/list/search/filter entry point for the UI.
 
     Returns a ``BrowseResult`` whose ``state`` is one of ``ok``, ``empty``,
-    ``no-match``, ``stale`` or ``partial`` so the frontend can render the right
-    empty/failure state without re-deriving it.
+    ``no-match``, ``stale``, ``partial`` or ``out-of-scope``. Snapshot HEALTH
+    takes precedence over match state: ``partial``/``stale`` are never reported
+    as ``no-match``. ``match_state`` separately reports whether the filters
+    matched anything (``match`` / ``no-match`` / ``empty`` / ``out-of-scope``).
     """
     notices: list[str] = []
+
+    # The fixed September 2026 window is enforced HERE, not only in callers.
+    scope_reason = _out_of_scope_reason(date_, start, end)
+    if scope_reason is not None:
+        return BrowseResult(events=(), total=0, state=STATE_OUT_OF_SCOPE,
+                            notices=(scope_reason,),
+                            match_state=STATE_OUT_OF_SCOPE)
+
     base_state = snapshot_state(snapshot, now=now)
     if base_state == STATE_STALE:
         notices.append(
@@ -1059,7 +1161,8 @@ def browse(snapshot: "Snapshot", *,
     if base_state == STATE_EMPTY:
         return BrowseResult(events=(), total=0, state=STATE_EMPTY,
                             notices=tuple(notices + [
-                                "No events match September 2026 Blacksburg coverage."]))
+                                "No events match September 2026 Blacksburg coverage."]),
+                            match_state=STATE_EMPTY)
 
     matched = filter_events(
         snapshot.events, date_=date_, start=start, end=end, category=category,
@@ -1068,17 +1171,25 @@ def browse(snapshot: "Snapshot", *,
         only_known_location=only_known_location)
     matched = search(matched, query)
     total = len(matched)
+    has_filters = bool(query or date_ or category or free is not None
+                       or free_food is not None or in_person is not None
+                       or start or end)
+    match_state = STATE_MATCH if total else STATE_NO_MATCH
     if total == 0:
-        state = STATE_NO_MATCH if (query or date_ or category or free is not None
-                                   or free_food is not None or in_person is not None
-                                   or start or end) else base_state
         notices.append("No events found for these filters.")
+
+    # HEALTH PRECEDENCE: an unhealthy snapshot stays partial/stale even when no
+    # row matched; only a healthy snapshot (or an empty one) can be no-match.
+    if base_state in (STATE_PARTIAL, STATE_STALE):
+        state = base_state
+    elif total == 0 and has_filters:
+        state = STATE_NO_MATCH
     else:
         state = base_state
     if limit is not None and limit >= 0:
         matched = matched[:limit]
     return BrowseResult(events=tuple(matched), total=total, state=state,
-                        notices=tuple(notices))
+                        notices=tuple(notices), match_state=match_state)
 
 
 # ---------------------------------------------------------------- dedupe
@@ -1145,7 +1256,7 @@ def fits_gap(event: Event, gaps: Iterable[Gap | tuple | list | Mapping]) -> Gap 
     (it still lists in browse).
     """
     st = _event_start(event)
-    if st is None or event.duration_unknown:
+    if st is None or event.duration_unknown or event.invalid_range:
         return None
     en = event.end_dt
     for gap in gaps:
@@ -1258,14 +1369,15 @@ def snapshot_state(snapshot: Snapshot, *, now: datetime | None = None,
                    stale_after_h: float = EVENTS_STALE_AFTER_H) -> str:
     """One of ``empty``/``partial``/``stale``/``ok`` (worst state wins).
 
-    ANY fetch or parse failure makes the snapshot ``partial`` (never ``ok``):
-    the crawl saw pages it could not turn into events. An empty snapshot is
-    empty even if also stale.
+    ANY fetch or parse failure makes the snapshot ``partial`` (never ``ok`` or
+    ``empty``): the crawl saw pages it could not turn into events, so a
+    zero-event snapshot is still a degraded crawl, not proof that nothing
+    exists. An empty snapshot with no failures is empty even if also stale.
     """
-    if not snapshot.events:
-        return STATE_EMPTY
     if snapshot.parser_failures or snapshot.fetch_failures:
         return STATE_PARTIAL
+    if not snapshot.events:
+        return STATE_EMPTY
     fetched = parse_event_time(snapshot.fetched_at)
     if fetched is None:
         return STATE_STALE
@@ -1305,7 +1417,13 @@ def to_calendar_event(event: Event, *, dtstamp: datetime | None = None) -> dict:
     st = _event_start(event) or config.now(_EVT_TZ)
     if event.all_day:
         start_date = to_campus(st).date()
-        end_date = start_date + timedelta(days=1)      # DATE DTEND is exclusive
+        # Preserve an explicit multi-day end (DATE DTEND is exclusive); fall
+        # back to the next day only when the source gave no later end.
+        explicit_end = to_campus(event.end_dt).date() if event.end_dt else None
+        if explicit_end is not None and explicit_end > start_date:
+            end_date = explicit_end
+        else:
+            end_date = start_date + timedelta(days=1)
         en = datetime.combine(end_date, time.min, tzinfo=_EVT_TZ)
         dtstart_key, dtstart_val = "DTSTART;VALUE=DATE", _ics_date(start_date)
         dtend_key, dtend_val = "DTEND;VALUE=DATE", _ics_date(end_date)
@@ -1420,7 +1538,7 @@ __all__ = [
     "Event", "Gap", "BrowseResult", "Snapshot", "STATUS_SCHEDULED",
     "STATUS_CANCELLED", "STATUS_CANCELLED_UNCERTAIN", "STATUS_PARSER_FAILED",
     "STATUS_STALE", "STATUS_UNKNOWN", "STATE_OK", "STATE_EMPTY", "STATE_STALE",
-    "STATE_PARTIAL", "STATE_NO_MATCH", "STATE_OUT_OF_SCOPE", "ADMISSION_FREE", "ADMISSION_PAID",
+    "STATE_PARTIAL", "STATE_NO_MATCH", "STATE_OUT_OF_SCOPE", "STATE_MATCH", "ADMISSION_FREE", "ADMISSION_PAID",
     "ADMISSION_UNKNOWN", "ALLOWED_HOST", "validate_month", "allowed_fetch_url",
     "resolve_url", "parse_event_time", "to_campus", "in_month",
     "in_september_2026", "event_id", "parse_sitemap", "sitemap_month_urls",

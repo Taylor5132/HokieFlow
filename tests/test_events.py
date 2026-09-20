@@ -7,12 +7,13 @@ fake contact emails/phones so the no-PII guarantee is actually exercised.
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from hokieday import config, events
+from hokieday import cache, config, events
 
 FIX = Path(config.FIXTURES_DIR) / "events"
 TZ = ZoneInfo("America/New_York")
@@ -558,6 +559,29 @@ class UrlPolicyTests(unittest.TestCase):
                     "https://events.vt.edu:8443/x", "https://events.vt.edu/../secret"):
             self.assertFalse(events.allowed_fetch_url(bad), bad)
 
+    def test_url_policy_rejects_malformed_ports_and_encoded_traversal(self):
+        for bad in (
+            "https://events.vt.edu:99999/x",          # port out of range
+            "https://events.vt.edu:443abc/x",         # non-numeric port
+            "https://events.vt.edu:-1/x",             # negative port
+            "https://events.vt.edu:0/x",              # non-443 port
+            "https://events.vt.edu/%2e%2e/secret",
+            "https://events.vt.edu/%2E%2E/%2E%2E/secret",
+            "https://events.vt.edu/events/%2e%2e/%2e%2e/sitemap.xml",
+            "https://events.vt.edu/events%2f..%2f..%2fsecret",
+            "https://events.vt.edu/events/..%5csecret",
+            "https://events.vt.edu/events/%00x.html",
+            "https://events.vt.edu/events/%252e%252e/secret",   # double-encoded
+            "https://events.vt.edu.evil.com/x",
+            "https://events.vt.edu@evil.com/x",
+        ):
+            self.assertFalse(events.allowed_fetch_url(bad), bad)
+        # the expected crawler paths remain allowed
+        self.assertTrue(events.allowed_fetch_url(
+            "https://events.vt.edu/events/2026/09.html"))
+        self.assertTrue(events.allowed_fetch_url(
+            "https://events.vt.edu/events/2026.html"))
+
     def test_resolve_url(self):
         self.assertEqual(events.resolve_url("https://events.vt.edu/a/b.html", "/events/x.html"),
                          "https://events.vt.edu/events/x.html")
@@ -636,6 +660,39 @@ class BlacksburgTests(unittest.TestCase):
     def test_unknown_address_uses_venue(self):
         self.assertTrue(events.is_blacksburg("", "Moss Arts Center", ()))
 
+    def test_hybrid_physical_signal_overrides_online(self):
+        # A hybrid/in-person tag overrides an online tag; only online-only is
+        # rejected. This is the adversarial case (both tags present).
+        self.assertTrue(events.is_blacksburg(
+            "Blacksburg, VA 24061", "Squires", ("Online", "Hybrid")))
+        self.assertTrue(events.is_blacksburg(
+            "Blacksburg, VA 24061", "Squires", ("Virtual", "In-Person")))
+
+
+class InPersonOverrideTests(unittest.TestCase):
+    def test_listing_hybrid_overrides_online(self):
+        # The CMS repeats the `types X` class per variant (`types_-X` is the
+        # marker); this card carries BOTH an online and a hybrid signal.
+        html = ("<ul><li class='event-page types online types_-online "
+                "types hybrid types_-hybrid'>"
+                "<a href='/events/2026/09/x.html' "
+                "class='vt-list-item-title-link'>Hybrid</a></li></ul>")
+        card = events.parse_listing(html, "https://events.vt.edu/events.html")[0]
+        self.assertTrue(card.in_person)
+
+    def test_listing_online_only_is_online(self):
+        html = ("<ul><li class='event-page types online'>"
+                "<a href='/events/2026/09/x.html' "
+                "class='vt-list-item-title-link'>Online</a></li></ul>")
+        card = events.parse_listing(html, "https://events.vt.edu/events.html")[0]
+        self.assertFalse(card.in_person)
+
+    def test_tags_hybrid_overrides_online(self):
+        self.assertTrue(events._in_person_from_tags(["Online", "Hybrid"]))
+        self.assertTrue(events._in_person_from_tags(["Virtual", "In-Person"]))
+        self.assertFalse(events._in_person_from_tags(["Online"]))
+        self.assertIsNone(events._in_person_from_tags(["Lecture"]))
+
 
 class FreeFoodTriStateTests(unittest.TestCase):
     def test_none_is_not_matched_by_true_or_false(self):
@@ -658,6 +715,19 @@ class IcsHardeningTests(unittest.TestCase):
         self.assertEqual(cal["ics"]["DTSTART;VALUE=DATE"], "20260922")
         self.assertEqual(cal["ics"]["DTEND;VALUE=DATE"], "20260923")
         self.assertIn("DTSTART;VALUE=DATE:20260922", events.to_ics([ev]))
+
+    def test_all_day_multiday_preserves_explicit_exclusive_end(self):
+        # A three-day all-day event: the source end (09-24) is preserved as the
+        # exclusive DTEND instead of being flattened to start + 1 day.
+        ev = make_event(start="2026-09-22", end="2026-09-24", all_day=True)
+        cal = events.to_calendar_event(ev)
+        self.assertEqual(cal["ics"]["DTSTART;VALUE=DATE"], "20260922")
+        self.assertEqual(cal["ics"]["DTEND;VALUE=DATE"], "20260924")
+
+    def test_all_day_same_day_end_falls_back_to_one_day(self):
+        ev = make_event(start="2026-09-22", end="2026-09-22", all_day=True)
+        cal = events.to_calendar_event(ev)
+        self.assertEqual(cal["ics"]["DTEND;VALUE=DATE"], "20260923")
 
     def test_crlf_injection_is_neutralized(self):
         ev = make_event(title="Evil\r\nEND:VEVENT:injected")
@@ -773,6 +843,252 @@ class CrawlerLogicTests(unittest.TestCase):
                 self.assertEqual(len(snap["events"]), 1)
             finally:
                 config.CACHE_DIR = old_cache
+
+
+class BrowseScopeTests(unittest.TestCase):
+    """browse() enforces the fixed window and keeps health above match state."""
+
+    def _snap(self, evs, *, fetched_at="2026-09-19T15:00:00+00:00", **kw):
+        return events.Snapshot(
+            month="2026-09", generated_at=fetched_at, fetched_at=fetched_at,
+            source={}, coverage={}, events=tuple(evs), **kw)
+
+    def test_browse_rejects_out_of_scope_date(self):
+        snap = self._snap([make_event()])
+        res = events.browse(snap, date_="2026-10-05")
+        self.assertEqual(res.state, events.STATE_OUT_OF_SCOPE)
+        self.assertEqual(res.match_state, events.STATE_OUT_OF_SCOPE)
+        self.assertEqual(res.events, ())
+        self.assertTrue(res.notices)
+
+    def test_browse_rejects_out_of_scope_range_but_allows_overlap(self):
+        snap = self._snap([make_event()])
+        after = events.browse(snap, start="2026-10-01T00:00:00-04:00")
+        self.assertEqual(after.state, events.STATE_OUT_OF_SCOPE)
+        before = events.browse(snap, end="2026-08-01T00:00:00-04:00")
+        self.assertEqual(before.state, events.STATE_OUT_OF_SCOPE)
+        overlap = events.browse(
+            snap, start="2026-09-01T00:00:00-04:00",
+            end="2026-10-15T00:00:00-04:00")
+        self.assertNotEqual(overlap.state, events.STATE_OUT_OF_SCOPE)
+
+    def test_partial_snapshot_with_zero_matches_stays_partial(self):
+        now = datetime(2026, 9, 19, 16, tzinfo=timezone.utc)
+        snap = events.Snapshot(
+            month="2026-09", generated_at="t",
+            fetched_at="2026-09-19T15:00:00+00:00", source={}, coverage={},
+            events=(make_event(),), parser_failures=("https://x/bad",))
+        res = events.browse(snap, query="zzz", now=now)
+        self.assertEqual(res.state, events.STATE_PARTIAL,
+                         "health must not collapse to no-match")
+        self.assertEqual(res.match_state, events.STATE_NO_MATCH)
+        self.assertEqual(res.total, 0)
+        self.assertIn("No events found", " ".join(res.notices))
+
+    def test_stale_snapshot_with_zero_matches_stays_stale(self):
+        now = datetime(2026, 9, 25, 16, tzinfo=timezone.utc)
+        snap = self._snap([make_event()])
+        res = events.browse(snap, query="zzz", now=now)
+        self.assertEqual(res.state, events.STATE_STALE)
+        self.assertEqual(res.match_state, events.STATE_NO_MATCH)
+
+    def test_healthy_zero_matches_is_no_match(self):
+        now = datetime(2026, 9, 19, 16, tzinfo=timezone.utc)
+        snap = self._snap([make_event()])
+        res = events.browse(snap, query="zzz", now=now)
+        self.assertEqual(res.state, events.STATE_NO_MATCH)
+        self.assertEqual(res.match_state, events.STATE_NO_MATCH)
+
+
+class InvalidRangeTests(unittest.TestCase):
+    def test_end_before_start_is_invalid_and_non_recommendable(self):
+        ev = make_event(start="2026-09-22T12:00-04:00",
+                        end="2026-09-22T10:00-04:00")
+        self.assertTrue(ev.invalid_range)
+        self.assertTrue(ev.not_recommendable)
+        self.assertFalse(events.to_calendar_event(ev)["recommendable"])
+        # still lists / exports, it is just never recommended
+        self.assertTrue(ev.to_dict()["invalid_range"])
+        gap = events.Gap(datetime(2026, 9, 22, 9, tzinfo=TZ),
+                         datetime(2026, 9, 22, 23, tzinfo=TZ))
+        self.assertIsNone(events.fits_gap(ev, [gap]))
+        self.assertEqual(events.recommendable([ev], [gap]), [])
+
+    def test_equal_start_and_end_is_invalid(self):
+        ev = make_event(start="2026-09-22T10:00-04:00",
+                        end="2026-09-22T10:00-04:00")
+        self.assertFalse(ev.invalid_range)   # equal is zero-length, not reversed
+
+
+class CrawlerIncrementalTests(unittest.TestCase):
+    """Adversarial incremental sequences for the edge crawler.
+
+    These exercise the live cache path with a fake network: parse failure must
+    not freeze accepted state and must retry; a stale refresh fallback must not
+    advance accepted state, must count as a fetch failure, and must retry.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "crawl_events_incr", REPO / "scripts" / "crawl_events.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        cls.mod = mod
+
+    def setUp(self):
+        self._only = config.CACHE_ONLY
+        self._dir = config.CACHE_DIR
+        self._http_final = cache._http_final
+        self._orig_sleep = self.mod.Fetcher._sleep
+        # No real throttle sleeps in tests: the polite delay is exercised by the
+        # bots/allowlist tests, not by every incremental sequence.
+        self.mod.Fetcher._sleep = lambda self: None
+        self._tmp = tempfile.mkdtemp(prefix="hokie-crawl-incr-")
+        config.CACHE_ONLY = False
+        config.CACHE_DIR = Path(self._tmp)
+        cache._attempts.clear()
+        cache._key_locks.clear()
+        self.detail_url = ("https://events.vt.edu/events/2026/09/"
+                           "study-abroad-fair.html")
+
+    def tearDown(self):
+        import shutil
+        cache._http_final = self._http_final
+        self.mod.Fetcher._sleep = self._orig_sleep
+        config.CACHE_ONLY = self._only
+        config.CACHE_DIR = self._dir
+        cache._attempts.clear()
+        cache._key_locks.clear()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _seed(self, url, body, ts="2026-09-01T00:00:00+00:00"):
+        import hashlib
+        params = {"u": hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]}
+        p = cache._bin_path("events_page", params)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(body)
+        cache._json_path("events_page", params).write_text(json.dumps({
+            "key": p.stem, "url": url, "fetched_at": ts, "mode": "live",
+            "payload": {"bytes": len(body), "file": p.name}}), encoding="utf-8")
+
+    def _sitemap(self, lastmod):
+        return ("<?xml version='1.0'?><urlset>"
+                f"<url><loc>{self.detail_url}</loc><lastmod>{lastmod}</lastmod></url>"
+                "</urlset>").encode("utf-8")
+
+    def _net(self, detail_body, sitemap_body, robots=None):
+        robots = robots if robots is not None else \
+            b"User-agent: *\nAllow: /\nCrawl-delay: 10\n"
+
+        def http_final(url, timeout):
+            if url.endswith("/robots.txt"):
+                return robots, url
+            if url.endswith("/sitemap.xml"):
+                return sitemap_body, url
+            if url == self.detail_url:
+                return detail_body, url
+            return b"<html></html>", url
+        return http_final
+
+    def _args(self, out, state):
+        import argparse
+        return argparse.Namespace(
+            month="2026-09", dry_run=False, from_cache=False, throttle=10,
+            out=str(out), state=str(state), max_pages=200,
+            all_locations=False, include_summary=False)
+
+    def test_parse_failure_does_not_advance_state_and_retries(self):
+        out = Path(self._tmp) / "out.json"
+        state = Path(self._tmp) / "state.json"
+        sitemap = self._sitemap("2026-09-01")
+        bad = read("detail_malformed.html").encode("utf-8")
+        good = read("detail_study_abroad.html").encode("utf-8")
+
+        cache._http_final = self._net(bad, sitemap)
+        self.assertEqual(self.mod.crawl(self._args(out, state)), 0)
+        snap = events.load_snapshot(out)
+        self.assertTrue(snap.parser_failures)
+        self.assertEqual(events.snapshot_state(snap), events.STATE_PARTIAL)
+        entry = json.loads(state.read_text(encoding="utf-8"))[self.detail_url]
+        self.assertIn("parse_failed", entry)
+        self.assertFalse(entry.get("sha256"))
+
+        # Next run: the parse-failed marker forces a re-fetch, and success
+        # clears partial and advances the accepted state.
+        cache._http_final = self._net(good, sitemap)
+        self.assertEqual(self.mod.crawl(self._args(out, state)), 0)
+        snap2 = events.load_snapshot(out)
+        self.assertEqual(snap2.parser_failures, ())
+        self.assertEqual(events.snapshot_state(snap2), events.STATE_OK)
+        self.assertEqual(len(snap2.events), 1)
+        entry2 = json.loads(state.read_text(encoding="utf-8"))[self.detail_url]
+        self.assertNotIn("parse_failed", entry2)
+        self.assertTrue(entry2.get("sha256"))
+
+    def test_stale_fallback_keeps_accepted_state_and_retries(self):
+        out = Path(self._tmp) / "out.json"
+        state = Path(self._tmp) / "state.json"
+        good = read("detail_study_abroad.html").encode("utf-8")
+        cache._http_final = self._net(good, self._sitemap("2026-09-01"))
+        self.assertEqual(self.mod.crawl(self._args(out, state)), 0)
+        sha1 = json.loads(state.read_text(encoding="utf-8"))[self.detail_url]["sha256"]
+        self.assertTrue(sha1)
+
+        # The page changed upstream (new lastmod) but the refresh now fails.
+        sitemap2 = self._sitemap("2026-09-02")
+        ok_net = self._net(good, sitemap2)
+
+        def flaky(url, timeout):
+            if url == self.detail_url:
+                raise OSError("upstream down")
+            return ok_net(url, timeout)
+        cache._http_final = flaky
+        self.assertEqual(self.mod.crawl(self._args(out, state)), 0)
+
+        snap = events.load_snapshot(out)
+        self.assertTrue(snap.fetch_failures, "stale fallback must be a fetch failure")
+        self.assertEqual(events.snapshot_state(snap), events.STATE_PARTIAL)
+        self.assertEqual(len(snap.events), 1, "prior good event retained")
+        entry = json.loads(state.read_text(encoding="utf-8"))[self.detail_url]
+        self.assertEqual(entry["lastmod"], "2026-09-01",
+                         "stale fallback must not advance accepted lastmod")
+        self.assertEqual(entry["sha256"], sha1,
+                         "stale fallback must not advance accepted hash")
+
+        # A later successful refresh for the same changed page advances state.
+        new = good.replace(b"Study Abroad Fair", b"Study Abroad Fair 2")
+        cache._http_final = self._net(new, sitemap2)
+        self.assertEqual(self.mod.crawl(self._args(out, state)), 0)
+        snap3 = events.load_snapshot(out)
+        self.assertEqual(snap3.fetch_failures, ())
+        entry3 = json.loads(state.read_text(encoding="utf-8"))[self.detail_url]
+        self.assertEqual(entry3["lastmod"], "2026-09-02")
+        self.assertNotEqual(entry3["sha256"], sha1)
+
+    def test_robots_disallow_sitemap_aborts_without_writing(self):
+        out = Path(self._tmp) / "out.json"
+        state = Path(self._tmp) / "state.json"
+        cache._http_final = self._net(
+            read("detail_study_abroad.html").encode("utf-8"),
+            self._sitemap("2026-09-01"),
+            robots=b"User-agent: *\nDisallow: /sitemap.xml\n")
+        self.assertEqual(self.mod.crawl(self._args(out, state)), 0)
+        self.assertFalse(out.exists(), "a disallowed sitemap must not write a snapshot")
+
+    def test_robots_disallow_detail_counts_excluded(self):
+        out = Path(self._tmp) / "out.json"
+        state = Path(self._tmp) / "state.json"
+        cache._http_final = self._net(
+            read("detail_study_abroad.html").encode("utf-8"),
+            self._sitemap("2026-09-01"),
+            robots=(b"User-agent: *\nAllow: /sitemap.xml\n"
+                    b"Disallow: /events/\n"))
+        self.assertEqual(self.mod.crawl(self._args(out, state)), 0)
+        snap = events.load_snapshot(out)
+        self.assertEqual(snap.coverage["excluded_robots"], 1)
+        self.assertEqual(len(snap.events), 0)
 
 
 class ToolsEventsTests(unittest.TestCase):

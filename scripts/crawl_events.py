@@ -49,7 +49,7 @@ import hashlib
 import json
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.robotparser import RobotFileParser
 
@@ -68,7 +68,6 @@ DEFAULT_OUT = config.REPO_DIR / "fixtures" / "events" / "events_september_2026.j
 DEFAULT_STATE = config.CACHE_DIR / "events_crawl_state.json"
 DEFAULT_THROTTLE = 10.0                     # events.vt.edu robots Crawl-delay
 MIN_THROTTLE = 10.0
-FRESH_WINDOW_S = 15.0                       # age below this == this run's fetch
 
 
 # ---------------------------------------------------------------- polite HTTP
@@ -83,6 +82,7 @@ class Fetcher:
         self._last = 0.0
         self.network_calls = 0
         self.cache_hits = 0
+        self.fresh_fetches = 0
         self.stale_fallbacks = 0
 
     def _params(self, url: str) -> dict:
@@ -93,11 +93,9 @@ class Fetcher:
         return config.CACHE_DIR / f"{key}.bin"
 
     def _stored_fetched_at(self, url: str) -> str | None:
-        age = cache.age_seconds("events_page", self._params(url))
-        if age is None:
-            return None
-        return (datetime.now(timezone.utc) - timedelta(seconds=age)).isoformat(
-            timespec="seconds")
+        # Public API: read the recorded content time directly instead of
+        # reconstructing it from age_seconds (which must never imply freshness).
+        return cache.fetched_at("events_page", self._params(url))
 
     def _sleep(self) -> None:
         wait = self.throttle - (time.monotonic() - self._last)
@@ -105,43 +103,59 @@ class Fetcher:
             time.sleep(wait)
         self._last = time.monotonic()
 
-    def get(self, url: str, *, refresh: bool = True) -> tuple[bytes, bool, str | None]:
-        """Return ``(bytes, fresh, fetched_at_iso)``.
+    def get(self, url: str, *, refresh: bool = True) -> "cache.CacheFetch":
+        """Return a ``cache.CacheFetch`` whose ``status`` is explicit.
 
-        ``fresh`` is True only when this call actually refreshed the bytes.
-        Reading a cache hit (or a stale fallback) returns False with the stored
-        timestamp, so callers never stamp ``now`` on old content.
+        ``fresh`` means this call actually refreshed the bytes upstream.
+        ``reused`` means an on-disk copy was served without a refresh attempt.
+        ``stale`` means a refresh was attempted and failed and an older copy was
+        served: the caller MUST treat that as a fetch failure and must not
+        advance accepted state. The recorded content timestamp is carried on the
+        result, never inferred from the clock.
         """
         p = self.cached_path(url)
         if self.offline:
             if not p.exists():
                 raise FileNotFoundError(f"no cached copy for {url}")
             self.cache_hits += 1
-            return p.read_bytes(), False, self._stored_fetched_at(url)
+            return cache.CacheFetch(value=p.read_bytes(), status=cache.FETCH_REUSED,
+                                    url=url, fetched_at=self._stored_fetched_at(url),
+                                    final_url=url)
         if p.exists() and not refresh:
             self.cache_hits += 1
-            return p.read_bytes(), False, self._stored_fetched_at(url)
+            return cache.CacheFetch(value=p.read_bytes(), status=cache.FETCH_REUSED,
+                                    url=url, fetched_at=self._stored_fetched_at(url),
+                                    final_url=url)
         if not events.allowed_fetch_url(url):
             raise ValueError(f"URL not allowed by policy: {url}")
 
         self._sleep()
         self.network_calls += 1
-        data = cache.get_bytes("events_page", url, params=self._params(url),
-                               max_age_s=None, force=True)
-        age = cache.age_seconds("events_page", self._params(url))
-        now = datetime.now(timezone.utc)
-        if age is not None and age <= FRESH_WINDOW_S:
-            return data, True, now.isoformat(timespec="seconds")
-        # cache.get_bytes fell back to a stale copy because the refresh failed
-        self.stale_fallbacks += 1
-        ts = now - timedelta(seconds=(age or 0))
-        return data, False, ts.isoformat(timespec="seconds")
+        # require_final_url revalidates the redirect target against the same
+        # allowlist, so an allowed host cannot 302 us to an arbitrary location.
+        result = cache.get_bytes_result(
+            "events_page", url, params=self._params(url), max_age_s=None,
+            force=True, require_final_url=events.allowed_fetch_url)
+        if result.is_fresh:
+            self.fresh_fetches += 1
+        else:
+            self.stale_fallbacks += 1
+        return result
 
 
 def build_robot_parser(text: str) -> RobotFileParser:
     parsed = RobotFileParser()
     parsed.parse(text.splitlines())
     return parsed
+
+
+def _robots_blocked(rp: RobotFileParser | None, url: str) -> bool:
+    """True when robots.txt (once loaded) disallows fetching ``url``.
+
+    Applied to EVERY hop (sitemap, month/year/index listings and detail pages),
+    not just detail pages: a rule that disallows the sitemap must be obeyed too.
+    """
+    return rp is not None and not rp.can_fetch(config.USER_AGENT, url)
 
 
 def parse_robots_crawl_delay(text: str) -> float | None:
@@ -241,8 +255,8 @@ def crawl(args) -> int:
     # ---- robots (polite) ----
     rp: RobotFileParser | None = None
     try:
-        data, _fresh, _ts = fetcher.get(ROBOTS_URL)
-        text = data.decode("utf-8", "replace")
+        page = fetcher.get(ROBOTS_URL)
+        text = page.value.decode("utf-8", "replace")
         rp = build_robot_parser(text)
         delay = rp.crawl_delay("*") or parse_robots_crawl_delay(text)
         if delay and delay > fetcher.throttle:
@@ -256,13 +270,16 @@ def crawl(args) -> int:
               f"{fetcher.throttle:g}s floor")
 
     # ---- sitemap ----
+    if _robots_blocked(rp, SITEMAP_URL):
+        print(f"[robots] DISALLOW {SITEMAP_URL}; refusing to crawl")
+        return 0
     try:
-        sitemap_data, _fresh, _ts = fetcher.get(SITEMAP_URL)
+        sitemap_page = fetcher.get(SITEMAP_URL)
     except FileNotFoundError:
         print("[sitemap] read-only run has no cached sitemap; run a live crawl "
               "first (dry-run never fetches)")
         return 0
-    entries = events.parse_sitemap(sitemap_data.decode("utf-8", "replace"))
+    entries = events.parse_sitemap(sitemap_page.value.decode("utf-8", "replace"))
     plan = plan_urls(entries, year, mon)
     print(f"[sitemap] {plan['sitemap_entries']} entries; "
           f"{len(plan['detail_urls'])} under /events/{year}/{mon:02d}/")
@@ -271,21 +288,27 @@ def crawl(args) -> int:
     month_available = False
     month_cards: list = []
     month_url = plan["month_page"]
-    try:
-        body, _fresh, _ts = fetcher.get(month_url)
-        decoded = body.decode("utf-8", "replace")
-        if "no content" not in decoded[:200].lower():
-            month_cards = events.parse_listing(decoded, month_url)
-            month_available = bool(month_cards)
-    except Exception as exc:                              # noqa: BLE001
-        print(f"[month] {month_url} unavailable ({type(exc).__name__}: {exc}); "
-              "degrading to year listing + sitemap")
+    if _robots_blocked(rp, month_url):
+        print(f"[robots] DISALLOW {month_url}; skipping month page")
+    else:
+        try:
+            body = fetcher.get(month_url).value
+            decoded = body.decode("utf-8", "replace")
+            if "no content" not in decoded[:200].lower():
+                month_cards = events.parse_listing(decoded, month_url)
+                month_available = bool(month_cards)
+        except Exception as exc:                          # noqa: BLE001
+            print(f"[month] {month_url} unavailable ({type(exc).__name__}: {exc}); "
+                  "degrading to year listing + sitemap")
 
     # ---- year / index listings for card metadata (category, free-food, ...) ----
     cards_by_url: dict = {c.url: c for c in month_cards}
     for listing_url in (plan["year_page"], plan["events_index"]):
+        if _robots_blocked(rp, listing_url):
+            print(f"[robots] DISALLOW {listing_url}; skipping listing")
+            continue
         try:
-            body, _fresh, _ts = fetcher.get(listing_url)
+            body = fetcher.get(listing_url).value
             for c in events.parse_listing(body.decode("utf-8", "replace"), listing_url):
                 if (c.month or "") == args.month and events.allowed_fetch_url(c.url):
                     cards_by_url.setdefault(c.url, c)
@@ -366,19 +389,27 @@ def crawl(args) -> int:
         if not events.allowed_fetch_url(url):
             excluded_url_policy += 1
             continue
-        if rp is not None and not rp.can_fetch(config.USER_AGENT, url):
+        if _robots_blocked(rp, url):
             print(f"  [{i}/{len(candidates)}] ROBOTS DISALLOW {url}")
             excluded_robots += 1
             continue
         seen_candidates.add(url)
         lastmod = sitemap_map.get(url)
         prev_state = state.get(url, {})
-        # A missing lastmod can never be treated as "unchanged" -- revalidate.
+        cached_path = fetcher.cached_path(url)
+        cache_sha = (hashlib.sha256(cached_path.read_bytes()).hexdigest()
+                     if cached_path.exists() else None)
+        accepted = (bool(prev_state.get("sha256"))
+                    and not prev_state.get("parse_failed"))
+        # A missing lastmod can never be treated as "unchanged". Neither can a
+        # parse-failed marker, nor cached bytes whose hash does not match the
+        # ACCEPTED hash: all force a revalidation (and a retry next crawl).
         unchanged = (
             lastmod is not None
             and prev_state.get("lastmod") == lastmod
-            and prev_state.get("sha256")
-            and fetcher.cached_path(url).exists()
+            and accepted
+            and cache_sha is not None
+            and cache_sha == prev_state.get("sha256")
         )
         card = cards_by_url.get(url)
         if unchanged and url in prev_by_url and not args.from_cache:
@@ -389,7 +420,7 @@ def crawl(args) -> int:
 
         attempted_refresh = not unchanged
         try:
-            raw, fresh, page_fetched_at = fetcher.get(url, refresh=attempted_refresh)
+            page = fetcher.get(url, refresh=attempted_refresh)
         except Exception as exc:                          # noqa: BLE001
             print(f"  [{i}/{len(candidates)}] FETCH FAIL {url} ({type(exc).__name__})")
             fetch_failures.append(url)
@@ -399,19 +430,39 @@ def crawl(args) -> int:
                 page_times.append(prev_by_url[url].fetched_at)
             continue
 
-        page_fetched_at = page_fetched_at or ("" if read_only else now_iso)
-        page_times.append(page_fetched_at)
-        if fresh:
-            fresh_fetches += 1
-        elif attempted_refresh and not read_only:
-            # Only a *failed refresh* is a stale fallback; a deliberate cache
-            # hit (unchanged lastmod) is not.
+        raw = page.value
+        page_fetched_at = page.fetched_at or ("" if read_only else now_iso)
+
+        # A stale refresh fallback IS a fetch failure. It must never advance the
+        # accepted lastmod/hash, so the next crawl retries this URL, and it
+        # always counts toward snapshot "partial".
+        if page.fetch_failed or (attempted_refresh and not read_only
+                                 and not page.is_fresh):
+            print(f"  [{i}/{len(candidates)}] STALE FALLBACK {url} "
+                  f"({page.error or 'refresh failed'})")
+            fetch_failures.append(url)
+            coverage["detail_failed"] += 1
             stale_fallback_urls.append(url)
+            if url in prev_by_url:
+                parsed.append(prev_by_url[url])
+                page_times.append(prev_by_url[url].fetched_at)
+            elif not read_only:
+                # No accepted copy to fall back to: record a pending marker so
+                # the URL is retried instead of silently skipped.
+                state[url] = {"lastmod": lastmod, "sha256": None,
+                              "fetched_at": page_fetched_at,
+                              "refresh_pending": True}
+            continue
+
+        page_times.append(page_fetched_at)
+        if page.is_fresh:
+            fresh_fetches += 1
         sha = hashlib.sha256(raw).hexdigest()
         if prev_state.get("sha256") not in (None, sha):
             changed_urls.append(url)
-        state[url] = {"lastmod": lastmod, "sha256": sha,
-                      "fetched_at": page_fetched_at, "fresh": fresh}
+
+        # PARSE FIRST. The accepted state advances only after a successful parse
+        # so a parse failure cannot freeze unparseable bytes as "unchanged".
         try:
             ev = events.parse_detail(raw.decode("utf-8", "replace"), url,
                                      fetched_at=page_fetched_at, source_lastmod=lastmod,
@@ -420,9 +471,23 @@ def crawl(args) -> int:
             print(f"  [{i}/{len(candidates)}] PARSE FAIL {url}: {exc}")
             parser_failures.append(url)
             coverage["detail_failed"] += 1
+            # Retain the prior ACCEPTED state/hash and add an explicit
+            # parse-failed marker so the next crawl re-fetches and re-parses;
+            # the snapshot stays partial until a parse succeeds.
+            state[url] = {
+                "lastmod": prev_state.get("lastmod"),
+                "sha256": prev_state.get("sha256"),
+                "fetched_at": prev_state.get("fetched_at"),
+                "parse_failed": sha,
+                "parse_failed_at": page_fetched_at,
+            }
             if url in prev_by_url:                         # retain last good copy
                 parsed.append(prev_by_url[url])
             continue
+
+        # SUCCESS: only now is the new content accepted as the new baseline.
+        state[url] = {"lastmod": lastmod, "sha256": sha,
+                      "fetched_at": page_fetched_at, "fresh": page.is_fresh}
         coverage["detail_parsed"] += 1
         if not events.in_september_2026(ev.start_dt):
             coverage["excluded_out_of_month"] += 1

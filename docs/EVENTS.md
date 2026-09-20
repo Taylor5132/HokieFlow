@@ -33,8 +33,8 @@ excluded as non-Blacksburg / out-of-month.
 `location_name`, `address`, `tags`, `category`, `admission`,
 `registration_url`, `accessibility` (bool), `source_lastmod`, `fetched_at`,
 `status`, plus `summary` (opt-in, ≤160 chars, PII-scrubbed) and derived
-`in_person` / `free_food` / `duration_unknown` / `not_recommendable` /
-`miss_streak` / `all_day`.
+`in_person` / `free_food` / `duration_unknown` / `invalid_range` /
+`not_recommendable` / `miss_streak` / `all_day`.
 
 * `id` = `evt_<sha1(canonical_url)[:16]>` — stable across crawls.
 * `start`/`end` are ISO-8601 **with offset**. The site's quirky
@@ -76,13 +76,16 @@ excluded as non-Blacksburg / out-of-month.
 
 `fetched_at` is the **actual** time of the newest page content, not the time the
 snapshot file was written. `source.refresh` distinguishes a real network
-refresh from a stale-cache fallback (`cache.age_seconds`, public API), so a
-failed refresh never masquerades as fresh.
+refresh from a stale-cache fallback: `cache.get_bytes_result()` returns a public
+`CacheFetch` whose `status` is explicitly `fresh` / `reused` / `stale` (and
+`fetch_failed` is true for `stale`), so a failed refresh never masquerades as
+fresh and callers never infer freshness from `age_seconds`.
 
 `load_snapshot(path)` reads it offline; `snapshot_state(snap, now=...)`
 returns the worst of `empty` / `partial` / `stale` / `ok`. **Any fetch OR parse
-failure makes the snapshot `partial` (never `ok`)** — the crawl saw pages it
-could not turn into events.
+failure makes the snapshot `partial` (never `ok` or `empty`)** — the crawl saw
+pages it could not turn into events, so a zero-event crawl with failures is a
+degraded crawl rather than proof nothing exists.
 
 ## 4. User-flow contract
 
@@ -95,16 +98,24 @@ events.browse(snapshot, query=..., date_=..., start=..., end=...,
               limit=..., now=...) -> BrowseResult
 ```
 
-`BrowseResult = {events, total, state, notices}` where `state` is:
+`BrowseResult = {events, total, state, match_state, notices}` where `state` is
+the snapshot **health** and `match_state` separately records whether the
+filters matched anything:
 
 | state | meaning | UI guidance |
 |---|---|---|
 | `ok` | results found, snapshot fresh | render list |
-| `no-match` | snapshot fine, filters/query matched nothing | "No events match these filters" |
-| `empty` | snapshot itself is empty | "No September Blacksburg coverage" |
+| `no-match` | healthy snapshot, filters/query matched nothing | "No events match these filters" |
+| `empty` | snapshot itself is empty (no failures seen) | "No September Blacksburg coverage" |
 | `stale` | snapshot older than `EVENTS_STALE_AFTER_H` (24 h) | render + age warning |
 | `partial` | some pages failed to fetch OR parse | render + "some events may be missing" |
-| `out-of-scope` | requested date outside 2026-09 | explain the fixed scope |
+| `out-of-scope` | requested date/range outside 2026-09 | explain the fixed scope |
+
+Health takes precedence over match state: a `partial` or `stale` snapshot with
+zero matches stays `partial`/`stale` (with a no-match notice) and never collapses
+to `no-match`. `browse` itself enforces the fixed September 2026 date/range
+window, so any caller passing an out-of-month `date_`/`start`/`end` gets
+`out-of-scope`.
 
 `include_cancelled` / `include_uncertain` let the UI hide cancelled rows;
 cancelled rows are shown by default with their status so a student never sees a
@@ -124,11 +135,15 @@ ordered by start time, then id.
 `end`, `timezone`, `all_day`, `duration_unknown`, `recommendable`, `location`,
 `url`, `description`, `status`) plus an `ics` sub-dict, and `to_ics(events)`
 emits a full `VCALENDAR` string. All-day events use `DTSTART;VALUE=DATE` with an
-exclusive `DTEND;VALUE=DATE` (the next day). TEXT values are RFC 5545 escaped
-(CR/LF neutralized, so a title cannot inject `END:VEVENT`), URI values are
-control-stripped, and lines are folded on UTF-8 octet boundaries so long Unicode
-titles round-trip. This **only exports** a payload for the frontend's "add to
-schedule" action — the backend never writes a user's calendar.
+exclusive `DTEND;VALUE=DATE`: an explicit multi-day end is preserved, and
+`start + 1 day` is used only when the source states no later end. TEXT values are
+RFC 5545 escaped (CR/LF neutralized, so a title cannot inject `END:VEVENT`), URI
+values are control-stripped, and lines are folded on UTF-8 octet boundaries so
+long Unicode titles round-trip. This **only exports** a payload for the
+frontend's "add to schedule" action — the backend never writes a user's calendar.
+
+An event whose end precedes its start is flagged `invalid_range`: it still lists
+and exports, but it is `not_recommendable` and never fits a gap.
 
 ### Free-gap recommendation rule
 
@@ -148,14 +163,25 @@ when it fits fully inside a free gap.
   `Crawl-delay` is honoured, with a hard floor of 10 s even if robots cannot be
   read;
 * URL allowlist: HTTPS only, exact host `events.vt.edu`, public content paths
-  only (localhost, external hosts, non-HTTPS, ports, userinfo and traversal are
-  rejected before any socket); relative hrefs are resolved against the page;
+  only (localhost, external hosts, non-HTTPS, malformed/out-of-range ports,
+  userinfo, percent-encoded or normalized traversal and NUL bytes are rejected
+  before any socket); relative hrefs are resolved against the page; the URL
+  returned **after redirects** is revalidated against the same allowlist;
+* `robots.txt` `can_fetch` is applied to **every** hop after robots is loaded —
+  sitemap, month page, year/index listings and detail pages — not just details;
 * read-only GETs of public pages; never authenticated or write paths;
 * content hashes (`sha256`) + sitemap `lastmod` per URL in an incremental state
-  file (gitignored cache). Unchanged `lastmod` + existing cached bytes => no
-  network call. A **missing lastmod is always revalidated** (never frozen);
+  file (gitignored cache). Unchanged `lastmod` + existing cached bytes whose hash
+  matches the ACCEPTED hash => no network call. A **missing lastmod is always
+  revalidated** (never frozen);
+* accepted `lastmod`/hash advance **only after a successful parse**. A failed
+  parse retains the prior good event and the prior accepted state plus an
+  explicit `parse_failed` marker, so the next crawl re-fetches and re-parses and
+  the snapshot stays `partial` until a parse succeeds;
 * the actual page fetch time is preserved; a failed refresh that falls back to
-  stale bytes is recorded as a `stale_fallback`, not stamped as fresh;
+  stale bytes is recorded as a `stale_fallback` **and a fetch failure**, never
+  stamped as fresh and never allowed to advance the accepted state, so the next
+  crawl retries that URL;
 * canonical-URL ids so a re-crawl updates rather than duplicates;
 * `--max-pages` guard (default 200) refuses to truncate silently;
 * `--dry-run` is genuinely read-only (cache-only plan: no network, no cache
@@ -190,7 +216,10 @@ with its status intact, so a flaky network never cancels an event.
   committed snapshot covers 27 of 67 advertised detail pages (33 were stale
   404s), so its state is `partial` by construction.
 * `in_person`/`free_food`/`category` are best-effort from tags and listing
-  classes; `None`/`unknown` means "not stated", not "false".
+  classes; `None`/`unknown` means "not stated", not "false". A physical
+  in-person/hybrid signal overrides an online tag, so a hybrid event is not
+  mislabelled online and only a pure online listing is rejected as
+  non-Blacksburg.
 * `admission == unknown` is common; treat it as "check the source", not free.
 * The month page can 404; coverage metadata records this.
 * Times are normalized to campus time but the source's per-event offsets are

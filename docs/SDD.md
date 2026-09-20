@@ -354,7 +354,7 @@ Catalog `hokieday`. Three schemas: `bronze`, `silver`, `gold`.
 | 3 | `walk_time` | `(from_place:str, to_place:str)` | `{minutes, meters, method}` | raises on unknown place |
 | 4 | `find_food` | `(location_num:str\|None, date:str, diet:str\|None, avoid:[str], min_kcal:int\|None, max_kcal:int\|None, open_only:bool)` | `[{name, location, section, kcal, protein_g, allergens, diet_tags}]` | `[]` + reason |
 | 5 | `get_hours` | `(foodpro_id:str, date:str)` | `[{open_time, close_time, is_open_now, closes_in_min}]` | last known + `stale: true` |
-| 6 | `get_events` | `(date:str, tags:[str]\|None)` | `{state:ok/no-match/empty/stale/partial/out-of-scope, events:[{title,start,place,tags,url,category,admission,in_person,free_food}], reason, coverage, fetched_at}` | typed empty/partial state + reason (never fatal) |
+| 6 | `get_events` | `(date:str, tags:[str]\|None)` | `{state:ok/no-match/empty/stale/partial/out-of-scope, match_state:match/no-match/empty/out-of-scope, events:[{title,start,place,tags,url,category,admission,in_person,free_food}], reason, coverage, fetched_at}` | typed empty/partial state + reason (never fatal) |
 | 7 | `predict_dining_wait` | `(location_num:str, ts:str)` | `{wait_min, confidence, basis}` | `{basis: "heuristic"}` if model unavailable |
 | 8 | `plan_day` | `(student_ref:str, start:str, end:str, prefs:dict)` | `{itinerary:[...], rationale, alternatives, replan_trigger}` | always returns a best-effort plan |
 

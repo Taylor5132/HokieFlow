@@ -318,6 +318,90 @@ class CacheConcurrencyTest(unittest.TestCase):
         self.assertEqual(
             cache.get_bytes("bt_gtfs", "http://x", max_age_s=60), b"ZIPDATA")
 
+    # ----------------------------------------- explicit fetch metadata
+    def test_fetch_result_exposes_explicit_status_fresh_reused_stale(self):
+        http = FakeHTTP(result={"v": 1})
+        cache._http = http
+        fresh = cache.get_json_result("meta", "http://x", max_age_s=60)
+        self.assertEqual(fresh.status, cache.FETCH_FRESH)
+        self.assertTrue(fresh.is_fresh)
+        self.assertFalse(fresh.fetch_failed)
+        self.assertIsNotNone(fresh.fetched_at)
+        self.assertEqual(fresh.value, {"v": 1})
+        # A second call inside the window is a deliberate reuse, not a fetch.
+        reused = cache.get_json_result("meta", "http://x", max_age_s=60)
+        self.assertEqual(reused.status, cache.FETCH_REUSED)
+        self.assertFalse(reused.fetch_failed)
+        self.assertEqual(http.n, 1)
+
+    def test_recent_cache_plus_failed_refresh_is_stale_never_fresh(self):
+        """Adversarial: a 1s-old cached copy must NOT read as fresh when the
+        upstream refresh failed. Age-inference got this wrong."""
+        self._write_stale("recent", {"old": True}, age_s=1)
+        http = FakeHTTP(error=OSError("down"))
+        cache._http = http
+        res = cache.get_json_result("recent", "http://x", max_age_s=60, force=True)
+        self.assertEqual(res.status, cache.FETCH_STALE)
+        self.assertTrue(res.fetch_failed)
+        self.assertFalse(res.is_fresh)
+        self.assertEqual(res.value, {"old": True})
+        self.assertIn("down", res.error)
+
+    def test_binary_fetch_result_reports_stale_after_failed_refresh(self):
+        self._write_stale_bin("meta_zip", b"OLD", age_s=1)
+        http = FakeHTTP(error=OSError("down"))
+        cache._http = http
+        res = cache.get_bytes_result("meta_zip", "http://x", max_age_s=60, force=True)
+        self.assertEqual(res.status, cache.FETCH_STALE)
+        self.assertTrue(res.fetch_failed)
+        self.assertEqual(res.value, b"OLD")
+        self.assertIsNotNone(res.fetched_at,
+                             "binary provenance comes from the sibling envelope")
+
+    def test_binary_reuse_keeps_envelope_timestamp(self):
+        cache._http = FakeHTTP(result=None)
+        cache._http.result = None
+        # FakeHTTP JSON-encodes results, so seed binary + metadata directly.
+        p = cache._bin_path("reuse_zip")
+        cache._write_bytes_atomic(p, b"ZIP")
+        stamp = "2026-09-19T15:22:29+00:00"
+        cache._write_envelope(cache._json_path("reuse_zip"), "http://x",
+                              {"bytes": 3, "file": p.name}, fetched_at=stamp)
+        res = cache.get_bytes_result("reuse_zip", "http://x", max_age_s=None)
+        self.assertEqual(res.status, cache.FETCH_REUSED)
+        self.assertEqual(res.value, b"ZIP")
+        self.assertEqual(res.fetched_at, stamp)
+
+    def test_redirect_final_url_is_revalidated(self):
+        def good(u):
+            return u.startswith("https://events.vt.edu/")
+
+        orig = cache._http_final
+        try:
+            # Cold cache + disallowed redirect -> hard failure, no invented data.
+            cache._http_final = lambda url, timeout: (b'{"v": 1}', "https://evil.com/x")
+            with self.assertRaises(ValueError):
+                cache.get_json_result("redir", "https://events.vt.edu/a",
+                                      max_age_s=60, force=True,
+                                      require_final_url=good)
+            # With a cached copy, a disallowed redirect is a stale fallback.
+            self._write_stale("redir2", {"old": True}, age_s=3600)
+            res = cache.get_json_result("redir2", "https://events.vt.edu/a",
+                                        max_age_s=60, force=True,
+                                        require_final_url=good)
+            self.assertEqual(res.status, cache.FETCH_STALE)
+            self.assertIn("disallowed", res.error)
+            # An allowlisted final URL is accepted as fresh.
+            cache._http_final = lambda url, timeout: (b'{"v": 2}',
+                                                      "https://events.vt.edu/final")
+            ok = cache.get_json_result("redir3", "https://events.vt.edu/a",
+                                       max_age_s=60, force=True,
+                                       require_final_url=good)
+            self.assertEqual(ok.status, cache.FETCH_FRESH)
+            self.assertEqual(ok.final_url, "https://events.vt.edu/final")
+        finally:
+            cache._http_final = orig
+
     # ------------------------------------------------- binary concurrency
     def test_binary_cold_cache_concurrent_callers_make_one_upstream_fetch(self):
         http = FakeHTTP(result={"zip": [1]}, delay=0.05)
