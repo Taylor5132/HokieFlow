@@ -389,6 +389,17 @@ function render(r){
     $("#out").innerHTML = `<div class="card err"><div class="k">I need a correction</div>${esc(r.rationale || r.error)}</div>`;
     return;
   }
+  if(typeof r.answer === "string" && !r.itinerary && !r.clarification){
+    const sources = (r.sources || []).map(s =>
+      `<div class="muted" style="margin-top:6px">${esc(s.title || s.file_id || "Campus source")}${s.state ? ` · ${esc(s.state)}` : ""}</div>`).join("");
+    const p = r.provenance || {};
+    $("#out").innerHTML = `<div class="card"><div class="k">HokieFlow AI</div>
+      <div class="answer">${esc(r.answer)}</div>
+      ${sources}
+      <div class="muted" style="margin-top:10px">${esc(p.provider || "deterministic fallback")}${p.model ? ` · ${esc(p.model)}` : ""}</div>
+    </div>`;
+    return;
+  }
   if(r.clarification){
     const cl = r.clarification;
     $("#out").innerHTML = `<div class="card">
@@ -416,11 +427,11 @@ function render(r){
   const answerTiming = it.arrives_in_window
       ? `with ${whole(it.slack_min)} min to spare`
       : `${whole(Math.abs(it.slack_min))} min after your deadline`;
-  const answer = infeasible
+  const answer = r.answer || (infeasible
       ? infeasibleCopy(r)
       : (trg
         ? `Take Plan B and reach ${c.to_place || "your destination"} at ${clock(it.arrive_time)}, ${answerTiming}.`
-        : r.rationale);
+        : r.rationale));
   const destinationPicker = $("#to");
   if(destinationPicker && [...destinationPicker.options].some(o => o.value === c.to_place))
     destinationPicker.value = c.to_place;
@@ -532,7 +543,7 @@ async function boot(){
        <div style="margin-top:8px">meal choice: ${esc(s.assumptions.meal_ranking)}
         — a demo convenience, not dietary advice.</div>
        <div style="margin-top:8px">The map uses our GTFS geometry and works offline. Dashed walk lines are straight-line estimates, not routed paths.</div>
-       <div style="margin-top:8px">The text box uses a bounded rule parser offline. In a Databricks workspace, the agent maps language to these same governed tools.</div>`;
+       <div style="margin-top:8px">HokieFlow AI uses Gemini only when configured in live mode. Replay and provider failures use the bounded parser.</div>`;
   }catch(e){
     $("#chips").innerHTML = `<span class="chip warn" id="timechip">status unavailable</span>`;
   }

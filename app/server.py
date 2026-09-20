@@ -24,9 +24,13 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+import os
 import re
 import socket
 import sys
+import threading
+import time
+from collections import defaultdict, deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,13 +39,22 @@ from zoneinfo import ZoneInfo
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+from app.local_env import load_local_env  # noqa: E402
+
+# Local credentials remain in the gitignored .env file. Load them before
+# hokieday.config reads DEMO_MODE; existing process environment always wins.
+load_local_env(REPO / ".env")
+
+from hokieday import agent as hokie_agent  # noqa: E402
 from hokieday import cache, config, tools  # noqa: E402
+from hokieday.agent_tools import AgentContext  # noqa: E402
 
 # Absolute, not relative: this file is run as a SCRIPT (`python3 app/server.py`),
 # where `from . import x` raises "attempted relative import with no known parent
 # package". REPO is on sys.path just above, so `app` resolves either way -- as a
 # namespace package when run as a script, and as app.server when tests import it.
 from app import mapview  # noqa: E402
+from app.gemini_provider import GeminiProvider  # noqa: E402
 
 TZ = ZoneInfo(config.CAMPUS_TZ)
 
@@ -898,8 +911,93 @@ def run_plan(call: dict, origin: dict | None = None,
     return result
 
 
+_MAX_KCAL_RE = re.compile(
+    r"\b(?:under|below|less\s+than|at\s+most|max(?:imum)?|no\s+more\s+than)\s*"
+    r"(\d{1,4}(?:\.\d+)?)\s*(?:kcal|calories?)\b",
+    re.IGNORECASE,
+)
+
+
+def _agent_hard_constraints(text: str) -> dict:
+    """Deterministically preserve supported numeric safety constraints."""
+    ceilings = []
+    for match in _MAX_KCAL_RE.finditer(str(text or "")):
+        value = float(match.group(1))
+        if 0 <= value <= 5000:
+            ceilings.append(value)
+    return {"max_kcal": min(ceilings)} if ceilings else {}
+
+
+_CLIENT_BUDGET_LOCK = threading.Lock()
+_CLIENT_QUESTION_TIMES: dict[str, deque[float]] = defaultdict(deque)
+
+
+def _client_agent_budget_available(client_ip: str) -> bool:
+    """Per-process/IP guard in front of the shared Gemini call budget."""
+    try:
+        limit = int(os.environ.get("HOKIEFLOW_AI_QUESTIONS_PER_IP_HOUR", "10"))
+    except ValueError:
+        limit = 10
+    limit = min(max(limit, 1), 1000)
+    now_mono = time.monotonic()
+    key = str(client_ip or "unknown")
+    with _CLIENT_BUDGET_LOCK:
+        queue = _CLIENT_QUESTION_TIMES[key]
+        while queue and now_mono - queue[0] >= 3600:
+            queue.popleft()
+        if len(queue) >= limit:
+            return False
+        queue.append(now_mono)
+        return True
+
+
+def configured_agent_provider():
+    """Build the opt-in live provider from environment configuration.
+
+    No default model is hardcoded: both the secret and model id must be set at
+    runtime. In replay mode callers never invoke this function.
+    """
+    provider_name = os.environ.get("HOKIEFLOW_AI_PROVIDER", "").strip().lower()
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    model = os.environ.get("GEMINI_MODEL", "").strip()
+    if not provider_name and (key or model):
+        provider_name = "gemini"
+    if provider_name != "gemini" or not key or not model:
+        return None
+    try:
+        return GeminiProvider(key, model)
+    except ValueError:
+        return None
+
+
+def _decorate_agent_plan(result: dict, origin: dict, now: datetime,
+                         live: bool) -> dict:
+    """Keep agent answers compatible with the existing structured UI."""
+    result["_origin"] = origin
+    result["_time"] = time_meta(now, live=live)
+    nested = result.get("result")
+    if isinstance(nested, dict):
+        nested.setdefault("_origin", origin)
+        nested.setdefault("_time", result["_time"])
+    if isinstance(result.get("itinerary"), dict):
+        try:
+            plan_a = next((a.get("itinerary") for a in
+                           (result.get("alternatives") or [])
+                           if a.get("type") == "previous_itinerary_a"), None)
+            result["_map_svg"] = mapview.build_map_svg(
+                result.get("itinerary"), overlay=plan_a)
+        except Exception as exc:                              # noqa: BLE001
+            result["_map_svg"] = ""
+            result["_map_error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            result["_links"] = deep_links(result)
+        except Exception:                                    # noqa: BLE001
+            result["_links"] = []
+    return result
+
+
 def handle_ask(payload: dict, now: datetime | None = None,
-               live: bool | None = None) -> tuple[dict, int]:
+               live: bool | None = None, provider=None) -> tuple[dict, int]:
     """The /api/ask pipeline, HTTP-free so it is directly testable.
 
     Captures ONE campus-local request timestamp (or accepts the one the HTTP
@@ -922,6 +1020,7 @@ def handle_ask(payload: dict, now: datetime | None = None,
     except Exception as exc:                                   # noqa: BLE001
         return {"error": f"origin resolution failed: {exc}", "_time": meta}, 500
 
+    agent_failure = None
     if payload.get("scenario_id"):
         match = next((s for s in SCENARIOS
                       if s["id"] == payload["scenario_id"]), None)
@@ -934,7 +1033,49 @@ def handle_ask(payload: dict, now: datetime | None = None,
         elif live:
             _materialize_live_preset(call, now)
     else:
-        call = parse_free_text(payload.get("text", ""), now=now, live=live)
+        text = str(payload.get("text", ""))
+        # One deterministic pre-pass supplies BOTH the hard constraints the model
+        # may never weaken and the planner window (request start -> the deadline
+        # the student actually stated). The model is never asked to invent either.
+        safety_call = parse_free_text(text, now=now, live=live)
+        # The global replay switch is stronger than a per-call clock override:
+        # DEMO_MODE=cache must never contact a language provider.
+        active_provider = provider if live and not config.CACHE_ONLY else None
+        if active_provider is None and live and not config.CACHE_ONLY:
+            active_provider = configured_agent_provider()
+        safety_clarification = safety_call.get("_clarification") or {}
+        # Two clarifications are exact factual claims about the clock or about
+        # safety, and deterministic code already answers them correctly: an
+        # unparsed allergy must never be weakened, and a passed deadline must be
+        # corrected rather than re-planned into an invalid window.
+        if (active_provider is not None
+                and safety_clarification.get("kind")
+                not in ("allergen_unparsed", "deadline_passed")):
+            required_prefs = dict(safety_call.get("prefs") or {})
+            required_prefs.update(_agent_hard_constraints(text))
+            explicit_from = str(payload.get("from_place") or "").strip()
+            explicit_to = str(payload.get("to_place") or "").strip()
+            if explicit_from and explicit_from.lower() not in ("auto", "default"):
+                required_prefs["from_place"] = explicit_from
+            if explicit_to and explicit_to.lower() not in ("auto", "default"):
+                required_prefs["to_place"] = explicit_to
+            schedule = payload.get("schedule")
+            if not isinstance(schedule, list):
+                schedule = []
+            context = AgentContext(
+                now=now, schedule=schedule[:200], origin_place=origin_key,
+                required_prefs=required_prefs, is_replay=False,
+                plan_start=safety_call.get("start"),
+                plan_end=safety_call.get("end"))
+            try:
+                result = hokie_agent.run_agent(
+                    text, provider=active_provider, context=context)
+                return _decorate_agent_plan(result, origin, now, live), 200
+            except hokie_agent.AgentUnavailable as exc:
+                # Fall through to the existing deterministic parser/planner.
+                # The typed provider failure is safe metadata, not raw internals.
+                agent_failure = exc.to_dict()
+        call = parse_free_text(text, now=now, live=live)
 
     # Copy prefs rather than mutating the shared SCENARIOS entry.
     call["prefs"] = dict(call.get("prefs") or {})
@@ -962,6 +1103,12 @@ def handle_ask(payload: dict, now: datetime | None = None,
     except Exception as exc:                                   # noqa: BLE001
         return {"error": f"{type(exc).__name__}: {exc}", "_time": meta}, 500
     result["_time"] = meta
+    if agent_failure is not None:
+        result["agent"] = agent_failure
+        result["provenance"] = {
+            "provider": "unavailable", "model": None, "tool_names": [],
+            "replay": not live, "fallback": "bounded_parser",
+        }
     return result, 200
 
 
@@ -974,6 +1121,11 @@ def status() -> dict:
         a = cache.age_seconds(name, params)
         ages[name] = None if a is None else round(a / 3600.0, 1)
     live = tools.get_live_bus(source=None)
+    ai_provider = os.environ.get("HOKIEFLOW_AI_PROVIDER", "").strip().lower()
+    ai_model = os.environ.get("GEMINI_MODEL", "").strip()
+    ai_enabled = bool(ai_provider == "gemini"
+                      and os.environ.get("GEMINI_API_KEY", "").strip()
+                      and ai_model and not config.CACHE_ONLY)
     return {
         "mode": config.DEMO_MODE,
         "offline": config.CACHE_ONLY,
@@ -985,6 +1137,12 @@ def status() -> dict:
         "fixture_age_hours": ages,
         "live_vehicles": len(live.get("buses", live) or []),
         "live_stale": live.get("stale"),
+        "agent": {
+            "name": "HokieFlow AI", "enabled": ai_enabled,
+            "provider": "gemini" if ai_enabled else None,
+            "model": ai_model if ai_enabled else None,
+            "fallback": "bounded_parser",
+        },
         "assumptions": {
             "eat_minutes": tools.EAT_MINUTES,
             "meal_ranking": tools.MEAL_RANKING_RULE,
@@ -1085,10 +1243,25 @@ class Handler(BaseHTTPRequestHandler):
         # time in the response; the browser clock is never consulted.
         now = config.now(TZ)
         length = int(self.headers.get("Content-Length") or 0)
+        if length < 0 or length > 1_000_000:
+            self._json({"error": "request body too large",
+                        "_time": time_meta(now)}, 413)
+            return
         try:
             payload = json.loads(self.rfile.read(length) or b"{}")
         except Exception:                                  # noqa: BLE001
             payload = {}
+        if (isinstance(payload, dict) and not payload.get("scenario_id")
+                and str(payload.get("text") or "").strip()
+                and not config.CACHE_ONLY
+                and configured_agent_provider() is not None
+                and not _client_agent_budget_available(self.client_address[0])):
+            self._json({
+                "error": "AI request limit reached for this client; try later",
+                "agent": {"status": "unavailable", "code": "client_rate_limit"},
+                "_time": time_meta(now),
+            }, 429)
+            return
         try:
             result, code = handle_ask(payload, now=now)
             self._json(result, code)
