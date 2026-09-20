@@ -125,12 +125,16 @@ def _cache_path(key: str) -> Path:
     return config.CACHE_DIR / f"classes_live_{hashlib.sha1(key.encode()).hexdigest()[:12]}.json"
 
 
-def _live_snapshot(term: str, filters: dict) -> classes.TimetableSnapshot | None:
+def live_snapshot(term: str, filters: dict) -> classes.TimetableSnapshot | None:
     """Capture one Banner query, or None when it could not be read.
 
     A live query needs a subject, course number, or CRN: Banner will not list a
-    whole term on a title search, and we will not ask it to.
+    whole term on a title search, and we will not ask it to. Under
+    ``DEMO_MODE=cache`` this ALWAYS returns None -- the replay guarantee lives
+    here, at the network boundary, so no caller can reach Banner by accident.
     """
+    if config.CACHE_ONLY:
+        return None
     subject = str(filters.get("subject") or "")
     course_number = str(filters.get("course_number") or "")
     crn = str(filters.get("crn") or "")
@@ -158,16 +162,33 @@ def _live_snapshot(term: str, filters: dict) -> classes.TimetableSnapshot | None
     return _snapshot_from_cache(term, filters, html, fetched_at)
 
 
+def _is_inside_fixtures(path: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(Path(config.FIXTURES_DIR).resolve())
+    except (OSError, ValueError):
+        return False
+
+
 def _snapshot_from_cache(term: str, filters: dict, html: str,
                          fetched_at: str) -> classes.TimetableSnapshot | None:
     """Persist a live capture under cache/ and load it back through the
-    snapshot validator, so live and offline results share one code path."""
+    snapshot validator, so live and offline results share one code path.
+
+    NEVER writes into fixtures/: that is the frozen replay store, and in
+    ``DEMO_MODE=cache`` ``config.CACHE_DIR`` IS ``fixtures/``, so an accidental
+    live write here would both corrupt the snapshot and stamp it with the
+    replay clock instead of the real capture time.
+    """
     query = {k: v for k, v in filters.items()
              if k in ("subject", "course_number", "crn", "title_contains")}
     payload = classes.make_snapshot(
         html, term=term, query=query,
         fetched_at=datetime.fromisoformat(fetched_at))
     path = _cache_path(f"{term}|{sorted(query.items())}")
+    if _is_inside_fixtures(path):
+        print(f"[class_search] refusing to write the replay store: {path.name} "
+              "(captures belong in cache/; use scripts/fetch_classes.py to seed)")
+        return None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload), encoding="utf-8")
@@ -229,7 +250,7 @@ def search(text: str = "", *, term: str | None = None, subject: str | None = Non
         query["days"] = list(days)
     filters = dict(query)
 
-    snapshot = None if config.CACHE_ONLY else _live_snapshot(term, filters)
+    snapshot = live_snapshot(term, filters)
     if snapshot is not None:
         parse = classes.snapshot_sections(snapshot)
         hits = classes.search(parse.sections, **filters)

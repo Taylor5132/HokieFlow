@@ -142,6 +142,9 @@ every variable the app reads.
 | `HOKIEDAY_CACHE`, `HOKIEDAY_DATA`, `HOKIEDAY_FIXTURES` | data locations | only to point at other stores |
 | `DEMO_NOW`, `HOKIEDAY_GIS_PERMISSION_REF`, `VTGIS_LIVE` | clock and GIS | optional |
 
+Account schedules use the existing `saved_plans` table and each user's session.
+See [account storage](docs/ACCOUNT_STORAGE.md) for the schema mapping and save contract.
+
 For a deployment, set the same names through the platform's environment UI and
 do not ship `.env`.
 

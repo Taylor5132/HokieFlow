@@ -112,7 +112,7 @@ class SnapshotSearchTests(unittest.TestCase):
 
     def test_replay_never_reaches_the_network(self):
         """The whole point of the snapshot fallback."""
-        from app import class_search
+        from app import class_import, class_search
         calls = []
 
         def explode(*_args, **_kwargs):
@@ -124,9 +124,27 @@ class SnapshotSearchTests(unittest.TestCase):
         try:
             class_search.search("CS 3114")
             class_search.search("data structures")
+            # The Schedule tab's own endpoint must honour replay too: it asks the
+            # network boundary directly, and it once leaked a live call here.
+            class_import.search_endpoint({"term": "202609", "subject": "ECE",
+                                          "course_number": "2564"})
         finally:
             class_search.fetch_timetable_html = original
         self.assertEqual(calls, [], "no live fetch while replaying")
+
+    def test_a_live_capture_never_lands_in_the_replay_store(self):
+        """In replay CACHE_DIR IS fixtures/, so an unguarded live write would
+        overwrite the frozen snapshot and stamp it with the replay clock."""
+        from app import class_search
+        before = {p.name: p.stat().st_mtime for p in class_search.snapshot_paths()}
+        self.assertTrue(class_search._is_inside_fixtures(
+            class_search._cache_path("anything")))
+        written = class_search._snapshot_from_cache(
+            "202609", {"subject": "CS"}, "<html></html>",
+            "2026-09-20T12:00:00+00:00")
+        self.assertIsNone(written, "the write must be refused")
+        after = {p.name: p.stat().st_mtime for p in class_search.snapshot_paths()}
+        self.assertEqual(before, after, "the replay store is byte-unchanged")
 
     def test_a_term_we_never_captured_reports_unavailable(self):
         from app import class_search

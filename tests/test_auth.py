@@ -45,7 +45,7 @@ class FakeAuth:
         self.sign_out_calls += 1
         return {"message": "logged out"}
 
-    def get_user(self):
+    def get_user(self, token=None):
         if self.user is None:
             return None
         return {"user": self.user}
@@ -75,6 +75,25 @@ class TestAuth(unittest.TestCase):
             result = register_user("alice@example.com", "secretpass")
         self.assertEqual(result["user"]["email"], "alice@example.com")
         self.assertIn("access_token", result["session"])
+
+    def test_register_user_falls_back_to_password_sign_in_when_signup_has_no_session(self):
+        class NoSessionSignupClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.auth = type("NoSessionAuth", (), {
+                    "sign_up": lambda self, payload: {"user": {"id": "user-2", "email": payload["email"]}},
+                    "sign_in_with_password": lambda self, payload: {"user": {"id": "user-2", "email": payload["email"]}, "session": {"access_token": "access-2", "refresh_token": "refresh-2"}},
+                    "sign_out": FakeAuth.sign_out,
+                    "get_user": FakeAuth.get_user,
+                    "sign_in_with_oauth": FakeAuth.sign_in_with_oauth,
+                    "exchange_code_for_session": FakeAuth.exchange_code_for_session,
+                })()
+
+        fake = NoSessionSignupClient()
+        with mock.patch("auth.get_supabase_client", return_value=fake):
+            result = register_user("new@example.com", "secretpass")
+        self.assertEqual(result["user"]["email"], "new@example.com")
+        self.assertEqual(result["session"]["access_token"], "access-2")
 
     def test_login_user_failure_and_success(self):
         bad = FakeClient(error="invalid login credentials")
@@ -162,7 +181,7 @@ class TestAuth(unittest.TestCase):
             handle_google_oauth_callback({"error": "access_denied"}, {"state": "state-123"})
 
         with self.assertRaises(ValueError):
-            handle_google_oauth_callback({"code": "abc"}, {"state": "diff"})
+            handle_google_oauth_callback({"code": "abc"}, {})
 
     def test_session_cookie_helpers_round_trip(self):
         cookie = set_session_cookie({"access_token": "t1", "refresh_token": "t2"})

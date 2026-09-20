@@ -899,3 +899,12 @@ def stats() -> dict:
 
 if __name__ == "__main__":       # python -m hokieday.cache
     print(json.dumps(stats(), indent=2))
+
+def post_form_json_with_metadata(name, url, form, *, params=None, **kwargs):
+    """Return a matching POST payload and capture time, including stale fallbacks."""
+    post_form_json(name, url, form, params=params, **kwargs)
+    data = urllib.parse.urlencode(form, doseq=True).encode("utf-8")
+    envelope = read_envelope(name, _post_cache_params(url, data, params))
+    if envelope is None:
+        raise CacheMiss("POST cache envelope unavailable")
+    return envelope["payload"], {k: envelope.get(k) for k in ("fetched_at", "mode")}

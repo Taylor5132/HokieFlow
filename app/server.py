@@ -1476,7 +1476,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/auth/me":
             try:
                 user = require_auth({"Authorization": self.headers.get("Authorization"), "Cookie": self.headers.get("Cookie")})
-                self._json(ui_files.enrich_account({"user": ui_files.user_ref(user)}, user), 200)
+                self._json(ui_files.enrich_account({"user": ui_files.user_ref(user)}, user, headers=self.headers), 200)
             except PermissionError:
                 self._json({"user": None}, 200)
             return
@@ -1547,6 +1547,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/dining/places":
             self._json(ui_files.dining_places_endpoint())
             return
+        if path == "/api/classes":
+            from app.class_import import search_endpoint
+            self._json(search_endpoint({k: v[0] for k, v in query.items()}))
+            return
+        if path == "/api/events":
+            self._json(ui_files.campus_events_endpoint())
+            return
         if path == "/api/transit/stops":
             self._json(ui_files.transit_stops_endpoint())
             return
@@ -1602,7 +1609,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "forbidden"}, 403)
             return
         result, code = ui_files.save_account(user, payload.get("data"),
-                                             payload.get("version"))
+                                             payload.get("version"), headers=self.headers)
         self._json(result, code)
 
     def do_PUT(self) -> None:                 # noqa: N802
@@ -1631,16 +1638,30 @@ class Handler(BaseHTTPRequestHandler):
                         "status": "unavailable",
                         "detail": AUTH_UNAVAILABLE_REASON}, 503)
             return
+        if path == "/api/classes/preview":
+            from app.class_import import preview_endpoint
+            if int(self.headers.get("Content-Length") or 0) > 1048576:
+                self.close_connection = True
+                self._json({"error": "Calendar upload is too large."}, 413)
+                return
+            try:
+                payload = self._read_json()
+                self._json(preview_endpoint(payload))
+            except (ValueError, KeyError, TypeError) as exc:
+                self._json({"error": str(exc)}, 400)
+            return
         if path == "/api/auth/register":
             payload = self._read_json()
             try:
                 user = register_user(payload.get("email"), payload.get("password"))
                 session = _session_payload(user)
                 session_cookie = set_session_cookie(session) if session else ""
-                response = {"user": ui_files.user_ref(user.get("user"))}
+                response = ui_files.enrich_account({"user": ui_files.user_ref(user.get("user"))}, user.get("user"), access_token=session.get("access_token"))
                 if session_cookie:
                     self._json(response, 201, [("Set-Cookie", session_cookie)])
                 else:
+                    response["user"] = None
+                    response["requires_confirmation"] = True
                     # Confirmation pending: no session yet, so no signed-in cookie.
                     response["message"] = ("Check your email to confirm the account "
                                            "before signing in.")
@@ -1656,7 +1677,7 @@ class Handler(BaseHTTPRequestHandler):
                 session_cookie = set_session_cookie(session) if session else ""
                 if not session_cookie:
                     raise ValueError("Sign-in did not create a session.")
-                self._json({"user": ui_files.user_ref(user.get("user"))}, 200,
+                self._json(ui_files.enrich_account({"user": ui_files.user_ref(user.get("user"))}, user.get("user"), access_token=session.get("access_token")), 200,
                            [("Set-Cookie", session_cookie)])
             except Exception as exc:                           # noqa: BLE001
                 self._json({"error": str(exc)}, 401)
@@ -1667,7 +1688,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/auth/me":
             try:
                 user = require_auth({"Authorization": self.headers.get("Authorization"), "Cookie": self.headers.get("Cookie")})
-                self._json(ui_files.enrich_account({"user": ui_files.user_ref(user)}, user), 200)
+                self._json(ui_files.enrich_account({"user": ui_files.user_ref(user)}, user, headers=self.headers), 200)
             except PermissionError:
                 self._json({"user": None}, 200)
             return

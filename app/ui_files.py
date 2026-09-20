@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from hokieday import config, tools, vtgis
+from hokieday import config, tools, vtgis, transit
 
 UI_DIR = Path(__file__).resolve().parent.parent / "ui"
 
@@ -28,6 +28,9 @@ UI_DIR = Path(__file__).resolve().parent.parent / "ui"
 # every other asset by its fixed name. A mapping (instead of Path.joinpath on
 # user input) makes path traversal structurally impossible.
 _ASSET_TYPES = {
+    "motion.js": "text/javascript; charset=utf-8",
+    "gsap.min.js": "text/javascript; charset=utf-8",
+    "ScrollTrigger.min.js": "text/javascript; charset=utf-8",
     "index.html": "text/html; charset=utf-8",
     "styles.css": "text/css; charset=utf-8",
     "app.js": "text/javascript; charset=utf-8",
@@ -37,6 +40,7 @@ _ASSET_TYPES = {
     "home-live.js": "text/javascript; charset=utf-8",
     "bus-location.js": "text/javascript; charset=utf-8",
     "dining.js": "text/javascript; charset=utf-8",
+    "class-import.js": "text/javascript; charset=utf-8",
     "schedule.js": "text/javascript; charset=utf-8",
     "directions.js": "text/javascript; charset=utf-8",
     "preferences.js": "text/javascript; charset=utf-8",
@@ -115,71 +119,44 @@ def user_ref(user: object) -> dict:
     }
 
 
-def enrich_account(body: dict, user: object) -> dict:
-    """Add {data, version} from Supabase when configured.
+def _account_token(headers=None, access_token=None):
+    if access_token:
+        return access_token
+    if not headers:
+        return None
+    bearer = headers.get("Authorization") or headers.get("authorization") or ""
+    if str(bearer).lower().startswith("bearer "):
+        return str(bearer).split(" ", 1)[1].strip()
+    from auth import get_session_cookie
+    return get_session_cookie(headers.get("Cookie") or headers.get("cookie")).get("access_token")
 
-    Contract (CONNECTING.md): data is exactly {savedClass, reduceMotion,
-    plans, events}; version is a monotonic integer for optimistic concurrency.
-    No database configured -> account data stays absent and the UI keeps
-    working logged-in without cloud save.
-    """
-    try:
-        from database import supabase  # optional dependency, may be None
-    except Exception:                                    # noqa: BLE001
-        return body
-    client = supabase
-    if client is None:
-        return body
+
+def enrich_account(body: dict, user: object, *, headers=None, access_token=None) -> dict:
+    """Load UI state using the same user's session as the authenticated request."""
+    from app import account_store
     uid = user_ref(user).get("id")
     if not uid:
         return body
     try:
-        rows = (client.table("account_data")
-                .select("data, version")
-                .eq("user_id", uid)
-                .limit(1).execute().data) or []
-        if rows:
-            body["data"] = rows[0].get("data") or {}
-            body["version"] = int(rows[0].get("version") or 0)
-    except Exception:                                    # noqa: BLE001
-        pass
+        body.update(account_store.load(uid, _account_token(headers, access_token)))
+    except account_store.StorageError as exc:
+        # A failed read is not an empty account. The UI blocks saves until
+        # a successful reload so it cannot overwrite unknown existing data.
+        body["storageError"] = str(exc)
+        body["storageErrorCode"] = exc.code
     return body
 
 
-def save_account(user: object, data: object, version: object) -> tuple[dict, int]:
-    """Optimistic-concurrency account save. 409 on a stale version."""
-    if not isinstance(data, dict):
-        return {"error": "data must be an object"}, 400
-    allowed = {"savedClass", "reduceMotion", "plans", "events"}
-    clean = {k: v for k, v in data.items() if k in allowed}
-    try:
-        from database import supabase
-        client = supabase
-    except Exception:                                    # noqa: BLE001
-        client = None
-    if client is None:
-        return {"error": "account storage is not configured"}, 503
+def save_account(user: object, data: object, version: object, *, headers=None) -> tuple[dict, int]:
+    from app import account_store
     uid = user_ref(user).get("id")
     if not uid:
         return {"error": "authentication required"}, 401
     try:
-        rows = (client.table("account_data")
-                .select("version").eq("user_id", uid).limit(1).execute().data) or []
-        current = int(rows[0].get("version") or 0) if rows else 0
-        try:
-            requested = int(version)
-        except (TypeError, ValueError):
-            requested = 0
-        if requested != current:
-            return {"error": "stale version — reload and retry",
-                    "version": current}, 409
-        client.table("account_data").upsert(
-            {"user_id": uid, "data": clean, "version": current + 1},
-            on_conflict="user_id").execute()
-        return {"ok": True, "data": clean, "version": current + 1}, 200
-    except Exception as exc:                             # noqa: BLE001
-        return {"error": f"save failed: {type(exc).__name__}"}, 500
-
+        result = account_store.save(uid, _account_token(headers), data, version)
+        return {**result, "user": user_ref(user)}, 200
+    except account_store.StorageError as exc:
+        return {"error": str(exc), "code": exc.code}, exc.status
 
 # --------------------------------------------------------------------------- #
 # GET endpoints
@@ -217,19 +194,23 @@ def dining_places_endpoint() -> dict:
 
 
 def transit_stops_endpoint() -> dict:
-    """BT stops (id/name/lat/lon) for the Near-me departure board."""
     try:
-        g = tools._src(None)._g()          # the shared lazy GTFS loader
-    except Exception as exc:                             # noqa: BLE001
-        return {"stops": [], "status": "unavailable",
-                "reason": f"transit schedule unavailable: {exc}"}
-    stops = [{"id": s.stop_id, "name": s.name, "lat": s.lat, "lon": s.lon}
-             for s in g.stops.values()]
-    stops.sort(key=lambda s: s["id"])
-    return {"stops": stops}
+        return transit.stops()
+    except Exception:
+        return {"stops": [], "status": "unavailable", "reason": "BT stops are temporarily unavailable."}
 
 
 def transit_departures_endpoint(stop_id: str) -> dict:
+    if config.CACHE_ONLY:
+        payload = _scheduled_transit_departures_endpoint(stop_id)
+        return {**payload, "is_replay": True, "fetched_at": config.now().isoformat()}
+    try:
+        return transit.departures(str(stop_id or ""))
+    except Exception:
+        return {"departures": [], "status": "unavailable", "reason": "BT departures are temporarily unavailable."}
+
+
+def _scheduled_transit_departures_endpoint(stop_id: str) -> dict:
     """Departure board rows for one stop, service-filtered (schedule truth).
 
     The row field names are the UI's contract (`departure_at`, `route`,
@@ -388,3 +369,28 @@ def route_endpoint(payload: dict) -> tuple[dict, int]:
             "Path geometry withheld pending the recorded VT GIS redistribution "
             "permission; distance and directions are still real."]
     return body, 200
+
+
+def campus_events_endpoint():
+    """Expose Taylor's browse/calendar contract without writing a calendar."""
+    from hokieday import events
+    candidates = [config.CACHE_DIR / "events" / "events_september_2026.json",
+                  config.FIXTURES_DIR / "events" / "events_september_2026.json"]
+    try:
+        path = next(p for p in candidates if p.exists())
+        snapshot = events.load_snapshot(path)
+        now = config.now()
+        result = events.browse(snapshot, start=now, now=now,
+                               include_cancelled=False, include_uncertain=False, limit=100)
+        rows = []
+        for event in result.events:
+            if event.invalid_range or event.status == "parser-failed":
+                continue
+            calendar = events.to_calendar_event(event)
+            if event.duration_unknown and not event.all_day:
+                calendar["end"] = None
+            rows.append({"id": event.id, **calendar})
+        return {"events": rows, "state": result.state, "notices": list(result.notices),
+                "month": snapshot.month, "fetched_at": snapshot.fetched_at}
+    except Exception:
+        return {"events": [], "state": "unavailable", "notices": ["Campus events could not load. Please try again."]}
