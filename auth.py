@@ -486,6 +486,23 @@ def start_google_oauth(request_state: Optional[Mapping[str, Any]] = None,
 def login_with_google(request_state: Optional[Mapping[str, Any]] = None) -> str:
     return start_google_oauth(request_state)
 
+def _token_expiry(supa_session: Any) -> str:
+    """When Supabase's access token expires, as an ISO string ('' if unknown).
+
+    Supabase reports either ``expires_at`` (epoch seconds) or ``expires_in``.
+    """
+    expires = _get(supa_session, "expires_at")
+    if isinstance(expires, (int, float)) and expires > 0:
+        return datetime.fromtimestamp(float(expires), timezone.utc).isoformat()
+    try:
+        seconds = float(_get(supa_session, "expires_in") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if seconds <= 0:
+        return ""
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+
 def handle_google_oauth_callback(
     callback_params: Optional[Mapping[str, Any]],
     request_state: Optional[Mapping[str, Any]] = None,
@@ -528,7 +545,12 @@ def handle_google_oauth_callback(
         "session": {
             "access_token": _get(supa_session, "access_token") or "",
             "refresh_token": _get(supa_session, "refresh_token") or "",
+            # The session cookie lives a week; the Supabase access token inside
+            # it dies in about an hour. Keep both, so the account path can
+            # refresh the token instead of presenting a dead one and telling the
+            # student to sign in again while the UI still shows them signed in.
             "expires_at": expires_at.isoformat(),
+            "token_expires_at": _token_expiry(supa_session),
             "provider": "google",
             "user": user,
         },

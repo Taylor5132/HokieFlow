@@ -32,7 +32,7 @@ import sys
 import threading
 import time
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
@@ -1026,6 +1026,20 @@ def _client_agent_budget_available(client_ip: str) -> bool:
         return True
 
 
+def _supabase_token_expiry(session: dict) -> str:
+    """The access token's own expiry, from Supabase's session object."""
+    expires = session.get("expires_at")
+    if isinstance(expires, (int, float)) and expires > 0:
+        return datetime.fromtimestamp(float(expires), timezone.utc).isoformat()
+    try:
+        seconds = float(session.get("expires_in") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if seconds <= 0:
+        return ""
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+
 def _session_payload(auth_response) -> dict:
     """The session cookie payload for an email/password sign-in.
 
@@ -1043,7 +1057,12 @@ def _session_payload(auth_response) -> dict:
     payload = {
         "access_token": session.get("access_token"),
         "refresh_token": session.get("refresh_token"),
-        "expires_at": session.get("expires_at") or "",
+        # The cookie outlives the token on purpose: an hour-long token must not
+        # sign a student out, so the account path refreshes it (see
+        # app/supabase_session.py) and only a failed refresh asks them to sign in.
+        "expires_at": (datetime.now(timezone.utc)
+                       + timedelta(seconds=60 * 60 * 24 * 7)).isoformat(),
+        "token_expires_at": _supabase_token_expiry(session),
         "provider": "email",
     }
     account = auth_response.get("user")

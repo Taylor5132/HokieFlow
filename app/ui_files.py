@@ -128,7 +128,13 @@ def _account_token(headers=None, access_token=None):
     if str(bearer).lower().startswith("bearer "):
         return str(bearer).split(" ", 1)[1].strip()
     from auth import get_session_cookie
-    return get_session_cookie(headers.get("Cookie") or headers.get("cookie")).get("access_token")
+    from app import supabase_session
+    session = get_session_cookie(headers.get("Cookie") or headers.get("cookie"))
+    # The cookie is valid for a week, but the Supabase access token inside it
+    # lasts about an hour. Refreshing here -- one choke point for account reads
+    # and writes -- is what stops a signed-in student from being told to sign in
+    # again while the UI still shows them signed in.
+    return supabase_session.token_for(session)
 
 
 def enrich_account(body: dict, user: object, *, headers=None, access_token=None) -> dict:
