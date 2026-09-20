@@ -57,6 +57,7 @@ from hokieday import cache, config, tools  # noqa: E402
 # package". REPO is on sys.path just above, so `app` resolves either way -- as a
 # namespace package when run as a script, and as app.server when tests import it.
 from app import mapview  # noqa: E402
+from app import ui_files  # noqa: E402
 
 TZ = ZoneInfo(config.CAMPUS_TZ)
 
@@ -1064,19 +1065,45 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 return {}
 
+    def _assets(self, path: str) -> bool:
+        """Serve the shipped ui/ design (and legacy app/index.html assets)."""
+        asset = ui_files.serve(path)
+        if asset is not None:
+            code, body, ctype, extra = asset
+            self._send(code, body, ctype, extra)
+            return True
+        if path == "/manifest.webmanifest":   # legacy demo app constants
+            self._send(200, json.dumps(MANIFEST).encode("utf-8"),
+                       "application/manifest+json; charset=utf-8")
+            return True
+        if path == "/icon.svg":
+            self._send(200, ICON_SVG.encode("utf-8"), "image/svg+xml")
+            return True
+        if path == "/favicon.ico":           # keep the console clean
+            self._send(204, b"", "image/x-icon")
+            return True
+        if path in ("/styles.css", "/app.js"):
+            legacy = Path(__file__).parent / path.lstrip("/")
+            try:
+                ctype = ("text/css; charset=utf-8" if path.endswith(".css")
+                         else "text/javascript; charset=utf-8")
+                self._send(200, legacy.read_bytes(), ctype)
+            except OSError:
+                self._send(404, b"{}", "application/json; charset=utf-8")
+            return True
+        return False
+
     def do_GET(self) -> None:                 # noqa: N802
         path = self.path.split("?")[0]
         query = parse_qs(urlparse(self.path).query)
-        if path in ("/", "/index.html"):
-            html = (Path(__file__).parent / "index.html").read_bytes()
-            self._send(200, html, "text/html; charset=utf-8")
+        if self._assets(path):
             return
         if path == "/api/auth/me":
             try:
                 user = require_auth({"Authorization": self.headers.get("Authorization"), "Cookie": self.headers.get("Cookie")})
-                self._json({"user": user}, 200)
+                self._json(ui_files.enrich_account({"user": ui_files.user_ref(user)}, user), 200)
             except PermissionError:
-                self._json({"error": "authentication required"}, 401)
+                self._json({"user": None}, 200)
             return
         if path == "/api/auth/google":
             state = query.get("state", [None])[0] or None
@@ -1119,15 +1146,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json([{"key": k, "verified": bool(v.get("verified"))}
                         for k, v in config.static_places()])
             return
-        if path == "/manifest.webmanifest":
-            self._send(200, json.dumps(MANIFEST).encode("utf-8"),
-                       "application/manifest+json; charset=utf-8")
+        if path == "/api/dining/places":
+            self._json(ui_files.dining_places_endpoint())
             return
-        if path == "/icon.svg":
-            self._send(200, ICON_SVG.encode("utf-8"), "image/svg+xml")
+        if path == "/api/transit/stops":
+            self._json(ui_files.transit_stops_endpoint())
             return
-        if path == "/favicon.ico":        # keep the console clean
-            self._send(204, b"", "image/x-icon")
+        if path == "/api/transit/departures":
+            self._json(ui_files.transit_departures_endpoint(
+                query.get("stop", [""])[0]))
+            return
+        if path == "/api/map/buildings":
+            self._json(ui_files.buildings_endpoint(query.get("q", [])))
+            return
+        if path == "/api/map/state":
+            self._json(ui_files.map_state_endpoint(config.now(TZ)))
             return
         if path == "/api/raw":
             n = int((parse_qs(urlparse(self.path).query).get("n", ["1"])[0]))
@@ -1167,9 +1200,25 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/auth/me":
             try:
                 user = require_auth({"Authorization": self.headers.get("Authorization"), "Cookie": self.headers.get("Cookie")})
-                self._json({"user": user}, 200)
+                self._json(ui_files.enrich_account({"user": ui_files.user_ref(user)}, user), 200)
+            except PermissionError:
+                self._json({"user": None}, 200)
+            return
+        if path == "/api/account/data":
+            try:
+                user = require_auth({"Authorization": self.headers.get("Authorization"), "Cookie": self.headers.get("Cookie")})
             except PermissionError:
                 self._json({"error": "authentication required"}, 401)
+                return
+            payload = self._read_json()
+            host = self.headers.get("Host", "")
+            origin = self.headers.get("Origin")
+            same_origin = origin in (None, f"https://{host}", f"http://{host}")
+            if not same_origin or self.headers.get("X-HokieFlow-Request") != "1":
+                self._json({"error": "forbidden"}, 403)
+                return
+            result, code = ui_files.save_account(user, payload.get("data"), payload.get("version"))
+            self._json(result, code)
             return
         if path == "/api/auth/google":
             payload = self._read_json()
@@ -1194,6 +1243,14 @@ class Handler(BaseHTTPRequestHandler):
                             ("Set-Cookie", clear_oauth_state_cookie())])
             except ValueError as exc:
                 self._json({"error": str(exc)}, 400, [("Set-Cookie", clear_oauth_state_cookie())])
+            return
+        if path == "/api/route":
+            payload = self._read_json()
+            try:
+                result, code = ui_files.route_endpoint(payload)
+                self._json(result, code)
+            except Exception as exc:                      # noqa: BLE001
+                self._json({"error": f"{type(exc).__name__}: {exc}", "status": "unavailable"}, 502)
             return
         if self.path.split("?")[0] != "/api/ask":
             self._json({"error": "not found"}, 404)
