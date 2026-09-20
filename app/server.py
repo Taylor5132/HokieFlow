@@ -37,6 +37,20 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
+
+# The repo root must be on sys.path BEFORE the imports below: run as a script
+# (`python3 app/server.py`) sys.path[0] is app/, so `import auth` (repo root) and
+# the .env loader would otherwise fail. This is the only reason the path setup
+# sits above the imports.
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+from app.local_env import load_local_env  # noqa: E402
+
+# Local credentials remain in the gitignored .env file. Load them before
+# hokieday.config reads DEMO_MODE; existing process environment always wins.
+load_local_env(REPO / ".env")
+
 # Auth is OPTIONAL at import time: it needs the third-party `supabase` and
 # `python-dotenv` packages, while the offline demo and the whole test suite must
 # run on the stdlib alone (NFR-1). When the packages are absent the auth
@@ -82,15 +96,6 @@ except Exception as _auth_exc:                                 # noqa: BLE001
     set_oauth_state_cookie = _auth_unavailable
     set_session_cookie = _auth_unavailable
     start_google_oauth = _auth_unavailable
-
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO))
-
-from app.local_env import load_local_env  # noqa: E402
-
-# Local credentials remain in the gitignored .env file. Load them before
-# hokieday.config reads DEMO_MODE; existing process environment always wins.
-load_local_env(REPO / ".env")
 
 from hokieday import agent as hokie_agent  # noqa: E402
 from hokieday import cache, config, tools  # noqa: E402
