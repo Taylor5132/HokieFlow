@@ -1,10 +1,18 @@
 import os
 from typing import Optional
 
-from dotenv import load_dotenv
+# python-dotenv is OPTIONAL: app/server.py already loads the same .env through
+# app/local_env.py (stdlib) before anything else imports this module, so the
+# value here is only convenience for someone importing database.py directly.
+try:
+    from dotenv import load_dotenv
+except ImportError:                                            # pragma: no cover
+    load_dotenv = None
+
 from supabase import Client, create_client
 
-load_dotenv()
+if load_dotenv is not None:
+    load_dotenv()
 
 
 def get_supabase_url() -> Optional[str]:
