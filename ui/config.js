@@ -2,6 +2,6 @@
 export const config = Object.freeze({
   mode: 'backend', apiBase: '',
   homeEndpoint: '',
-  // Set to the same-origin server route that begins Google OAuth.
-  googleAuthUrl: ''
+  // Must be a same-origin route that starts Google OAuth on the backend.
+  googleAuthUrl: '/api/auth/google'
 });

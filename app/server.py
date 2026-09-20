@@ -26,6 +26,7 @@ import errno
 import json
 import os
 import re
+import secrets
 import socket
 import sys
 import threading
@@ -34,7 +35,7 @@ from collections import defaultdict, deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 from zoneinfo import ZoneInfo
 
 
@@ -59,6 +60,7 @@ try:                                                          # noqa: SIM105
     from auth import (
         clear_oauth_state_cookie,
         clear_session_cookie,
+        get_oauth_state_cookie,
         get_session_cookie,
         handle_google_oauth_callback,
         login_user,
@@ -87,6 +89,7 @@ except Exception as _auth_exc:                                 # noqa: BLE001
 
     clear_oauth_state_cookie = _auth_unavailable
     clear_session_cookie = _auth_unavailable
+    get_oauth_state_cookie = _auth_unavailable
     get_session_cookie = _auth_unavailable
     handle_google_oauth_callback = _auth_unavailable
     login_user = _auth_unavailable
@@ -1311,27 +1314,26 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"user": None}, 200)
             return
         if path == "/api/auth/google":
-            state = query.get("state", [None])[0] or None
-            redirect = start_google_oauth({"state": state} if state else {})
-            cookie = set_oauth_state_cookie(state) if state else set_oauth_state_cookie(redirect.split("state=")[-1].split("&")[0])
-            self._send(302, b"", "text/plain; charset=utf-8", [("Location", redirect), ("Set-Cookie", cookie)])
+            state = secrets.token_urlsafe(32)
+            redirect = start_google_oauth({"state": state})
+            self._send(302, b"", "text/plain; charset=utf-8",
+                       [("Location", redirect),
+                        ("Set-Cookie", set_oauth_state_cookie(state))])
             return
         if path == "/api/auth/google/callback":
             params = {key: values[0] for key, values in query.items()}
-            state = self.headers.get("Cookie", "")
-            state_value = None
-            for part in state.split(";"):
-                name, sep, value = part.strip().partition("=")
-                if sep and name == "hokieflow_oauth_state":
-                    state_value = value
-                    break
+            state = get_oauth_state_cookie(self.headers.get("Cookie"))
             try:
-                session = handle_google_oauth_callback(params, {"state": state_value})
-                self._json({"user": session.get("user"), "session": session.get("session")}, 200,
-                           [("Set-Cookie", set_session_cookie({**session.get("session", {}), "user": session.get("user")})),
+                result = handle_google_oauth_callback(params, {"state": state})
+                self._send(302, b"", "text/plain; charset=utf-8",
+                           [("Location", "/"),
+                            ("Set-Cookie", set_session_cookie(result["session"])),
                             ("Set-Cookie", clear_oauth_state_cookie())])
             except ValueError as exc:
-                self._json({"error": str(exc)}, 400, [("Set-Cookie", clear_oauth_state_cookie())])
+                message = quote(str(exc), safe="")
+                self._send(302, b"", "text/plain; charset=utf-8",
+                           [("Location", f"/?auth_error={message}"),
+                            ("Set-Cookie", clear_oauth_state_cookie())])
             return
         if path == "/api/time":
             # Lightweight: the clock only -- no GTFS, dining, or live-bus load.
@@ -1464,25 +1466,19 @@ class Handler(BaseHTTPRequestHandler):
             self._account_save()
             return
         if path == "/api/auth/google":
-            payload = self._read_json()
-            redirect = start_google_oauth(payload)
-            state = redirect.split("state=")[-1].split("&")[0]
+            payload = self._read_json() if self.headers.get("Content-Type", "").lower().startswith("application/json") else {}
+            state = payload.get("state") or secrets.token_urlsafe(32)
+            redirect = start_google_oauth({"state": state})
             self._json({"redirect": redirect}, 200, [("Set-Cookie", set_oauth_state_cookie(state))])
             return
         if path == "/api/auth/google/callback":
             params = parse_qs(urlparse(self.path).query)
             data = {k: v[0] for k, v in params.items()}
-            cookie = self.headers.get("Cookie", "")
-            state = None
-            for part in cookie.split(";"):
-                name, sep, value = part.strip().partition("=")
-                if sep and name == "hokieflow_oauth_state":
-                    state = value
-                    break
+            state = get_oauth_state_cookie(self.headers.get("Cookie"))
             try:
-                session = handle_google_oauth_callback(data, {"state": state})
-                self._json({"user": session.get("user")}, 200,
-                           [("Set-Cookie", set_session_cookie({"access_token": session.get("session", {}).get("access_token"), "refresh_token": session.get("session", {}).get("refresh_token"), "expires_at": session.get("session", {}).get("expires_at") or ""})),
+                result = handle_google_oauth_callback(data, {"state": state})
+                self._json({"user": result.get("user")}, 200,
+                           [("Set-Cookie", set_session_cookie(result["session"])),
                             ("Set-Cookie", clear_oauth_state_cookie())])
             except ValueError as exc:
                 self._json({"error": str(exc)}, 400, [("Set-Cookie", clear_oauth_state_cookie())])

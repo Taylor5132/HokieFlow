@@ -46,7 +46,11 @@ def load_local_env(path: str | Path) -> dict[str, str]:
         mode = env_path.stat().st_mode
     except OSError as exc:
         raise RuntimeError(f"cannot inspect {env_path}") from exc
-    if mode & 0o077:
+    # Windows files do not use the same Unix permission bits; a file can be
+    # effectively user-private on NTFS without setting the POSIX group/other
+    # bits that this loader is checking. The guard is still valuable on Unix,
+    # but it must not block valid local development on Windows.
+    if os.name != "nt" and mode & 0o077:
         raise RuntimeError(
             f"refusing {env_path}: run 'chmod 600 {env_path}' to protect secrets")
 

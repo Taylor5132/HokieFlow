@@ -19,6 +19,15 @@ const icon = name => `<svg width="24" height="24" viewBox="0 0 24 24" fill="none
 let preferenceStorage;try{preferenceStorage=window.localStorage;}catch{}
 const preferences=loadPreferences(preferenceStorage);document.documentElement.dataset.theme=preferences.theme;let notificationMessage='',notificationBusy=false;const sentReminders=new Set();
 const state = {tab:'home',answer:null,clock:null,clockFailed:false,busy:false,error:'',query:'',review:'fits',status:null, savedClass:null, homeData:null, homeError:'',user:null,accountReady:false,accountError:'',accountData:{savedClass:null,reduceMotion:false,plans:[],events:[]},accountVersion:0,accountSaving:false};
+let googleAuthErrorMessage = (() => {
+  const params = new URLSearchParams(window.location.search);
+  const message = params.get('auth_error');
+  if (!message) return '';
+  const url = new URL(window.location.href);
+  url.searchParams.delete('auth_error');
+  history.replaceState({}, '', url);
+  return decodeURIComponent(message);
+})();
 let calendarMonth=new Date(new Date().getFullYear(),new Date().getMonth(),1),selectedDay=dateKey(new Date());
 let diningPlaces=[],diningLocation=null,diningLoading=false,diningError='',diningLoaded=false;
 let homeWeather=null,weatherError=false,transitStops=[],transitDepartures=[],transitLocation=null,transitBusy=false,transitError='',transitUpdated=0;
@@ -172,6 +181,11 @@ document.addEventListener('click',event=>{if(event.target.closest('[data-action=
 function startGoogleLogin(){
  const message=$('#google-auth-error');
  try{
+  console.log('[HokieFlow auth]', {
+   googleAuthUrl: config.googleAuthUrl,
+   origin: window.location.origin,
+   href: config.googleAuthUrl ? new URL(config.googleAuthUrl, window.location.origin).href : null
+  });
   if(!config.googleAuthUrl)throw new Error('Google sign-in is temporarily unavailable. Please use email to continue.');
   const target=new URL(config.googleAuthUrl,window.location.origin);
   if(target.origin!==window.location.origin||!['http:','https:'].includes(target.protocol))throw new Error('Google sign-in is temporarily unavailable. Please use email to continue.');
