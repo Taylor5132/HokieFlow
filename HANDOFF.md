@@ -1,3 +1,5 @@
+> Current UI: run `python3 serve.py --port 3001`. Navigation now opens Apple Maps. [CAMPUS-INTEGRATION.md](CAMPUS-INTEGRATION.md) supersedes earlier GIS integration instructions.
+
 # HokieFlow integration handoff
 
 
