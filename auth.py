@@ -38,6 +38,13 @@ def login(email, password):
         "password": password,
     })
 
+def login_with_google():
+    response = supabase.auth.sign_in_with_oauth({
+        "provider": "google"
+    })
+
+    return response
+
 
 def get_profile():
     user_response = supabase.auth.get_user()
