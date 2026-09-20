@@ -30,7 +30,22 @@ import sys
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
+
+from auth import (
+    clear_oauth_state_cookie,
+    clear_session_cookie,
+    get_session_cookie,
+    handle_google_oauth_callback,
+    login_user,
+    logout_user,
+    require_auth,
+    register_user,
+    set_oauth_state_cookie,
+    set_session_cookie,
+    start_google_oauth,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -1017,23 +1032,74 @@ class Handler(BaseHTTPRequestHandler):
         if "/api/" not in (args[0] if args else ""):
             return
 
-    def _send(self, code: int, body: bytes, ctype: str) -> None:
+    def _send(self, code: int, body: bytes, ctype: str, extra_headers: list[tuple[str, str]] | None = None) -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if extra_headers:
+            for key, value in extra_headers:
+                self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
-    def _json(self, obj, code: int = 200) -> None:
+    def _json(self, obj, code: int = 200, extra_headers: list[tuple[str, str]] | None = None) -> None:
         self._send(code, json.dumps(obj, default=str, indent=1).encode("utf-8"),
-                   "application/json; charset=utf-8")
+                   "application/json; charset=utf-8", extra_headers)
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length") or 0)
+        if not length:
+            return {}
+        raw = self.rfile.read(length)
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw.decode("utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            try:
+                qs = parse_qs(raw.decode("utf-8"))
+                return {k: v[0] if len(v) == 1 else v for k, v in qs.items()}
+            except Exception:
+                return {}
 
     def do_GET(self) -> None:                 # noqa: N802
         path = self.path.split("?")[0]
+        query = parse_qs(urlparse(self.path).query)
         if path in ("/", "/index.html"):
             html = (Path(__file__).parent / "index.html").read_bytes()
             self._send(200, html, "text/html; charset=utf-8")
+            return
+        if path == "/api/auth/me":
+            try:
+                user = require_auth({"Authorization": self.headers.get("Authorization"), "Cookie": self.headers.get("Cookie")})
+                self._json({"user": user}, 200)
+            except PermissionError:
+                self._json({"error": "authentication required"}, 401)
+            return
+        if path == "/api/auth/google":
+            state = query.get("state", [None])[0] or None
+            redirect = start_google_oauth({"state": state} if state else {})
+            cookie = set_oauth_state_cookie(state) if state else set_oauth_state_cookie(redirect.split("state=")[-1].split("&")[0])
+            self._send(302, b"", "text/plain; charset=utf-8", [("Location", redirect), ("Set-Cookie", cookie)])
+            return
+        if path == "/api/auth/google/callback":
+            params = {key: values[0] for key, values in query.items()}
+            state = self.headers.get("Cookie", "")
+            state_value = None
+            for part in state.split(";"):
+                name, sep, value = part.strip().partition("=")
+                if sep and name == "hokieflow_oauth_state":
+                    state_value = value
+                    break
+            try:
+                session = handle_google_oauth_callback(params, {"state": state_value})
+                self._json({"user": session.get("user"), "session": session.get("session")}, 200,
+                           [("Set-Cookie", set_session_cookie({**session.get("session", {}), "user": session.get("user")})),
+                            ("Set-Cookie", clear_oauth_state_cookie())])
+            except ValueError as exc:
+                self._json({"error": str(exc)}, 400, [("Set-Cookie", clear_oauth_state_cookie())])
             return
         if path == "/api/time":
             # Lightweight: the clock only -- no GTFS, dining, or live-bus load.
@@ -1064,7 +1130,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send(204, b"", "image/x-icon")
             return
         if path == "/api/raw":
-            from urllib.parse import parse_qs, urlparse
             n = int((parse_qs(urlparse(self.path).query).get("n", ["1"])[0]))
             idx = max(0, min(len(SCENARIOS) - 1, n - 1))
             try:
@@ -1077,6 +1142,59 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "not found"}, 404)
 
     def do_POST(self) -> None:                # noqa: N802
+        path = self.path.split("?")[0]
+        if path == "/api/auth/register":
+            payload = self._read_json()
+            try:
+                user = register_user(payload.get("email"), payload.get("password"))
+                session_cookie = set_session_cookie({"access_token": user.get("session", {}).get("access_token"), "refresh_token": user.get("session", {}).get("refresh_token"), "expires_at": user.get("session", {}).get("expires_at") or ""})
+                self._json({"user": user.get("user")}, 201, [("Set-Cookie", session_cookie)])
+            except Exception as exc:                           # noqa: BLE001
+                self._json({"error": str(exc)}, 400)
+            return
+        if path == "/api/auth/login":
+            payload = self._read_json()
+            try:
+                user = login_user(payload.get("email"), payload.get("password"))
+                session_cookie = set_session_cookie({"access_token": user.get("session", {}).get("access_token"), "refresh_token": user.get("session", {}).get("refresh_token"), "expires_at": user.get("session", {}).get("expires_at") or ""})
+                self._json({"user": user.get("user")}, 200, [("Set-Cookie", session_cookie)])
+            except Exception as exc:                           # noqa: BLE001
+                self._json({"error": str(exc)}, 401)
+            return
+        if path == "/api/auth/logout":
+            self._json({"ok": True}, 200, [("Set-Cookie", clear_session_cookie())])
+            return
+        if path == "/api/auth/me":
+            try:
+                user = require_auth({"Authorization": self.headers.get("Authorization"), "Cookie": self.headers.get("Cookie")})
+                self._json({"user": user}, 200)
+            except PermissionError:
+                self._json({"error": "authentication required"}, 401)
+            return
+        if path == "/api/auth/google":
+            payload = self._read_json()
+            redirect = start_google_oauth(payload)
+            state = redirect.split("state=")[-1].split("&")[0]
+            self._json({"redirect": redirect}, 200, [("Set-Cookie", set_oauth_state_cookie(state))])
+            return
+        if path == "/api/auth/google/callback":
+            params = parse_qs(urlparse(self.path).query)
+            data = {k: v[0] for k, v in params.items()}
+            cookie = self.headers.get("Cookie", "")
+            state = None
+            for part in cookie.split(";"):
+                name, sep, value = part.strip().partition("=")
+                if sep and name == "hokieflow_oauth_state":
+                    state = value
+                    break
+            try:
+                session = handle_google_oauth_callback(data, {"state": state})
+                self._json({"user": session.get("user")}, 200,
+                           [("Set-Cookie", set_session_cookie({"access_token": session.get("session", {}).get("access_token"), "refresh_token": session.get("session", {}).get("refresh_token"), "expires_at": session.get("session", {}).get("expires_at") or ""})),
+                            ("Set-Cookie", clear_oauth_state_cookie())])
+            except ValueError as exc:
+                self._json({"error": str(exc)}, 400, [("Set-Cookie", clear_oauth_state_cookie())])
+            return
         if self.path.split("?")[0] != "/api/ask":
             self._json({"error": "not found"}, 404)
             return
@@ -1084,11 +1202,7 @@ class Handler(BaseHTTPRequestHandler):
         # body is parsed or any planning runs. This is the authority for every
         # time in the response; the browser clock is never consulted.
         now = config.now(TZ)
-        length = int(self.headers.get("Content-Length") or 0)
-        try:
-            payload = json.loads(self.rfile.read(length) or b"{}")
-        except Exception:                                  # noqa: BLE001
-            payload = {}
+        payload = self._read_json()
         try:
             result, code = handle_ask(payload, now=now)
             self._json(result, code)
