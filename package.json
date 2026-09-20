@@ -1,0 +1,7 @@
+{
+  "name": "hokieday-ui",
+  "private": true,
+  "type": "module",
+  "description": "HokieFlow UI/UX contribution for the Python hokieday backend",
+  "scripts": {"test": "node --test tests/*.test.js"}
+}
