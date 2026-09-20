@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from hokieday import config, tools, vtgis
+from hokieday import config, tools, vtgis, transit, dining_places
 
 UI_DIR = Path(__file__).resolve().parent.parent / "ui"
 
@@ -28,6 +28,9 @@ UI_DIR = Path(__file__).resolve().parent.parent / "ui"
 # every other asset by its fixed name. A mapping (instead of Path.joinpath on
 # user input) makes path traversal structurally impossible.
 _ASSET_TYPES = {
+    "motion.js": "text/javascript; charset=utf-8",
+    "gsap.min.js": "text/javascript; charset=utf-8",
+    "ScrollTrigger.min.js": "text/javascript; charset=utf-8",
     "index.html": "text/html; charset=utf-8",
     "styles.css": "text/css; charset=utf-8",
     "app.js": "text/javascript; charset=utf-8",
@@ -37,6 +40,7 @@ _ASSET_TYPES = {
     "home-live.js": "text/javascript; charset=utf-8",
     "bus-location.js": "text/javascript; charset=utf-8",
     "dining.js": "text/javascript; charset=utf-8",
+    "class-import.js": "text/javascript; charset=utf-8",
     "schedule.js": "text/javascript; charset=utf-8",
     "directions.js": "text/javascript; charset=utf-8",
     "preferences.js": "text/javascript; charset=utf-8",
@@ -217,19 +221,23 @@ def dining_places_endpoint() -> dict:
 
 
 def transit_stops_endpoint() -> dict:
-    """BT stops (id/name/lat/lon) for the Near-me departure board."""
     try:
-        g = tools._src(None)._g()          # the shared lazy GTFS loader
-    except Exception as exc:                             # noqa: BLE001
-        return {"stops": [], "status": "unavailable",
-                "reason": f"transit schedule unavailable: {exc}"}
-    stops = [{"id": s.stop_id, "name": s.name, "lat": s.lat, "lon": s.lon}
-             for s in g.stops.values()]
-    stops.sort(key=lambda s: s["id"])
-    return {"stops": stops}
+        return transit.stops()
+    except Exception:
+        return {"stops": [], "status": "unavailable", "reason": "BT stops are temporarily unavailable."}
 
 
 def transit_departures_endpoint(stop_id: str) -> dict:
+    if config.CACHE_ONLY:
+        payload = _scheduled_transit_departures_endpoint(stop_id)
+        return {**payload, "is_replay": True, "fetched_at": config.now().isoformat()}
+    try:
+        return transit.departures(str(stop_id or ""))
+    except Exception:
+        return {"departures": [], "status": "unavailable", "reason": "BT departures are temporarily unavailable."}
+
+
+def _scheduled_transit_departures_endpoint(stop_id: str) -> dict:
     """Departure board rows for one stop, service-filtered (schedule truth).
 
     The row field names are the UI's contract (`departure_at`, `route`,
@@ -388,3 +396,28 @@ def route_endpoint(payload: dict) -> tuple[dict, int]:
             "Path geometry withheld pending the recorded VT GIS redistribution "
             "permission; distance and directions are still real."]
     return body, 200
+
+
+def campus_events_endpoint():
+    """Expose Taylor's browse/calendar contract without writing a calendar."""
+    from hokieday import events
+    candidates = [config.CACHE_DIR / "events" / "events_september_2026.json",
+                  config.FIXTURES_DIR / "events" / "events_september_2026.json"]
+    try:
+        path = next(p for p in candidates if p.exists())
+        snapshot = events.load_snapshot(path)
+        now = config.now()
+        result = events.browse(snapshot, start=now, now=now,
+                               include_cancelled=False, include_uncertain=False, limit=100)
+        rows = []
+        for event in result.events:
+            if event.invalid_range or event.status == "parser-failed":
+                continue
+            calendar = events.to_calendar_event(event)
+            if event.duration_unknown and not event.all_day:
+                calendar["end"] = None
+            rows.append({"id": event.id, **calendar})
+        return {"events": rows, "state": result.state, "notices": list(result.notices),
+                "month": snapshot.month, "fetched_at": snapshot.fetched_at}
+    except Exception:
+        return {"events": [], "state": "unavailable", "notices": ["Campus events could not load. Please try again."]}

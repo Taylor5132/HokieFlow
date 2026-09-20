@@ -45,7 +45,7 @@ class FakeAuth:
         self.sign_out_calls += 1
         return {"message": "logged out"}
 
-    def get_user(self):
+    def get_user(self, token=None):
         if self.user is None:
             return None
         return {"user": self.user}
@@ -181,7 +181,7 @@ class TestAuth(unittest.TestCase):
             handle_google_oauth_callback({"error": "access_denied"}, {"state": "state-123"})
 
         with self.assertRaises(ValueError):
-            handle_google_oauth_callback({"code": "abc"}, {"state": "diff"})
+            handle_google_oauth_callback({"code": "abc"}, {})
 
     def test_session_cookie_helpers_round_trip(self):
         cookie = set_session_cookie({"access_token": "t1", "refresh_token": "t2"})

@@ -160,16 +160,28 @@ def clear_oauth_state_cookie() -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Email / password auth
-# ---------------------------------------------------------------------------
+def _response_dict(value):
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    return {}
+
+
+def _auth_call(method, payload):
+    try:
+        return _response_dict(method(payload))
+    except Exception as exc:
+        if any(word in str(exc).lower() for word in ("streamreset", "remote_reset", "connection", "timed out")):
+            raise ValueError("The account service could not be reached. Please try again shortly.") from exc
+        raise ValueError(str(exc)) from exc
 
 def register_user(email: str, password: str):
     client = get_supabase_client()
     if not email or not password:
         raise ValueError("Email and password are required.")
-    response = client.auth.sign_up({"email": email, "password": password})
-    if not response or not _get(response, "user"):
+    response = _auth_call(client.auth.sign_up, {"email": email, "password": password})
+    if not response or not response.get("user"):
         raise ValueError("Registration failed.")
 
     session = _get(response, "session")
@@ -192,7 +204,7 @@ def login_user(email: str, password: str):
     if not email or not password:
         raise ValueError("Email and password are required.")
     try:
-        response = client.auth.sign_in_with_password({"email": email, "password": password})
+        response = _auth_call(client.auth.sign_in_with_password, {"email": email, "password": password})
     except Exception as exc:  # pragma: no cover - surfaced to callers for security messages
         raise ValueError(str(exc)) from exc
     if not response or not _get(response, "user"):
