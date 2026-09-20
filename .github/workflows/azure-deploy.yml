@@ -1,4 +1,4 @@
-# Deploys HokieFlow to Azure App Service (hokieflow-5132) on every push to master.
+# Deploys HokieFlow to Azure App Service (hokie-5132) on every push to master.
 #
 # HOW IT WORKS
 #   azure/webapps-deploy ships the repo source to the App Service; the remote
@@ -42,6 +42,6 @@ jobs:
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
-          app-name: hokieflow-5132
+          app-name: hokie-5132
           publish-profile: ${{ secrets.AZURE_PUBLISH_PROFILE }}
           package: .
