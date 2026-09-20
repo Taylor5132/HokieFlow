@@ -63,7 +63,7 @@ mean **+0.96 min** — physically sensible. Override with `DEMO_NOW=<iso8601>`.
 
 ```bash
 export DEMO_MODE=cache
-python3 -m unittest discover -s tests -v     # 408 tests, no network
+python3 -m unittest discover -s tests -v     # 526 tests, no network
 ```
 
 With `DEMO_MODE=cache` nothing touches the network and the clock is pinned. If a
