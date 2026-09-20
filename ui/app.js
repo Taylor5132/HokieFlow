@@ -167,11 +167,16 @@ $('#detail').addEventListener('click',event=>{if(event.target===$('#detail'))clo
 $('.close').innerHTML=icon('close');
 async function syncClock(){try{state.clock=await getJSON('/api/time');state.clockFailed=false;syncMoment=performance.now();}catch{state.clockFailed=true;}const label=$('#clock-label');if(label)label.textContent=clockLabel();}
 void loadAccount();
-if(config.homeEndpoint){
 // #dining=<hall> opens that hall's menu directly, so a menu is linkable (and
-// screenshot-able) without clicking through the Dining tab first.
-const deepDining=new URLSearchParams((window.location.hash||'').replace(/^#/,'')).get('dining');
-if(deepDining&&!preview){navigate('dining');void loadDining().then(()=>openDiningMenu(deepDining));}void getJSON(config.homeEndpoint).then(data=>{state.homeData=data;render();}).catch(()=>{state.homeError='We couldn’t refresh your day. Please try again shortly.';render();});}
+// screenshot-able) without clicking through the Dining tab first. Kept OUT of
+// the homeEndpoint branch: that endpoint is empty in the shipped config, and the
+// first version of this was nested inside it and therefore never ran.
+if(!preview){
+ const deepDining=new URLSearchParams((window.location.hash||'').replace(/^#/,'')).get('dining');
+ if(deepDining){navigate('dining');void loadDining().then(()=>openDiningMenu(deepDining));}
+}
+if(config.homeEndpoint){
+void getJSON(config.homeEndpoint).then(data=>{state.homeData=data;render();}).catch(()=>{state.homeError='We couldn’t refresh your day. Please try again shortly.';render();});}
 if(preview){state.clock=previewTime;render();}else{render();void Promise.allSettled([syncClock(),getJSON('/api/status').then(status=>{state.status=status;})]).then(()=>render());setInterval(syncClock,30000);setInterval(()=>{const c=state.clock;if(!c||c.is_replay||c.pinned||!c.ticking||state.clockFailed)return;const label=$('#clock-label');if(label)label.textContent=`Campus ${new Intl.DateTimeFormat('en-US',{timeZone:c.timezone||'America/New_York',hour:'numeric',minute:'2-digit',second:'2-digit'}).format(new Date(campusMs()))} · server synced`;},1000);}
 
 function updateFooterSpace(){requestAnimationFrame(()=>{const footer=$('#chat-footer');document.documentElement.style.setProperty('--chat-height',`${footer.offsetHeight}px`);});}
