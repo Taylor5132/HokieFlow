@@ -33,8 +33,8 @@ def fetch(key, url, ttl, form=None):
     params = {'k': str(key)}
     if form:
         return cache.post_form_json(name, url, form, params=params,
-                                    max_age_s=ttl, timeout=12)
-    return cache.get_json(name, url, params=params, max_age_s=ttl, timeout=12)
+                                    max_age_s=ttl, timeout=3 if isinstance(key, tuple) and key[0]=='pattern' else 10)
+    return cache.get_json(name, url, params=params, max_age_s=ttl, timeout=3 if isinstance(key, tuple) and key[0]=='pattern' else 10)
 
 
 def fetched_at(key):
@@ -98,15 +98,8 @@ def departures(stop):
     payload=fetch(('departures',stop),BT+'getNextDeparturesForStop',30,{'stopCode':stop,'numOfTrips':9})
     rows = normalize_departures(payload,stop)
     patterns = list({row['pattern'] for row in rows})
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=9) as pool:
         loops = dict(zip(patterns,pool.map(pattern_loop,patterns)))
     for row in rows:
         row['destination_loop'] = loops.get(row['pattern'])
-    try:
-        routes = fetch('routes',BT+'getRoutes',3600).get('data',{})
-        for row in rows:
-            values = routes.get(row['route'],[])
-            row['route_name'] = values[0].get('routeName',row['route']).strip() if values else row['route']
-    except Exception:
-        pass
     return {'departures':rows,'fetched_at':fetched_at(('departures',stop)),'source':'Blacksburg Transit','kind':'adjusted departure estimates'}

@@ -2,7 +2,8 @@ import os
 from typing import Optional
 
 from dotenv import load_dotenv
-from supabase import Client, create_client
+from supabase import Client, ClientOptions, create_client
+import httpx
 
 load_dotenv()
 
@@ -22,7 +23,11 @@ def get_supabase_client() -> Client:
         raise RuntimeError(
             "Missing SUPABASE_URL or SUPABASE_KEY. Set them in the environment or .env."
         )
-    return create_client(url, key)
+    # HTTP/1.1 avoids upstream HTTP/2 StreamReset failures during signup.
+    return create_client(url, key, options=ClientOptions(
+        httpx_client=httpx.Client(http2=False, timeout=15.0),
+        auto_refresh_token=False, persist_session=False,
+    ))
 
 
 supabase: Optional[Client] = None

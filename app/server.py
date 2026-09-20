@@ -1388,8 +1388,12 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._read_json()
             try:
                 user = register_user(payload.get("email"), payload.get("password"))
-                session_cookie = set_session_cookie({"access_token": user.get("session", {}).get("access_token"), "refresh_token": user.get("session", {}).get("refresh_token"), "expires_at": user.get("session", {}).get("expires_at") or ""})
-                self._json({"user": user.get("user")}, 201, [("Set-Cookie", session_cookie)])
+                session = user.get("session") or {}
+                if not session.get("access_token"):
+                    self._json({"user": None, "requires_confirmation": True}, 201)
+                else:
+                    session_cookie = set_session_cookie({"access_token": session["access_token"], "refresh_token": session.get("refresh_token")})
+                    self._json(ui_files.enrich_account({"user": ui_files.user_ref(user["user"])}, user["user"]), 201, [("Set-Cookie", session_cookie)])
             except Exception as exc:                           # noqa: BLE001
                 self._json({"error": str(exc)}, 400)
             return
@@ -1397,8 +1401,11 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._read_json()
             try:
                 user = login_user(payload.get("email"), payload.get("password"))
-                session_cookie = set_session_cookie({"access_token": user.get("session", {}).get("access_token"), "refresh_token": user.get("session", {}).get("refresh_token"), "expires_at": user.get("session", {}).get("expires_at") or ""})
-                self._json({"user": user.get("user")}, 200, [("Set-Cookie", session_cookie)])
+                session = user.get("session") or {}
+                if not session.get("access_token"):
+                    raise ValueError("Confirm your email before logging in.")
+                session_cookie = set_session_cookie({"access_token": session["access_token"], "refresh_token": session.get("refresh_token")})
+                self._json(ui_files.enrich_account({"user": ui_files.user_ref(user["user"])}, user["user"]), 200, [("Set-Cookie", session_cookie)])
             except Exception as exc:                           # noqa: BLE001
                 self._json({"error": str(exc)}, 401)
             return

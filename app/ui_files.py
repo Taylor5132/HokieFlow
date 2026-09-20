@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from hokieday import config, tools, vtgis
+from hokieday import config, tools, vtgis, transit, dining_places
 
 UI_DIR = Path(__file__).resolve().parent.parent / "ui"
 
@@ -162,51 +162,21 @@ def save_account(user: object, data: object, version: object) -> tuple[dict, int
 # --------------------------------------------------------------------------- #
 
 def dining_places_endpoint() -> dict:
-    """Curated campus dining directory (CONNECTING.md contract).
-
-    The planner's place registry already carries the curated coordinates the
-    trip planner uses, so the UI browses exactly the places plans can route
-    to. Menus/allergens stay in /api/ask results; this list never fabricates
-    hours or open-now state it does not have.
-    """
-    places = []
-    for key, row in config.static_places():
-        name = str(key)
-        low = name.lower()
-        category = ("dining-hall" if ("d2" in low or "dietrick" in low
-                                      or "owens" in low or "west end" in low)
-                    else "cafe" if ("coffee" in low or "cafe" in low)
-                    else "market" if "market" in low else "dining")
-        places.append({
-            "id": name,
-            "name": name,
-            "category": category,
-            "lat": row.get("lat"),
-            "lon": row.get("lon"),
-            # Omitted, never guessed: no fabricated hours/description here.
-        })
-    return {"places": places, "note": ("coordinates match the planner place "
-            "registry; verified flags are deliberate")}
+    return dining_places.dining()
 
 
 def transit_stops_endpoint() -> dict:
-    """BT stops (id/name/lat/lon) for the Near-me departure board."""
     try:
-        g = tools._src(None)._g()          # the shared lazy GTFS loader
-    except Exception as exc:                             # noqa: BLE001
-        return {"stops": [], "status": "unavailable",
-                "reason": f"transit schedule unavailable: {exc}"}
-    stops = [{"id": s.stop_id, "name": s.name, "lat": s.lat, "lon": s.lon}
-             for s in g.stops.values()]
-    stops.sort(key=lambda s: s["id"])
-    return {"stops": stops}
+        return transit.stops()
+    except Exception:
+        return {"stops": [], "status": "unavailable", "reason": "BT stops are temporarily unavailable."}
 
 
 def transit_departures_endpoint(stop_id: str) -> dict:
-    """Departure board rows for one stop, service-filtered (schedule truth)."""
-    result = tools.get_next_departures(str(stop_id or ""))
-    return {"stop_id": result.get("stop_id"), "departures": result.get("departures", []),
-            "reason": result.get("reason")}
+    try:
+        return transit.departures(str(stop_id or ""))
+    except Exception:
+        return {"departures": [], "status": "unavailable", "reason": "BT departures are temporarily unavailable."}
 
 
 def buildings_endpoint(query_values: list[str]) -> dict:

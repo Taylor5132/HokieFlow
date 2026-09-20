@@ -45,7 +45,7 @@ class FakeAuth:
         self.sign_out_calls += 1
         return {"message": "logged out"}
 
-    def get_user(self):
+    def get_user(self, token=None):
         if self.user is None:
             return None
         return {"user": self.user}

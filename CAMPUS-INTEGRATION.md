@@ -40,10 +40,14 @@ The local account API, BT departures, dining location distances, and Apple Maps 
 Run `node --test tests/*.test.js` and `python3 -m unittest discover -s tests -p 'test_*.py'`.
 The directions tests cover the exact curated-list count, current-location omission, building origins, bus/walk modes, bad inputs, encoded place names, and feet conversion.
 
-## Settings and reminders
+## Settings
 
-Light/dark mode and notification opt-in are stored in browser localStorage by `ui/preferences.js`. These are device preferences, not account settings. Storage failure falls back safely to in-memory preferences. The user icon opens the full login view.
+Light/dark mode is stored in browser localStorage. Notifications and reminders have been removed. The user icon opens the login view. Weather attribution is under About → Data credits.
 
-Notifications request browser permission only after the user switches them on. The open app checks saved schedule occurrences every 30 seconds and shows a browser notification within ten minutes of an upcoming event, once per occurrence per page session. Support depends on the browser and HTTPS. There is no service worker or background push: reminders do not run after the app closes, and throttled/suspended tabs may delay delivery. Background mobile notifications require the team's push-service implementation. Notification titles contain the event title on the user's device.
+## Integrated backend fixes
 
-Weather attribution has moved into About → Data credits. Team credits and the 2026 copyright footer are in `ui/app.js`.
+Run `python -m app.server --port 3001` for the combined app. Its dining endpoint uses the nine-place directory, and its transit endpoints use the live BT adapter with the UI's departure contract. BT outages return an unavailable state; no scheduled times are presented as live.
+
+Install `requirements.txt` for Supabase authentication. The client uses HTTP/1.1 to avoid HTTP/2 stream resets, accepts current SDK response models, and validates the request's bearer token. Email-confirmation signups prompt the user to check their inbox instead of pretending they are logged in. Auth transport errors are not automatically retried, since a signup may already have reached the provider.
+
+Verification: 23 frontend tests and targeted backend regressions; real BT stop/departure reads and browser rendering. Signup is verified with mocked provider responses, not a real production account. Production verification still needs the team's configured Supabase project and email confirmation flow.
