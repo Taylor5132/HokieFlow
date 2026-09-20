@@ -100,17 +100,22 @@ class AccountSaveVerbContract(unittest.TestCase):
 
     def test_the_route_is_shared_by_both_verbs(self):
         import inspect
-        put = inspect.getsource(server.Handler.do_PUT)
-        post = inspect.getsource(server.Handler.do_POST)
+        put = inspect.getsource(server.Handler._route_put)
+        post = inspect.getsource(server.Handler._route_post)
         self.assertIn("/api/account/data", put)
         self.assertIn("/api/account/data", post)
         for source in (put, post):
             self.assertIn("_account_save", source,
                           "one implementation, so the verbs cannot drift")
+        # And each verb dispatches through the crash guard.
+        for verb in ("do_PUT", "do_POST", "do_GET"):
+            self.assertIn("_dispatch",
+                          inspect.getsource(getattr(server.Handler, verb)))
 
     def test_unknown_put_path_is_404_not_a_dead_socket(self):
         import inspect
-        self.assertIn('"not found"', inspect.getsource(server.Handler.do_PUT))
+        self.assertIn('"not found"',
+                      inspect.getsource(server.Handler._route_put))
 
 
 class AssetMapContract(unittest.TestCase):
@@ -246,6 +251,47 @@ class HttpEdgeContractTests(unittest.TestCase):
                          "the connection must be usable after a refused body")
         follow_up.read()
         conn.close()
+
+    def test_an_escaping_exception_never_becomes_an_empty_reply(self):
+        """A crash must answer, not drop the socket.
+
+        Deployed with APP_ENV=production and no SESSION_SECRET, auth.py refused
+        to sign with the development secret and the request died silently: the
+        client saw an empty reply, the proxy reported 502, and nothing said why.
+        """
+        from unittest import mock
+        conn = self._conn()
+        with mock.patch.object(server, "start_google_oauth",
+                               side_effect=RuntimeError("config missing")):
+            conn.request("GET", "/api/auth/google")
+            response = conn.getresponse()
+            self.assertEqual(response.status, 503)
+            body = json.loads(response.read())
+            self.assertEqual(body["status"], "unavailable")
+            self.assertNotIn("config missing", body["error"],
+                             "internals stay in the log, not in the response")
+        conn.close()
+
+    def test_an_unexpected_exception_is_a_500_not_a_dead_socket(self):
+        from unittest import mock
+        conn = self._conn()
+        with mock.patch.object(server.ui_files, "dining_places_endpoint",
+                               side_effect=ValueError("boom")):
+            conn.request("GET", "/api/dining/places")
+            response = conn.getresponse()
+            self.assertEqual(response.status, 500)
+            self.assertEqual(json.loads(response.read())["type"], "ValueError")
+        conn.close()
+
+    def test_normal_routes_still_answer_after_the_guard(self):
+        for path, expected in (("/api/time", 200), ("/api/status", 200),
+                               ("/api/dining/places", 200),
+                               ("/api/transit/stops", 200),
+                               ("/api/nope", 404)):
+            conn = self._conn()
+            conn.request("GET", path)
+            self.assertEqual(conn.getresponse().status, expected, path)
+            conn.close()
 
     def test_bounded_body_is_still_accepted(self):
         conn = self._conn()
