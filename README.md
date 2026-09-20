@@ -101,9 +101,24 @@ chmod 600 .env
 python3 app/server.py
 ```
 
-`app/server.py` loads only an allowlisted set of keys from `.env`, never prints
-values, and refuses a file readable by group/other users. Real process
-environment variables override `.env`. The file is ignored by Git.
+`app/server.py` loads `.env` with a small stdlib parser: `KEY=VALUE` only (no
+interpolation or command substitution), values are never printed, and a file
+readable by group/other users is refused (`chmod 600 .env`). A real process
+environment variable always wins, so a deployment's platform settings are never
+clobbered by a stray file. `.env` is ignored by Git; `.env.example` documents
+every variable the app reads.
+
+| Variable | Needed for | Notes |
+|---|---|---|
+| `DEMO_MODE` | everything | `cache` = replay only, zero network. `live` = refresh upstream |
+| `GEMINI_API_KEY`, `GEMINI_MODEL`, `HOKIEFLOW_AI_PROVIDER` | the live agent | no model is hardcoded; without these, free text uses the bounded parser |
+| `HOKIEFLOW_GEMINI_CALLS_PER_HOUR`, `_PER_DAY`, `HOKIEFLOW_AI_QUESTIONS_PER_IP_HOUR` | quota control | ledger persists in `cache/`, survives restarts |
+| `SUPABASE_URL`, `SUPABASE_KEY`, `APP_ENV`, `APP_URL` | accounts | optional; needs `pip install -r requirements.txt`. Without them `/api/auth/*` answers a typed 503 and the rest of the app is unaffected |
+| `HOKIEDAY_CACHE`, `HOKIEDAY_DATA`, `HOKIEDAY_FIXTURES` | data locations | only to point at other stores |
+| `DEMO_NOW`, `HOKIEDAY_GIS_PERMISSION_REF`, `VTGIS_LIVE` | clock and GIS | optional |
+
+For a deployment, set the same names through the platform's environment UI and
+do not ship `.env`.
 
 No model is hardcoded. If any setting is absent, or Gemini fails, `/api/ask`
 falls back to the bounded parser. `DEMO_MODE=cache` always bypasses the provider,

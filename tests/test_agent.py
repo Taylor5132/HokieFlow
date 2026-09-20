@@ -494,10 +494,39 @@ class LocalEnvTests(unittest.TestCase):
                 self.assertEqual(os.environ["GEMINI_MODEL"], "file-model")
                 os.environ.pop("GEMINI_MODEL", None)
 
-    def test_rejects_unknown_key(self):
+    def test_loads_keys_the_loader_does_not_know_about(self):
+        """A .env may carry settings for other integrations (e.g. Supabase).
+
+        Rejecting unknown keys made the server fail to import the moment the
+        accounts integration was merged, so unknown keys are loaded, not policed.
+        """
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / ".env"
-            path.write_text("EVIL_SETTING=yes\n")
+            path.write_text("SUPABASE_URL=https://example.supabase.co\n"
+                            "APP_ENV=production\n")
+            path.chmod(0o600)
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("SUPABASE_URL", None)
+                os.environ.pop("APP_ENV", None)
+                applied = load_local_env(path)
+                self.assertEqual(os.environ["SUPABASE_URL"],
+                                 "https://example.supabase.co")
+                self.assertIn("SUPABASE_URL", applied)
+                os.environ.pop("SUPABASE_URL", None)
+                os.environ.pop("APP_ENV", None)
+
+    def test_refuses_a_world_readable_secret_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / ".env"
+            path.write_text("GEMINI_API_KEY=secret\n")
+            path.chmod(0o644)
+            with self.assertRaises(RuntimeError):
+                load_local_env(path)
+
+    def test_rejects_malformed_lines(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / ".env"
+            path.write_text("this is not an assignment\n")
             path.chmod(0o600)
             with self.assertRaises(RuntimeError):
                 load_local_env(path)
