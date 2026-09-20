@@ -4,7 +4,7 @@ import {loadPreferences,savePreferences} from './preferences.js';
 import {trackBusLocation,locationError} from './bus-location.js';
 import {CAMPUS,campusNowMs,closestStops,departureRows,fetchWeather} from './home-live.js';
 import {dateKey,occurrences,upcoming,localInput} from './schedule.js';
-import {nearbyDining,distanceFeet} from './dining.js';
+import {nearbyDining,distanceFeet,mealTabs,nutritionRows,allergenLine} from './dining.js';
 import {mountDirections,placeDirectionsURL} from './directions.js';
 import { config } from './config.js';
 import { previewTime, previewStates, sampleVehicle } from './fixtures.js';
@@ -120,6 +120,10 @@ document.addEventListener('click',event=>{
  if(el.dataset.prompt){state.query=el.dataset.prompt;$('#request').value=state.query;$('#request').focus();return;}
  if(el.dataset.leg!==undefined){const leg=state.answer?.itinerary?.legs?.[Number(el.dataset.leg)];if(leg)openSheet(leg.type==='eat'?leg.item:leg.type==='bus'?'Scheduled bus leg':`Walk to ${leg.to}`,`<p>${escape((preview?'Illustrative · ':'')+sourceForLeg(leg))}</p><p>${numberOrDash(leg.minutes)} minutes · ${escape(leg.method||'Method unavailable')}</p>${leg.type==='eat'?`<div class="allergen unknown">${escape(allergenLabel(leg))}</div><p>${numberOrDash(leg.kcal)} kcal · ${numberOrDash(leg.protein_g)} g protein</p>`:'<p>Check the route details before setting off.</p>'}`);return;}
  if(el.dataset.campusEvent){void addCampusEvent(el.dataset.campusEvent);return;}
+ if(el.dataset.diningMenu){void openDiningMenu(el.dataset.diningMenu);return;}
+ if(el.dataset.diningMeal){diningMenu.meal=el.dataset.diningMeal;diningMenu.item=null;diningMenu.loading=true;redrawDiningMenu();void loadDiningMenu();return;}
+ if(el.dataset.diningItem){diningMenu.item=(diningMenu.data?.meals||[]).flatMap(m=>m.sections||[]).flatMap(s=>s.items||[]).find(i=>i.recipe_id===el.dataset.diningItem)||null;redrawDiningMenu();return;}
+ if(el.dataset.diningBack){diningMenu.item=null;redrawDiningMenu();return;}
  const action=el.dataset.action;
  if(el.dataset.addClass){void addClassFromSearch(el.dataset.addClass);return;}
  if(action==='refresh-events'){if(state.accountStorageError)void loadAccount();void loadCampusEvents();return;}
@@ -257,6 +261,21 @@ async function addClassFromSearch(crn){
   render();
  }catch(error){showAccountError(error);}
 }
+// ---- dining menus: a hall's foods, grouped by meal, with nutrition detail ----
+let diningMenu=null;
+function diningMenuHtml(){
+ const m=diningMenu;
+ if(!m)return '';
+ const stamp=m.data?.fetched_at?` · as of ${escape(new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}).format(new Date(m.data.fetched_at)))} ET`:"";
+ const tabs=mealTabs(m.data).map(t=>`<button class="text-button" data-dining-meal="${escape(t.meal)}" ${m.meal===t.meal?'aria-current="page"':''}>${escape(t.label)}</button>`).join('');
+ const items=(m.data?.meals||[]).flatMap(meal=>meal.sections||[]).flatMap(section=>section.items||[]);
+ if(m.item)return `<p class="eyebrow">HokieFlow · dining</p><h2 id="detail-title">${escape(m.item.name)}</h2><button class="text-button" data-dining-back="1">‹ Back to ${escape(m.data?.location?.name||m.name)}</button><p class="helper">${escape(m.item.section||'')}${m.item.meal?` · ${escape(m.item.meal)}`:''}${m.item.portion?` · ${escape(m.item.portion)}`:''}</p>${m.item.description?`<p>${escape(m.item.description)}</p>`:''}<dl class="nutrition-list">${nutritionRows(m.item).map(r=>`<div><dt>${escape(r.label)}</dt><dd>${escape(r.value)}</dd></div>`).join('')}</dl><p class="allergen ${m.item.allergens_known?'known':'unknown'}">${escape(allergenLine(m.item))}</p>${(m.item.diet_tags||[]).length?`<p class="helper">Diet tags: ${escape(m.item.diet_tags.join(', '))}</p>`:''}<p class="helper">VT published menu data${stamp}</p>`;
+ const note=m.data&&m.data.nutrition_state!=='ok'?'<p class="helper">Calories are not shown for this date: the published nutrition does not match the app\'s clock, so it is left unknown.</p>':'';
+ return `<p class="eyebrow">HokieFlow · dining</p><h2 id="detail-title">${escape(m.data?.location?.name||m.name)}</h2>${m.loading?'<p class="helper">Loading foods…</p>':''}${m.error?`<p class="notice" role="alert">${escape(m.error)}</p>`:''}${m.data?`<p class="helper">${m.data.state==='closed'?'Closed right now':m.data.open_now?'Open now':'Hours unknown'} · ${m.data.count} foods${stamp}${m.data.stale?' · older menu':''}</p>${tabs?`<div class="meal-tabs">${tabs}</div>`:''}${note}${items.length?items.map(item=>`<button class="class-search-result" data-dining-item="${escape(item.recipe_id)}"><strong>${escape(item.name)}</strong><small>${escape(item.section||'')}${item.portion?` · ${escape(item.portion)}`:''}</small><span class="departure-chips"><b class="distance-chip">${item.nutrition?`${Math.round(item.nutrition.kcal)} kcal`:'kcal unknown'}</b>${item.nutrition?`<b class="distance-chip">${Math.round(item.nutrition.protein_g)}g protein</b>`:''}</span></button>`).join(''):m.loading?'':'<p class="helper">No published foods for this meal. Try another meal or another dining hall.</p>'}`:""}`;
+}
+function redrawDiningMenu(){const el=$('#detail-content');if(el&&diningMenu)el.innerHTML=diningMenuHtml();}
+async function loadDiningMenu(){try{const params=new URLSearchParams({location:diningMenu.name});if(diningMenu.meal)params.set('meal',diningMenu.meal);diningMenu.data=await getJSON(`/api/dining/menu?${params}`);if(diningMenu.data?.state==='unknown_location'){diningMenu.error=diningMenu.data.reason||'That dining location is unknown.';diningMenu.data=null;}}catch(error){diningMenu.error=error.message;}finally{diningMenu.loading=false;redrawDiningMenu();}}
+async function openDiningMenu(name){diningMenu={name,meal:'',data:null,loading:true,error:'',item:null};openSheet(`${name} menu`,diningMenuHtml());await loadDiningMenu();}
 function schedulePage(){
  if(!state.user)return `${heading('','Schedule','')}${upcomingCard()}${classSearchCard()}`;
  const year=calendarMonth.getFullYear(),month=calendarMonth.getMonth(),days=new Date(year,month+1,0).getDate(),offset=new Date(year,month,1).getDay();
@@ -283,7 +302,7 @@ function locateDining(){
   navigator.geolocation.getCurrentPosition(success,failure,{timeout:20000,maximumAge:60000,enableHighAccuracy:false});
  },{timeout:15000,maximumAge:0,enableHighAccuracy:true});
 }
-function diningDirectory(){const places=nearbyDining(diningPlaces,diningLocation);return `<div class="dining-location"><button class="primary" data-action="nearby-dining" ${diningLoading?'disabled':''}>${diningLoading?'Finding your options…':diningLocation?'Refresh my location':'Find dining near me'} ${icon('pin')}</button>${diningLocation?`<button class="text-button" data-action="all-dining">Show all campus dining</button>`:''}</div>${diningError?`<p class="notice" role="alert">${escape(diningError)}</p><button class="text-button" data-action="retry-dining">Try again</button>`:''}${!places.length&&!diningLoading&&!diningError?'<div class="empty"><h2>Your next favorite spot.</h2><p>No dining locations to show right now. Check back soon.</p></div>':''}<div class="dining-list">${places.map(p=>`<article class="dining-place"><div class="section-title"><h2>${escape(p.name)}</h2>${p.distance!==null?badge(distanceFeet(p.distance)+' away'):''}</div><p>${escape(p.building||p.address||'Campus dining')}</p>${p.hours_text?`<p class="helper">${escape(p.hours_text)}</p>`:''}${p.description?`<p>${escape(p.description)}</p>`:''}${p.updated_at?`<p class="helper">Updated ${escape(p.updated_at)}</p>`:''}<button class="text-button" data-dining-place="${escape(p.building||p.name)}">Get directions ${icon('arrow')}</button></article>`).join('')}</div>`;}
+function diningDirectory(){const places=nearbyDining(diningPlaces,diningLocation);return `<div class="dining-location"><button class="primary" data-action="nearby-dining" ${diningLoading?'disabled':''}>${diningLoading?'Finding your options…':diningLocation?'Refresh my location':'Find dining near me'} ${icon('pin')}</button>${diningLocation?`<button class="text-button" data-action="all-dining">Show all campus dining</button>`:''}</div>${diningError?`<p class="notice" role="alert">${escape(diningError)}</p><button class="text-button" data-action="retry-dining">Try again</button>`:''}${!places.length&&!diningLoading&&!diningError?'<div class="empty"><h2>Your next favorite spot.</h2><p>No dining locations to show right now. Check back soon.</p></div>':''}<div class="dining-list">${places.map(p=>`<article class="dining-place"><div class="section-title"><h2>${escape(p.name)}</h2>${p.distance!==null?badge(distanceFeet(p.distance)+' away'):''}</div><p>${escape(p.building||p.address||'Campus dining')}</p>${p.hours_text?`<p class="helper">${escape(p.hours_text)}</p>`:''}${p.description?`<p>${escape(p.description)}</p>`:''}${p.updated_at?`<p class="helper">Updated ${escape(p.updated_at)}</p>`:''}<button class="text-button" data-dining-place="${escape(p.building||p.name)}">Get directions ${icon('arrow')}</button><button class="text-button" data-dining-menu="${escape(p.name)}">See foods &amp; nutrition ${icon('arrow')}</button></article>`).join('')}</div>`;}
 
 setInterval(()=>{const card=$("#upcoming");if(card&&state.tab==='home'&&!$('#detail').open&&!state.busy)card.outerHTML=upcomingCard();},60000);
 

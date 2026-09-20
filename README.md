@@ -68,13 +68,37 @@ mean **+0.96 min** — physically sensible. Override with `DEMO_NOW=<iso8601>`.
 
 ```bash
 export DEMO_MODE=cache
-python3 -m unittest discover -s tests -v     # 820 tests, no network
+python3 -m unittest discover -s tests -v     # 869 tests, no network
 ```
 
 With `DEMO_MODE=cache` nothing touches the network and the clock is pinned. If a
 demo-day idea needs a network call, it is wrong.
 
 > No pytest, no pandas on this machine (Python 3.14.7) — tests use stdlib `unittest`, and the core library is stdlib-only.
+
+## Dining menus (foods and nutrition per hall)
+
+The Dining tab lists halls; tapping **See foods & nutrition** opens one hall's
+published menu, grouped by meal (Breakfast / Lunch / Dinner from the data, never
+a fixed list), and tapping a food shows its nutrition detail.
+
+```bash
+# one hall's foods with nutrition (live); a hall with no capture says so offline
+curl -s 'http://127.0.0.1:8321/api/dining/menu?location=D2&meal=Lunch'
+```
+
+* `location` accepts what a student says ("D2", "Owens Food Court") or a FoodPro
+  number. An unknown or ambiguous name is a typed `unknown_location` with the
+  known names — it never falls back to a different hall.
+* Nutrition is fetched for that hall's WHOLE menu and joined by recipe id, using
+  the same chunk keys the seed used (`dining.nutrition_for_location`), so the
+  numbers are real: D2 lunch reports e.g. Blueberry Bagel 300 kcal / 10 g protein
+  / 620 mg sodium.
+* Two honesty rules the UI repeats verbatim: replay nutrition that does not match
+  the app's clock is refused, so calories read **unknown** rather than a stale
+  figure, and a blank allergen field means **UNKNOWN**, not allergen-free. The
+  payload states both rules in `assumptions`, and a nutrition outage still
+  returns the menu (`nutrition_state="unavailable"`).
 
 ## Course search (live catalog, offline fallback)
 

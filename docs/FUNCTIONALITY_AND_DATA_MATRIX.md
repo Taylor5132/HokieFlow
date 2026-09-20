@@ -9,7 +9,7 @@ as such.
 (package `hokieday/`, imports, file names, config keys).
 
 **As verified:** 2026-09-20 after VT GIS, reviewed NWS weather, public class/ICS,
-FoodPro basic-directory, September 2026 events integration, and the provider-neutral grounded agent layer (live Gemini path exercised end-to-end; all 9 tools, including course-catalog search, verified with `gemini-3.1-flash-lite`). Offline suite: **820 tests, 0 failures** under `DEMO_MODE=cache`. Live bus
+FoodPro basic-directory, September 2026 events integration, and the provider-neutral grounded agent layer (live Gemini path exercised end-to-end; all 9 tools, including course-catalog search, verified with `gemini-3.1-flash-lite`). Offline suite: **869 tests, 0 failures** under `DEMO_MODE=cache`. Live bus
 fixture captured **2026-09-19T15:22:29Z**. See §12 for the exact verification commands.
 
 ---
@@ -433,7 +433,7 @@ clock; replay is pinned; and the heavier `/api/status` is fetched once at boot.
 |---|---|---|---|---|---|---|
 | **Transit (static)** | GTFS ingested, 297 stops / 24 routes / 3,658 trips / 74,301 stop_times / 181 calendar_dates / 67 shapes | ✅ | `http://www.bt4uclassic.org/gtfs/google_transit.zip` | Daily | Documented, stable; no SLA | Schedule, stops, route geometry |
 | **Transit (live)** | 13 vehicles, load %, schedule delta, 13/13 join | ✅ | BT internal Joomla AJAX `ridebt.org/...method=getBuses` | 60 s | **Undocumented, no SLA, may change**; no public GTFS-RT ETA | Static dots, crowding, early/late, replay label |
-| **Dining** | D2 only: 470 recipes, allergens, hours, whole-menu nutrition | 🟡 | `foodpro.students.vt.edu/menus/API/*`, `apps.students.vt.edu/hours/...` | Daily / weekly | No SLA; menu fails silently on wrong date format | D2 dish, macros, hours, allergen status |
+| **Dining** | D2 only offline: 470 recipes, allergens, hours, whole-menu nutrition. Live: every published hall, with `GET /api/dining/menu?location=<name>&meal=` serving the food listing (grouped by meal/section) and each item's kcal/protein/fat/carb/sodium | 🟢 | `foodpro.students.vt.edu/menus/API/*`, `apps.students.vt.edu/hours/...` | Daily / weekly | No SLA; menu fails silently on wrong date format. Replay nutrition captured after the pinned clock is refused, so kcal reads `unknown` rather than a stale number; a blank allergen field is UNKNOWN | D2 dish, macros, hours, allergen status; the Dining tab shows each hall's foods and a nutrition detail per food |
 | **Location / walking** | 8 named places (1 verified) + device origin | 🟡 | Hard-coded registry + browser geolocation | Per request / static | Building coordinates await VT GIS calibration; geolocation needs HTTPS | Origin label ± accuracy; walk estimate |
 | **Weather** | `hokieday.weather` normalizes NWS point/hourly/alerts/observation and scores outdoor legs | 🟡 | NWS `https://api.weather.gov/points/{lat},{lon}` | 3 min–24 h by resource | Keyless, official, cached; backend only; replay unavailable until coherent capture; KBCB is airport observation | Live forecast evidence may be shown after API wiring; never imply certainty or show weather in current replay |
 | **Events** | 27 Blacksburg September 2026 events (from a 67-candidate crawl) | 🟡 | `https://events.vt.edu/sitemap.xml` + public detail HTML (AEM; no API) | On crawl (snapshot `fetched_at`) | No API; 33 of 67 detail fetches failed; snapshot is partial, PII-scrubbed and does not claim complete coverage | Browse/search/filter/gap-fit; add-to-schedule export; typed partial/empty/no-match/out-of-scope states |

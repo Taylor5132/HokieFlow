@@ -122,6 +122,7 @@ from hokieday.agent_tools import AgentContext  # noqa: E402
 # package". REPO is on sys.path just above, so `app` resolves either way -- as a
 # namespace package when run as a script, and as app.server when tests import it.
 from app import class_search  # noqa: E402
+from app import dining_menu  # noqa: E402
 from app import mapview  # noqa: E402
 from app import ui_files  # noqa: E402
 from app.gemini_provider import GeminiProvider  # noqa: E402
@@ -1573,6 +1574,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/dining/places":
             self._json(ui_files.dining_places_endpoint())
+            return
+        if path == "/api/dining/menu":
+            # One hall's foods, grouped by meal, with nutrition for that hall's
+            # whole menu (the join dining.list_foods deliberately omits).
+            params = {key: values[0] for key, values in query.items()}
+            self._json(dining_menu.menu_payload(
+                params.get("location") or params.get("location_num") or "",
+                date=(params.get("date") or "").strip() or None,
+                meal=(params.get("meal") or "").strip() or None))
             return
         if path == "/api/classes":
             from app.class_import import search_endpoint
