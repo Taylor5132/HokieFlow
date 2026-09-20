@@ -492,35 +492,42 @@ class OAuthHostContract(unittest.TestCase):
             self.assertIsNone(canonical_origin(),
                               "an unset APP_URL leaves local dev alone")
 
-    def test_alias_host_is_handed_to_the_canonical_origin(self):
-        from unittest import mock
-        with mock.patch.object(server, "AUTH_AVAILABLE", True), \
-                mock.patch.object(server, "canonical_origin",
-                                  lambda: "https://hokieflow.tech"):
-            status, headers = self._google_start("hokie-5132.azurewebsites.net")
-        self.assertEqual(status, 302)
-        self.assertEqual(headers["Location"], "https://hokieflow.tech/api/auth/google")
-        self.assertNotIn("Set-Cookie", headers,
-                         "a state cookie outside the callback host is useless")
+    @unittest.skipIf(not server.AUTH_AVAILABLE,
+                     "auth needs supabase + python-dotenv (pip install -r requirements.txt)")
+    def test_the_callback_follows_the_host_the_browser_uses(self):
+        """started on www -> comes back to www; unknown hosts fall back to APP_URL."""
+        from auth import redirect_uri_for
+        with mock.patch.dict(os.environ, {"APP_URL": "https://hokieflow.tech"}):
+            self.assertEqual(redirect_uri_for("hokieflow.tech"),
+                             "https://hokieflow.tech/api/auth/google/callback")
+            self.assertEqual(redirect_uri_for("www.hokieflow.tech"),
+                             "https://www.hokieflow.tech/api/auth/google/callback",
+                             "the Site URL is www: forcing apex moves the state cookie")
+            self.assertEqual(redirect_uri_for("WWW.HokieFlow.tech"),
+                             "https://www.hokieflow.tech/api/auth/google/callback")
+            for hostile in ("evil.example", "hokieflow.tech.evil.example", "", None):
+                self.assertEqual(redirect_uri_for(hostile),
+                                 "https://hokieflow.tech/api/auth/google/callback",
+                                 "only hosts derived from APP_URL may be used")
 
-    def test_canonical_host_runs_the_normal_flow(self):
-        from unittest import mock
-        seen = []
+    def test_the_request_host_reaches_the_sign_in_flow(self):
+        """The handler must pass the browser's Host through, not assume one."""
+        seen = {}
 
-        def fake_start(request_state=None):
-            seen.append(request_state)
+        def fake_start(request_state=None, request_host=None):
+            seen["host"] = request_host
+            seen["state"] = (request_state or {}).get("state")
             return "https://project.supabase.co/auth/v1/authorize?provider=google"
 
         with mock.patch.object(server, "AUTH_AVAILABLE", True), \
-                mock.patch.object(server, "canonical_origin",
-                                  lambda: "https://hokieflow.tech"), \
                 mock.patch.object(server, "start_google_oauth", fake_start), \
                 mock.patch.object(server, "set_oauth_state_cookie",
                                   lambda state: f"hokieflow_oauth_state={state}; Path=/"):
-            status, headers = self._google_start("HOKIEFLOW.TECH")
-        self.assertEqual(status, 302, "case differences are not another host")
+            status, headers = self._google_start("www.hokieflow.tech")
+        self.assertEqual(status, 302)
         self.assertIn("supabase", headers["Location"])
-        self.assertTrue(seen and seen[0].get("state"), "state is generated per browser")
+        self.assertEqual(seen["host"], "www.hokieflow.tech")
+        self.assertTrue(seen["state"], "state is still generated per browser")
         self.assertIn("hokieflow_oauth_state", headers.get("Set-Cookie", ""))
 
     def test_the_browser_says_why_sign_in_failed(self):
