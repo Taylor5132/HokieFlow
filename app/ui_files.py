@@ -28,6 +28,9 @@ UI_DIR = Path(__file__).resolve().parent.parent / "ui"
 # every other asset by its fixed name. A mapping (instead of Path.joinpath on
 # user input) makes path traversal structurally impossible.
 _ASSET_TYPES = {
+    "motion.js": "text/javascript; charset=utf-8",
+    "gsap.min.js": "text/javascript; charset=utf-8",
+    "ScrollTrigger.min.js": "text/javascript; charset=utf-8",
     "index.html": "text/html; charset=utf-8",
     "styles.css": "text/css; charset=utf-8",
     "app.js": "text/javascript; charset=utf-8",

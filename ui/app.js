@@ -1,3 +1,4 @@
+import {mountScrollMotion} from './motion.js';
 import {loadPreferences,savePreferences} from './preferences.js';
 import {trackBusLocation,locationError} from './bus-location.js';
 import {CAMPUS,closestStops,departureRows,fetchWeather} from './home-live.js';
@@ -24,7 +25,7 @@ let diningPlaces=[],diningLocation=null,diningLoading=false,diningError='',dinin
 let homeWeather=null,weatherError=false,transitStops=[],transitDepartures=[],transitLocation=null,transitBusy=false,transitError='',transitUpdated=0;
 let stopBusLocation=null,busLocating=false,busLocationError='',busRefreshQueued=false,busLocationVersion=0;
 let directionsPanel=null;let destinationHint='';const routeSelection={origin:'current',destination:'',mode:'walk'};
-let lastFocus, observer, syncMoment=performance.now();
+let lastFocus, syncMoment=performance.now();
 const preview = config.mode === 'preview';
 const time = value => { if (!value || !Number.isFinite(Date.parse(value))) return '—'; return new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',hour:'numeric',minute:'2-digit'}).format(new Date(value)); };
 const badge = (text, kind='') => `<span class="badge ${kind}">${escape(text)}</span>`;
@@ -73,7 +74,6 @@ function render(){
  const routeElement=$('#campus-directions');
  if(routeElement)directionsPanel=mountDirections(routeElement,{selection:routeSelection,destinationHint:destinationHint||classInfo()?.building||''});
  $('#navigation').innerHTML=[['home','Home'],['plan','Schedule'],['dining','Dining'],['bus','Bus'],['more','More']].map(([id,label])=>`<button data-tab="${id}" ${state.tab===id?'aria-current="page"':''}>${icon(id)}<span>${label}</span></button>`).join('');
- observer?.disconnect();observer=new IntersectionObserver(entries=>entries.forEach(entry=>{if(entry.isIntersecting){entry.target.classList.add('revealed');observer.unobserve(entry.target);}}),{threshold:.06});document.querySelectorAll('.reveal').forEach(el=>{el.classList.add('will-reveal');observer.observe(el);});
 }
 function announce(text){$('#announcer').textContent=text;}
 function navigate(tab){state.tab=tab;render();if(tab==='dining'&&!diningLoaded&&!diningLoading)void loadDining();window.scrollTo({top:0,behavior:'instant'});$('#main').focus({preventScroll:true});}
@@ -234,3 +234,6 @@ window.addEventListener('pagehide',()=>{stopBusLocation?.();stopBusLocation=null
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)void loadBuses();});
 window.addEventListener('online',()=>void loadBuses());
 void loadDining();void loadWeather();void loadBuses();setInterval(()=>{if(!document.hidden){void loadBuses();}},30000);setInterval(()=>{if(!document.hidden)void loadWeather();},600000);setInterval(()=>{updateHomeData();const h=$('.home-header h1');if(h)h.innerHTML=greeting()+'<br><span>Hokie<b>.</b></span>';},10000);
+
+// Wait for deferred vendor scripts before mounting animation enhancements.
+window.addEventListener("load",()=>mountScrollMotion($("#main")),{once:true});
