@@ -300,3 +300,137 @@ class HttpEdgeContractTests(unittest.TestCase):
                      headers={"Content-Type": "application/json"})
         self.assertEqual(conn.getresponse().status, 200)
         conn.close()
+
+
+class DeploymentDiagnosticsContract(unittest.TestCase):
+    """An operator must be able to tell WHY the agent is off, remotely.
+
+    'credentials missing' and 'the app is in replay mode' need completely
+    different fixes, and both looked identical from outside: enabled=false with
+    no explanation. No secret value is exposed -- only presence and the model id.
+    """
+
+    @staticmethod
+    def _status_offline():
+        """status() with the live-bus read stubbed: no network, no cache write."""
+        from unittest import mock
+        return mock.patch.object(server.tools, "get_live_bus",
+                                 return_value={"count": 0, "buses": [],
+                                               "stale": False})
+
+    def test_replay_mode_reports_that_as_the_reason(self):
+        import os
+        from unittest import mock
+        with self._status_offline(), \
+                mock.patch.object(server.config, "CACHE_ONLY", True), \
+                mock.patch.dict(os.environ, {"GEMINI_API_KEY": "k",
+                                             "GEMINI_MODEL": "gemini-x"},
+                                clear=False):
+            block = server.status()["agent"]
+        self.assertFalse(block["enabled"])
+        self.assertTrue(block["configured"])
+        self.assertEqual(block["model"], "gemini-x")
+        self.assertIn("replay mode", block["reason"])
+
+    def test_missing_credentials_are_named_as_the_reason(self):
+        import os
+        from unittest import mock
+        with self._status_offline(), \
+                mock.patch.object(server.config, "CACHE_ONLY", False), \
+                mock.patch.dict(os.environ, {"GEMINI_API_KEY": "",
+                                             "GEMINI_MODEL": "",
+                                             "HOKIEFLOW_AI_PROVIDER": ""},
+                                clear=False):
+            block = server.status()["agent"]
+        self.assertFalse(block["enabled"])
+        self.assertFalse(block["configured"])
+        self.assertIn("GEMINI_API_KEY", block["reason"])
+
+    def test_enabled_live_mode_has_no_reason_to_report(self):
+        import os
+        from unittest import mock
+        with self._status_offline(), \
+                mock.patch.object(server.config, "CACHE_ONLY", False), \
+                mock.patch.dict(os.environ, {"GEMINI_API_KEY": "k",
+                                             "GEMINI_MODEL": "gemini-x"},
+                                clear=False):
+            block = server.status()["agent"]
+        self.assertTrue(block["enabled"])
+        self.assertTrue(block["configured"])
+        self.assertIsNone(block["reason"])
+
+    def test_the_status_block_never_contains_a_secret(self):
+        import os
+        from unittest import mock
+        with self._status_offline(), \
+                mock.patch.dict(os.environ, {"GEMINI_API_KEY": "super-secret-key",
+                                             "GEMINI_MODEL": "gemini-x"},
+                                clear=False):
+            rendered = json.dumps(server.status())
+        self.assertNotIn("super-secret-key", rendered)
+
+
+class ReplayStoreIsReadOnlyContract(unittest.TestCase):
+    """fixtures/ must never be overwritten by an ordinary run.
+
+    CACHE_DIR is resolved at import while CACHE_ONLY is read per call, so a
+    process that started in replay mode and later treated itself as live wrote a
+    fresh bus snapshot straight over the fixture -- moving the replay clock and
+    emptying every replayed departure. The guard belongs at the write boundary.
+    """
+
+    def _envelope(self):
+        return json.dumps({"key": "bt_buses",
+                           "fetched_at": "2026-09-19T15:22:29+00:00",
+                           "payload": {"data": []}})
+
+    def test_an_accidental_write_is_refused(self):
+        import tempfile
+        from pathlib import Path as _Path
+        from unittest import mock
+        from hokieday import cache
+        with tempfile.TemporaryDirectory() as td:
+            store = _Path(td)
+            target = store / "bt_buses.json"
+            target.write_text(self._envelope())
+            with mock.patch.object(cache.config, "FIXTURES_DIR", store), \
+                    mock.patch.object(cache, "_FIXTURE_WRITES_ALLOWED", False):
+                cache._write_envelope(target, "https://example.test/buses",
+                                      {"data": [{"bus_id": "live"}]})
+            self.assertEqual(json.loads(target.read_text())["fetched_at"],
+                             "2026-09-19T15:22:29+00:00",
+                             "the frozen snapshot must be byte-identical")
+
+    def test_a_deliberate_seeding_run_may_write(self):
+        import tempfile
+        from pathlib import Path as _Path
+        from unittest import mock
+        from hokieday import cache
+        with tempfile.TemporaryDirectory() as td:
+            store = _Path(td)
+            target = store / "bt_buses.json"
+            target.write_text(self._envelope())
+            with mock.patch.object(cache.config, "FIXTURES_DIR", store), \
+                    mock.patch.object(cache, "_FIXTURE_WRITES_ALLOWED", True):
+                cache._write_envelope(target, "https://example.test/buses",
+                                      {"data": [{"bus_id": "seeded"}]},
+                                      fetched_at="2026-09-20T06:56:12+00:00")
+            written = json.loads(target.read_text())
+            self.assertEqual(written["fetched_at"], "2026-09-20T06:56:12+00:00")
+            self.assertEqual(written["payload"]["data"][0]["bus_id"], "seeded")
+
+    def test_the_live_cache_directory_is_unaffected(self):
+        import tempfile
+        from pathlib import Path as _Path
+        from unittest import mock
+        from hokieday import cache
+        with tempfile.TemporaryDirectory() as td:
+            live = _Path(td) / "cache"
+            live.mkdir()
+            target = live / "bt_buses.json"
+            with mock.patch.object(cache.config, "FIXTURES_DIR",
+                                   _Path(td) / "fixtures"), \
+                    mock.patch.object(cache, "_FIXTURE_WRITES_ALLOWED", False):
+                cache._write_envelope(target, "https://example.test/buses",
+                                      {"data": [{"bus_id": "live"}]})
+            self.assertTrue(target.exists(), "live caching still works")

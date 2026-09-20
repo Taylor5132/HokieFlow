@@ -213,10 +213,37 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# The frozen replay store is written ONLY by a deliberate seeding process, which
+# says so by pointing HOKIEDAY_CACHE at it. Everything else must treat
+# `fixtures/` as read-only.
+#
+# Why this exists: CACHE_DIR is resolved once at import, but CACHE_ONLY is read
+# at call time. A process that imported in cache mode (CACHE_DIR == fixtures/)
+# and later flipped CACHE_ONLY to False -- which a test did -- fetched live buses
+# and wrote them straight over `fixtures/bt_buses.json`. That silently moved the
+# replay clock to the live capture time, so every replayed departure vanished and
+# the offline demo quietly changed. One flag later and the same write is
+# harmless, so the guard belongs at the filesystem boundary, not at the callers.
+_FIXTURE_WRITES_ALLOWED = bool(os.environ.get("HOKIEDAY_CACHE"))
+
+
+def _is_inside_fixtures(path: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(Path(config.FIXTURES_DIR).resolve())
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
 def _write_envelope(path: Path, url: str, payload: Any,
                     *, fetched_at: str | None = None,
                     mode: str | None = None) -> str:
     actual_fetched_at = fetched_at or _now_iso()
+    if _is_inside_fixtures(path) and not _FIXTURE_WRITES_ALLOWED:
+        # Report the fetch normally but persist nothing: the caller still gets
+        # fresh data, while the reproducible snapshot stays byte-identical.
+        print(f"[cache] refusing to overwrite the replay store: {path.name} "
+              f"(fixtures/ is written only by an explicit seeding run)")
+        return actual_fetched_at
     envelope = {
         "key": path.stem,
         "url": url,

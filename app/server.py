@@ -1182,11 +1182,21 @@ def status() -> dict:
         a = cache.age_seconds(name, params)
         ages[name] = None if a is None else round(a / 3600.0, 1)
     live = tools.get_live_bus(source=None)
-    ai_provider = os.environ.get("HOKIEFLOW_AI_PROVIDER", "").strip().lower()
-    ai_model = os.environ.get("GEMINI_MODEL", "").strip()
-    ai_enabled = bool(ai_provider == "gemini"
-                      and os.environ.get("GEMINI_API_KEY", "").strip()
-                      and ai_model and not config.CACHE_ONLY)
+    # Report WHY the agent is on or off without leaking any secret value: an
+    # operator on a deployed instance could otherwise not tell "credentials are
+    # missing" from "the app is in replay mode", which are very different fixes.
+    provider_configured = configured_agent_provider() is not None
+    configured_model = os.environ.get("GEMINI_MODEL", "").strip() or None
+    agent_enabled = provider_configured and not config.CACHE_ONLY
+    if agent_enabled:
+        agent_reason = None
+    elif config.CACHE_ONLY:
+        agent_reason = ("replay mode (DEMO_MODE=cache): the agent is disabled so "
+                        "no request can spend provider quota or touch the network")
+    else:
+        agent_reason = ("no provider credentials configured (needs "
+                        "GEMINI_API_KEY and GEMINI_MODEL); free text uses the "
+                        "bounded parser")
     return {
         "mode": config.DEMO_MODE,
         "offline": config.CACHE_ONLY,
@@ -1199,10 +1209,12 @@ def status() -> dict:
         "live_vehicles": len(live.get("buses", live) or []),
         "live_stale": live.get("stale"),
         "agent": {
-            "name": "HokieFlow AI", "enabled": ai_enabled,
-            "provider": "gemini" if ai_enabled else None,
-            "model": ai_model if ai_enabled else None,
+            "name": "HokieFlow AI", "enabled": agent_enabled,
+            "configured": provider_configured,
+            "provider": "gemini" if provider_configured else None,
+            "model": configured_model,
             "fallback": "bounded_parser",
+            "reason": agent_reason,
         },
         "assumptions": {
             "eat_minutes": tools.EAT_MINUTES,
