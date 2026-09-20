@@ -148,3 +148,24 @@ h1,h2,h3{text-wrap:balance}p{text-wrap:pretty}
 
 .class-import select{padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--paper);color:inherit}.class-import input:focus-visible{outline:2px solid var(--orange);outline-offset:2px}
 .events-toolbar{justify-content:flex-end}
+
+/* Dining menu sheet: meal switcher, one food per line, nutrition detail.
+   These elements had no rules, so the meal tabs fell back to the 44px-tall
+   .text-button and the food rows pushed two chips into .departure-chips'
+   repeat(3,42px) grid, which is what made the sheet look oversized and gappy. */
+.dining-menu-sheet .class-search-result{display:flex;flex-direction:column;gap:2px;width:100%;text-align:left;padding:12px 0}
+.dining-menu-sheet .class-search-result strong{font-size:14px;line-height:1.35}
+.dining-menu-sheet .class-search-result small{font-size:11px;color:var(--muted);margin-top:2px}
+.dining-menu-sheet .departure-chips{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-start;margin-top:8px;font-variant-numeric:tabular-nums}
+.dining-menu-sheet .departure-chips .distance-chip{font-size:12px;font-weight:650;min-width:0;padding:4px 9px;border:0;border-radius:6px;background:#eae5db;color:var(--maroon)}
+.meal-tabs{display:flex;flex-wrap:wrap;gap:7px;margin:15px 0 2px}
+.meal-tabs .text-button{min-height:32px;padding:5px 12px;border:1px solid var(--line);border-radius:999px;font-size:12px;font-weight:600;gap:0}
+.meal-tabs .text-button[aria-current=page]{background:var(--maroon);border-color:var(--maroon);color:#fff}
+.nutrition-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 16px;margin:16px 0 2px}
+.nutrition-list div{border-bottom:1px solid var(--line);padding-bottom:7px}
+.nutrition-list dt{font-size:10px;font-weight:700;letter-spacing:1.1px;text-transform:uppercase;color:var(--muted)}
+.nutrition-list dd{margin:3px 0 0;font-size:15px;font-weight:650;color:var(--maroon)}
+[data-theme=dark] .dining-menu-sheet .departure-chips .distance-chip{background:#363039;color:var(--ink)}
+[data-theme=dark] .meal-tabs .text-button[aria-current=page]{background:#8d2856}
+/* A little less weight on sheet titles, which the dining sheet made obvious. */
+.sheet h2{font-size:26px}
