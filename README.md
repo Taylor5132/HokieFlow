@@ -16,7 +16,9 @@ hokieday/
     dining.py          # menu, nutrition, allergens, hours   [worker: dining]
     weather.py         # NWS forecast/alerts/observation + leg risk badges
     tools.py           # deterministic tools + plan_day/re-planning loop
-    # agent.py         # NOT BUILT YET: future LLM tool-selection layer
+    agent_tools.py     # strict allowlist, schemas, request-scoped schedule tool
+    agent.py           # provider-neutral bounded HokieFlow AI tool loop
+    providers/base.py  # provider protocol; no network dependency
   scripts/
     seed_cache.py      # build fixtures/ from known-good captured payloads
     fetch_weather.py   # edge fetch NWS -> frozen weather fixtures
@@ -63,7 +65,7 @@ mean **+0.96 min** — physically sensible. Override with `DEMO_NOW=<iso8601>`.
 
 ```bash
 export DEMO_MODE=cache
-python3 -m unittest discover -s tests -v     # 694 tests, no network
+python3 -m unittest discover -s tests -v     # 719 tests, no network
 ```
 
 With `DEMO_MODE=cache` nothing touches the network and the clock is pinned. If a
@@ -83,14 +85,67 @@ The tap writes to `cache/` (live) and appends one JSON line **per vehicle per
 poll** to `data/bus_bronze.jsonl` — the ML training set. It never touches
 `fixtures/`.
 
+### HokieFlow AI with Gemini (opt-in live mode)
+
+HokieFlow AI is a provider-neutral agent loop: Gemini interprets the question and
+selects strict allowlisted tools; deterministic Python obtains campus facts,
+computes schedule gaps and feasibility, and enforces safety constraints; Gemini
+then narrates only the returned evidence. The API key stays server-side.
+
+```bash
+cp .env.example .env
+chmod 600 .env
+# Edit .env locally and fill GEMINI_API_KEY + GEMINI_MODEL.
+python3 app/server.py
+```
+
+`app/server.py` loads only an allowlisted set of keys from `.env`, never prints
+values, and refuses a file readable by group/other users. Real process
+environment variables override `.env`. The file is ignored by Git.
+
+No model is hardcoded. If any setting is absent, or Gemini fails, `/api/ask`
+falls back to the bounded parser. `DEMO_MODE=cache` always bypasses the provider,
+even if credentials are present. The `ui/` client may attach only its
+request-scoped schedule entries; no PID, grades, roster, token, or raw account
+record is sent.
+
+To protect free-tier quota, one question normally uses two Gemini calls (tool
+selection and grounded narration), with a hard maximum of three turns and four
+tool calls. Responses are capped at 512 tokens. The server also defaults to 30
+Gemini calls/hour and 200/day per process, with no automatic retry. Override only
+when intentional with `HOKIEFLOW_GEMINI_CALLS_PER_HOUR` and
+`HOKIEFLOW_GEMINI_CALLS_PER_DAY` (default 120/day). Live HTTP requests also
+default to 10 AI questions/hour per client IP
+(`HOKIEFLOW_AI_QUESTIONS_PER_IP_HOUR`). The guard is stored in
+`cache/ai_provider_calls.json`, so restarting the server cannot silently reset
+the allowance. Google AI Studio quota controls remain the stronger
+account-level guard: a real `429` is reported as a typed provider failure and
+`/api/ask` falls back to the bounded parser.
+
+This is separate from Virginia Tech's **HokieAI** platform. HokieAI is a
+university-supported interface to vetted commercial models; it is not the name
+of this application's agent and is not automatically grounded in HokieFlow's
+campus data.
+
+A real-API smoke test is deliberately opt-in:
+
+```bash
+DEMO_MODE=live HOKIEFLOW_LIVE_SMOKE=1 python3 scripts/gemini_agent_smoke.py
+
+# One question per tool family (weather, food, hours, events, bus, departures,
+# planning) through the same pre-pass a real request uses:
+DEMO_MODE=live HOKIEFLOW_LIVE_SMOKE=1 python3 scripts/gemini_live_battery.py
+```
+
 **Before any demo, re-run `DEMO_MODE=cache python3 scripts/seed_cache.py`** to
 restore a known-good frozen snapshot.
 
 ## Rules for contributors / subagents
 
 1. `config.py` and `cache.py` are owned by the integrator. Do not edit them.
-2. All HTTP goes through `cache.get_json` / `cache.get_bytes`. Never call
-   `urllib`/`requests` directly — you would bypass the offline demo path.
+2. Campus-data HTTP goes through `cache.get_json` / `cache.get_bytes`. The sole
+   direct HTTP boundary is `app/gemini_provider.py`, and the server can invoke
+   it only outside replay mode. Never add provider networking to `hokieday/`.
 3. Tests MUST pass with `DEMO_MODE=cache` and MUST NOT touch the network.
    Use stdlib `unittest`, not pytest.
 4. Poll the live bus endpoint no faster than `config.LIVE_BUS_POLL_SECONDS`.

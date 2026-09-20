@@ -9,7 +9,7 @@ as such.
 (package `hokieday/`, imports, file names, config keys).
 
 **As verified:** 2026-09-20 after VT GIS, reviewed NWS weather, public class/ICS,
-FoodPro basic-directory, and September 2026 events integration. Offline suite: **694 tests, 0 failures** under `DEMO_MODE=cache`. Live bus
+FoodPro basic-directory, September 2026 events integration, and the provider-neutral grounded agent layer (live Gemini path exercised end-to-end; all 8 tools verified with `gemini-3.1-flash-lite`). Offline suite: **732 tests, 0 failures** under `DEMO_MODE=cache`. Live bus
 fixture captured **2026-09-19T15:22:29Z**. See §12 for the exact verification commands.
 
 ---
@@ -51,7 +51,7 @@ when reality contradicts Plan A, a **re-plan that states exactly what changed**.
 | **Continuous / smooth bus tracking** | We hold **one frozen snapshot** of 13 vehicles (plus 2 bronze polls). No interpolation, no trajectory. |
 | **Broad dining coverage** | Menu/nutrition/hours fixtures exist for **D2 at Dietrick Hall (location 15) only**. |
 | **A trained delay model** | No model is trained. `predict_bus_delay` returns `basis: "no_model"`. |
-| **A real LLM agent** | The offline text box is a **bounded rule parser**, not a language model. |
+| An LLM in offline replay | `DEMO_MODE=cache` deliberately uses the bounded parser and makes zero provider calls. The live agent requires runtime Gemini credentials. |
 | That a plan "fits" when it does not | Now enforced: `feasible: false` + `infeasible_reason` drive a "No plan fits" card, and the rationale never says "fits" or "to spare" when the deadline is missed (§5.9). |
 | That a deadline the student gave was silently moved to tomorrow | Live mode returns a `deadline_passed` clarification instead of rolling the time forward (§5.19). |
 | That the browser clock is authoritative | Every answer carries a server-captured `_time.evaluated_at`; the client only ticks locally in live mode and stays pinned in replay (§4.8, §6.1). |
@@ -140,7 +140,7 @@ when reality contradicts Plan A, a **re-plan that states exactly what changed**.
 | "Give me one plan" | `plan_day` | ✅ | `itinerary{legs, leave_time, arrive_time, window_end, total_min, slack_min, arrives_in_window, used_bus, eat_start, eat_end, eat_close_in_min, notes}, rationale, feasible, infeasible_reason, constraints, alternatives, replan_trigger` | Only D2 food; walking estimate; bus chosen only if it beats walking unless `prefer=bus`, but **feasibility beats preference** — a bus that misses the deadline falls back to a walk that fits | The full plan card |
 | "Is this plan possible?" | `feasible` + `infeasible_reason` | ✅ | `feasible: bool`; `infeasible_reason.code ∈ {invalid_window, unknown_place, no_legs, deadline_missed, clarification_needed}` plus code-specific fields (`late_by_min`, `field`, `value`, `known_places`, `detail`, `kind`) | Top-level feasibility describes the **chosen** plan (a re-planned Plan B can itself miss); the least-late useful itinerary is still returned for inspection | A "No plan fits" card with the corrective action; never an empty 0-minute itinerary |
 | "What changed?" | `_replan_trigger` + Plan A retention | ✅ | `cause (bus_early/bus_late/bus_full/dining_closing), detail`; `alternatives[previous_itinerary_a]` | Weather trigger still absent | Re-plan banner + Plan A/B diff |
-| "Ask in free text" | `server.parse_free_text(text, now, live)` | 🟡 | `start, end, prefs{diet, avoid, from_place, to_place, prefer}, _interpretation_notes, _clarification` | **Bounded rule parser, not an LLM**; recognises configured places and a small allergen/negation vocabulary. In live mode it anchors to the captured request `now`, plans from now for a single deadline, and returns `need_deadline` / `deadline_passed` clarifications. In cache mode the frozen demo window is kept byte-for-byte | The text box + "↳ interpreted …" notes; an "I need one detail" card for clarifications |
+| "Ask in free text" | `agent.run_agent(...)` live; `server.parse_free_text(...)` fallback | ✅ live when configured / 🟡 replay fallback | Grounded `answer`, structured `result`, `sources`, provider/tool provenance; fallback retains `start, end, prefs, clarification` | Gemini may interpret and select only registered tools; deterministic code owns facts and arithmetic. Live requires `GEMINI_API_KEY` + `GEMINI_MODEL`. Replay and provider failure use the bounded parser with zero provider calls. | Conversational answer with source list; legacy structured planner fields remain compatible |
 
 ### 3.7 Request time & clock
 
@@ -501,7 +501,7 @@ forcing GTFS. B1 and P1 are therefore closed below.
 | Dining | "D2 at Dietrick Hall", "470 items on 2026-09-19", "hard filter excludes Peanuts" | "All VT dining", "allergen-free" for unknown items, menu coverage beyond D2 |
 | Allergens | "Declared allergens", "UNKNOWN", "documented allergen-free kitchen (Viridian)" | Blank = safe; "certified allergen-free" outside Viridian |
 | ML | "No model yet; acting on observed deviation" | "Our model predicts lateness/wait" |
-| Agent | "Bounded offline parser today; agent layer maps language to governed tools" | "A real LLM agent answers this" in the offline demo |
+| Agent | "Gemini-backed grounded agent, live-verified with `gemini-3.6-flash`; bounded parser in replay/failure" | "HokieAI is the model"; "an LLM answers this" in offline replay; any live claim without a real smoke test |
 | Navigation | "We plan the trip; your maps app navigates it" | "Built-in turn-by-turn" |
 | Weather | "NWS forecast evidence, updated at …" in live mode after wiring; replay unavailable today | "It will rain"; presenting KBCB as on-campus; showing weather in replay without a coherent fixture |
 | Classes | "Public timetable snapshot" or "user-imported ICS", with stale/incomplete/assumed labels | "Automatic HokieSPA sync"; grades/rosters; authoritative next class when Banner recurrence was excluded |
@@ -539,7 +539,7 @@ Every component must name all five before it is marked ready.
 
 | Claim | Where it lives |
 |---|---|
-| 694 offline tests pass after VT GIS + weather + class/ICS + FoodPro + events backend integration | `python3 -m unittest discover -s tests` |
+| 732 offline tests pass after grounded-agent integration | `python3 -m unittest discover -s tests` |
 | 13 vehicles, one snapshot | `fixtures/bt_buses.json` (`fetched_at 2026-09-19T15:22:29Z`) |
 | No committed bus time series | `.gitignore` excludes `data/`; only the single `fixtures/bt_buses.json` observation is shipped |
 | 470 recipes, 188 blank allergens, 42 nut, 174 veg, 231 vegan | `fixtures/dining_menu__dtdate=09-19-2026__location_num=15.json` |
@@ -549,7 +549,7 @@ Every component must name all five before it is marked ready.
 | Weather backend present; planner trigger absent | `hokieday/weather.py`; `hokieday/tools.py` `_replan_trigger` comment |
 | Events typed states + partial snapshot | `hokieday/events.py` `browse`/`snapshot_state`; `hokieday/tools.py` `get_events`, `LocalSource.events` |
 | No ML model | `hokieday/tools.py` `predict_bus_delay` |
-| Bounded parser, not LLM | `app/server.py` `parse_free_text` |
+| Provider-neutral grounded agent + bounded fallback | `hokieday/agent.py`, `hokieday/agent_tools.py`, `app/gemini_provider.py`, `app/server.py` |
 | Feasibility guards (closed gap) | `tests/test_feasibility.py`: tight window → `feasible:false` + `deadline_missed`; unknown place → no itinerary; rationale never "fits" |
 | Request-time + clock + bus-freshness guards | `tests/test_time.py`: `/api/time` lightweight; `_time` on every ask; live from-now/clarifications; replay pinned; 60 s bus cache; no forced GTFS |
 | `/api/time` and `_time` exist | `app/server.py` `time_endpoint` / `time_meta` / `handle_ask`; `GET /api/time` |
@@ -562,7 +562,7 @@ Run from the repo root. All are read-only; none modify the repository.
 
 ```bash
 # 1. Offline suite (no network, pinned clock)
-DEMO_MODE=cache python3 -m unittest discover -s tests -v        # -> Ran 694 tests, OK
+DEMO_MODE=cache python3 -m unittest discover -s tests -v        # -> Ran 732 tests, OK
 DEMO_MODE=cache python3 -m unittest tests.test_time tests.test_feasibility -v
 
 # 2. Fixture and snapshot counts

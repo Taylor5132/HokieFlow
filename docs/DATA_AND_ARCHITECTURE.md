@@ -66,12 +66,12 @@ weather/events ingestion, Lakebase state, Genie, or a Databricks App deployment.
 | Ingestion | **Shipped:** laptop edge scripts fetch and upload JSONL because Free Edition blocks required outbound hosts. **Target:** scheduled egress-capable job → UC Volume → Auto Loader / Structured Streaming | Constraint-driven demo scaffold with an explicit production path |
 | Query compute | **Serverless SQL warehouse** | Chat needs sub-second reads, not cluster startup |
 | ML | **Not shipped.** Target: small bus-lateness model after ≥2,000 labelled observations, tracked in MLflow and batch-scored into gold | Current demo acts on observed schedule deviation; `predict_bus_delay` returns `basis=no_model` |
-| Agent | **Not shipped.** Target: provider-independent LLM/HokieAI layer selecting governed Unity Catalog tools | Current offline text input is a bounded parser; deterministic tools own all facts and arithmetic |
+| Agent | **Shipped locally.** Provider-independent bounded tool loop + strict allowlist; Gemini REST adapter is opt-in in live mode; replay/provider failure retains the bounded parser | Deterministic tools own all facts and arithmetic. Virginia Tech HokieAI is a separate multi-model platform, not the name of this app agent |
 | Semantic search | **Vector Search** (Delta-synced index) + Foundation Model API embeddings — **Tier 2 only** | Justified use: "something warm and filling" over dish descriptions. Skip if structured filters suffice |
 | Serving UI | **Shipped:** local stdlib HTTP app. **Target:** Databricks App or another HTTPS host | Keep deployment claims separate from the working demo |
 | State / OLTP | **Not shipped.** Target: Lakebase (Postgres) for profile, preferences, and session state | State must live outside the model |
 | Staff analytics | **Not shipped.** Target: Genie over governed gold tables | Roadmap capability only |
-| LLM | Whatever the workspace serves via **Foundation Model APIs** — **do not hardcode a model name** | Portability; also lets you swap to **Gemini via AI Gateway** to double-enter the MLH Gemini track |
+| LLM | Runtime-configured provider/model; no hardcoded model. Gemini GenerateContent is the first adapter; a future documented HokieAI/ARC adapter can use the same protocol | Portability; provider choice never changes deterministic campus tools |
 | Demo safety | Committed `fixtures/` replay store + `DEMO_MODE=cache`; live `cache/` remains separate and ignored | **Non-negotiable.** Expo = walk-up judging on unknown Wi-Fi |
 
 ---
