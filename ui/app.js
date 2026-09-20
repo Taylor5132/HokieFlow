@@ -179,6 +179,7 @@ async function accountRequest(path,body,method='POST'){
 function applyAccount(result){
  if(Object.hasOwn(result,'user'))state.user=result.user?{...result.user,name:result.user.name||result.user.user_metadata?.name||result.user.email?.split('@')[0]||'Hokie'}:null;
  state.accountStorageError=result.storageError||'';
+ if(result.storageErrorCode)console.warn('HokieFlow schedule storage:',result.storageErrorCode);
  if(result.data)state.accountData={savedClass:null,reduceMotion:false,plans:[],events:[],...result.data};
  else state.accountData={savedClass:null,reduceMotion:false,plans:[],events:[]};
  state.accountVersion=result.version||0;state.savedClass=state.accountData.savedClass;
