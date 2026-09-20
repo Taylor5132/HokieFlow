@@ -4,6 +4,15 @@ The integrated Python server uses the existing `public.saved_plans` table in
 `supabase/schema.sql`. No `account_data` table or new migration is required.
 Keep the existing row-level-security policies enabled.
 
+If production reports `PGRST205`, the table is missing from that project's
+Data API schema/cache. In the Supabase project configured in Azure's
+`SUPABASE_URL`, run `supabase/ensure_saved_plans.sql` in SQL Editor. It creates
+the table when missing, installs the existing owner-only policies when absent,
+grants authenticated access subject to RLS, and reloads the API schema cache.
+It does not modify profile tables or delete existing rows. Pushing this SQL to
+GitHub does **not** execute it in Supabase. After running it, refresh HokieFlow,
+add an event, and refresh again to verify persistence.
+
 `app/account_store.py` reserves one UUIDv5 row per user (namespace URL,
 `hokieflow:account:<user-id>`). Its title is `HokieFlow account` and its JSONB
 payload is `{kind: "hokieflow_account_v1", version: <integer>, data: {...}}`.
