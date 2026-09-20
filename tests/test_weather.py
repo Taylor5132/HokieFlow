@@ -675,7 +675,10 @@ class TestPublicCacheMetadata(TempCacheCase):
              "fetched_at": STAMP},
         ]
         published = cache.publish_envelopes(entries)
-        self.assertEqual(len(published), 2)
+        self.assertEqual(published["count"], 2)
+        self.assertEqual(len(published["files"]), 2)
+        self.assertRegex(published["version"], r"^[0-9a-f]{16}$")
+        self.assertIn("published_at", published)
         self.assertEqual(cache.read_envelope("weather_a", {"i": "1"})["payload"],
                          {"n": 1})
         self.assertEqual(cache.read_envelope("weather_b", {"i": "2"})["payload"],
@@ -758,6 +761,192 @@ class TestTimezones(unittest.TestCase):
         self.assertEqual(naive["level"], aware["level"])
         self.assertEqual(weather._parse_ts(naive["start"]),
                          weather._parse_ts(aware["start"]))
+
+
+# ------------------------------------------------------------- aggregate rules
+class TestAggregateSemantics(unittest.TestCase):
+    def test_nested_partial_beats_stale(self):
+        sources = {
+            "forecast": {"status": "stale", "stale": True, "reason": "old"},
+            "alerts": {"status": "partial", "stale": True, "reason": "zone down"},
+        }
+        status, stale, reason, _metas = weather._aggregate(sources, primary="forecast")
+        self.assertEqual(status, "partial")
+        self.assertTrue(stale)
+        self.assertEqual(reason, "zone down")
+
+    def test_primary_unavailable_forces_unavailable(self):
+        sources = {
+            "points": {"status": "ok", "stale": False},
+            "hourly": {"status": "unavailable", "stale": True, "reason": "down"},
+        }
+        status, stale, reason, _metas = weather._aggregate(sources, primary="hourly")
+        self.assertEqual(status, "unavailable")
+        self.assertTrue(stale)
+        self.assertEqual(reason, "down")
+
+
+class TestPlanRiskPartialAlerts(TempCacheCase):
+    def test_partial_alert_feed_propagates_to_plan_risk(self):
+        # Point + hourly fresh; point alerts ok; zone alerts missing -> partial.
+        self.seed_full(hourly_periods=[period(T0, T1, precip=5)],
+                       alerts_point={"features": []})
+        legs = [{"type": "walk", "start_time": T0, "minutes": 20}]
+        result = weather.plan_risk(legs, now=STAMP_DT)
+        self.assertEqual(result["sources"]["alerts"]["status"], "partial")
+        self.assertEqual(result["status"], "partial")
+        self.assertTrue(result["stale"])
+        self.assertIsNotNone(result["reason"])
+        self.assertIn("forecast", result["sources"])
+
+
+class TestMultiHourCompleteness(unittest.TestCase):
+    """A mild complete hour must not mask an incomplete or token hour."""
+
+    def test_incomplete_second_hour_makes_the_leg_unknown(self):
+        complete = window(T0, T1, precip_probability_pct=5, temperature_c=20,
+                          wind_speed_kph=5, short_forecast="Sunny")
+        incomplete = window(T1, T2, precip_probability_pct=5, temperature_c=20,
+                            wind_speed_kph=None, short_forecast="Sunny")
+        result = weather.assess_leg(
+            "2026-09-19T10:15:00-04:00", "2026-09-19T11:30:00-04:00",
+            windows=[complete, incomplete])
+        self.assertEqual(result["level"], "unknown")
+        self.assertEqual(result["status"], "unknown")
+        self.assertTrue(any(e["factor"] == "data_gap" for e in result["evidence"]))
+
+    def test_rain_token_hour_is_not_hidden_by_a_mild_hour(self):
+        complete = window(T0, T1, precip_probability_pct=5, temperature_c=20,
+                          wind_speed_kph=5, short_forecast="Sunny")
+        token_hour = window(T1, T2, precip_probability_pct=None, temperature_c=20,
+                            wind_speed_kph=5, short_forecast="Rain Likely")
+        result = weather.assess_leg(
+            "2026-09-19T10:15:00-04:00", "2026-09-19T11:30:00-04:00",
+            windows=[complete, token_hour])
+        self.assertEqual(result["level"], "low")
+        self.assertTrue(any(e["factor"] == "precip_token" for e in result["evidence"]))
+
+    def test_stronger_hour_keeps_its_level_but_records_the_gap(self):
+        strong = window(T0, T1, precip_probability_pct=70, temperature_c=20,
+                        wind_speed_kph=5, short_forecast="Showers")
+        incomplete = window(T1, T2, precip_probability_pct=5, temperature_c=20,
+                            wind_speed_kph=None, short_forecast="Sunny")
+        result = weather.assess_leg(
+            "2026-09-19T10:15:00-04:00", "2026-09-19T11:30:00-04:00",
+            windows=[strong, incomplete])
+        self.assertEqual(result["level"], "high")
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(any(e["factor"] == "data_gap" for e in result["evidence"]))
+
+
+class TestActiveAlertsMetadataDependency(TempCacheCase):
+    def test_metadata_unavailable_marks_zone_unavailable(self):
+        # Point alerts ok, but no weather_points fixture -> zone cannot resolve.
+        self.seed("weather_alerts_point", {"features": []}, POINT_PARAMS)
+        result = weather.active_alerts(now=STAMP_DT)
+        self.assertEqual(result["sources"]["point"]["status"], "ok")
+        self.assertEqual(result["sources"]["zone"]["status"], "unavailable")
+        self.assertEqual(result["status"], "partial")
+        self.assertIn("point metadata", result["reason"])
+
+    def test_metadata_and_point_alert_unavailable_is_unavailable(self):
+        result = weather.active_alerts(now=STAMP_DT)
+        self.assertEqual(result["status"], "unavailable")
+
+
+class TestObservationAggregation(TempCacheCase):
+    OBS = {"properties": {
+        "station": "https://api.weather.gov/stations/KBCB",
+        "timestamp": "2026-09-19T20:55:00+00:00",
+        "temperature": {"unitCode": "wmoUnit:degC", "value": 27.5},
+        "textDescription": "Clear"}}
+    STATIONS = stations_payload([("KBCB", "Virginia Tech Airport", 1766)])
+
+    def test_stale_point_dependency_propagates(self):
+        old = (STAMP_DT - timedelta(days=2)).isoformat(timespec="seconds")
+        self.seed("weather_points", point_payload(), POINT_PARAMS, fetched_at=old)
+        self.seed("weather_stations", self.STATIONS, STATIONS_PARAMS)
+        self.seed("weather_observation", self.OBS, {"station": "KBCB"})
+        result = weather.latest_observation(now=STAMP_DT)
+        self.assertEqual(set(result["sources"]),
+                         {"points", "stations", "observation"})
+        self.assertEqual(result["sources"]["points"]["status"], "stale")
+        self.assertEqual(result["status"], "stale")
+        self.assertTrue(result["stale"])
+
+    def test_missing_observation_is_unavailable_not_partial(self):
+        self.seed_full(stations=self.STATIONS)   # point + stations fresh, no obs
+        result = weather.latest_observation(now=STAMP_DT)
+        self.assertEqual(result["sources"]["observation"]["status"], "unavailable")
+        self.assertEqual(result["status"], "unavailable")
+        self.assertTrue(result["stale"])
+
+    def test_hourly_primary_unavailable_is_unavailable(self):
+        self.seed("weather_points", point_payload(), POINT_PARAMS)  # fresh metadata
+        result = weather.hourly_windows(now=STAMP_DT)
+        self.assertEqual(result["sources"]["points"]["status"], "ok")
+        self.assertEqual(result["sources"]["hourly"]["status"], "unavailable")
+        self.assertEqual(result["status"], "unavailable")
+
+
+class TestPublishManifest(TempCacheCase):
+    def test_manifest_version_is_stable_for_same_bundle(self):
+        entries = [{"name": "weather_m", "url": "u", "payload": {"n": 1},
+                    "params": {"i": "1"}, "fetched_at": STAMP}]
+        first = cache.publish_envelopes(entries)
+        second = cache.publish_envelopes(entries)
+        self.assertEqual(first["version"], second["version"])
+        self.assertEqual(first["count"], 1)
+
+
+class TestFetchScriptHelpers(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        path = (Path(__file__).resolve().parent.parent
+                / "scripts" / "fetch_weather.py")
+        spec = importlib.util.spec_from_file_location("hokieday_fetch_weather", path)
+        module = importlib.util.module_from_spec(spec)
+        prior = os.environ.get("DEMO_MODE")
+        os.environ["DEMO_MODE"] = "cache"
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            if prior is None:
+                os.environ.pop("DEMO_MODE", None)
+            else:
+                os.environ["DEMO_MODE"] = prior
+        cls.mod = module
+
+    def test_sort_stations_by_distance_before_trim(self):
+        payload = stations_payload([
+            ("KFAR", "Far", 50000), ("KBCB", "Near", 1766), ("KMID", "Mid", 20000)])
+        sorted_payload = self.mod._sort_stations(payload)
+        ids = [f["properties"]["stationIdentifier"]
+               for f in sorted_payload["features"]]
+        self.assertEqual(ids, ["KBCB", "KMID", "KFAR"])
+        trimmed = self.mod._trim_stations(sorted_payload, 1)
+        self.assertEqual(len(trimmed["features"]), 1)
+        self.assertEqual(
+            trimmed["features"][0]["properties"]["stationIdentifier"], "KBCB")
+
+    def test_required_names_derived_from_point_metadata(self):
+        entries = [{"name": "weather_points", "payload": point_payload()},
+                   {"name": "weather_hourly"},
+                   {"name": "weather_alerts_point"}]
+        required = self.mod._required_names(entries)
+        self.assertIn("weather_alerts_zone", required)
+        self.assertIn("weather_stations", required)
+        self.assertNotIn("weather_observation", required)
+        entries.append({"name": "weather_stations"})
+        self.assertIn("weather_observation", self.mod._required_names(entries))
+
+    def test_validate_flags_missing_required_resources(self):
+        point = {"name": "weather_points", "payload": point_payload(),
+                 "fetched_at": STAMP}
+        errors = self.mod._validate([point], datetime(2026, 9, 19, tzinfo=timezone.utc))
+        self.assertTrue(any("weather_hourly" in e for e in errors))
+        self.assertTrue(any("weather_alerts_zone" in e for e in errors))
 
 
 # ------------------------------------------------------------- claim wording

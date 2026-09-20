@@ -560,34 +560,47 @@ def write_envelope_atomic(name: str, url: str, payload: Any, *,
 
 
 def publish_envelopes(entries: list[dict], *,
-                      cache_dir: Path | str | None = None) -> list[Path]:
-    """Atomically publish a whole bundle of envelopes, all-or-none.
+                      cache_dir: Path | str | None = None) -> dict:
+    """Publish a bundle of envelopes through staged temp files + swaps.
 
     `entries` is a list of dicts: {name, url, payload, params?, fetched_at?}.
-    Every entry is staged to a unique temp file first; only when ALL stages are
-    written are they swapped into place. If any swap fails, the previously
-    published files are restored and the new ones removed, so a caller never
-    observes a half-written bundle. Returns the published paths.
 
-    This is the supported replacement for seeding several fixtures by hand and
-    rewriting envelope JSON with Path.write_text().
+    VISIBILITY — read this before claiming atomicity:
+      * Each individual file is published with os.replace(), so no reader ever
+        sees a half-written FILE.
+      * The bundle as a whole is NOT reader-atomically visible: a concurrent
+        reader can observe some new files and some old files between swaps.
+        There is no versioned pointer. This is acceptable only because
+        publication is an OFFLINE, STOPPED-APP operation (regenerate fixtures,
+        restart the app). Do not publish while a demo/server is serving.
+      * The returned manifest carries a `version` digest and `files`, so a
+        caller can tell later which bundle is on disk.
+
+    All-or-none applies to WRITER failure: if any stage or swap fails, the
+    previously published files are restored and the new ones removed. Returns:
+        {"version": str, "published_at": iso, "count": int, "files": [str]}
     """
     target = Path(cache_dir) if cache_dir is not None else config.CACHE_DIR
     target.mkdir(parents=True, exist_ok=True)
 
+    digested = hashlib.sha1()
     staged: list[tuple[Path, Path]] = []
     try:
         for entry in entries:
             name = entry["name"]
             params = entry.get("params")
             final = target / f"{key(name, params)}.json"
+            fetched_at = entry.get("fetched_at") or _now_iso()
             envelope = {
                 "key": final.stem,
                 "url": entry.get("url"),
-                "fetched_at": entry.get("fetched_at") or _now_iso(),
+                "fetched_at": fetched_at,
                 "mode": entry.get("mode") or config.DEMO_MODE,
                 "payload": entry["payload"],
             }
+            digested.update(f"{final.stem}|{fetched_at}|".encode("utf-8"))
+            digested.update(
+                json.dumps(entry["payload"], sort_keys=True).encode("utf-8"))
             fd, tmp_name = tempfile.mkstemp(
                 prefix=final.name + ".stage.", suffix=".tmp", dir=str(target))
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -641,7 +654,12 @@ def publish_envelopes(entries: list[dict], *,
                 backup.unlink()
             except OSError:
                 pass
-    return published
+    return {
+        "version": digested.hexdigest()[:16],
+        "published_at": _now_iso(),
+        "count": len(published),
+        "files": [str(p) for p in published],
+    }
 
 
 def stats() -> dict:

@@ -26,7 +26,14 @@ HONESTY RULES (learned from a rejected bundle):
 Mode safety: this script writes the FROZEN fixtures/ store. It refuses to run if
 DEMO_MODE is set to anything other than "cache" (no silent setdefault).
 
-    python3 scripts/fetch_weather.py                 # fetch, validate, publish
+VISIBILITY: publication is an OFFLINE, STOPPED-APP operation. Each file is
+swapped atomically, but the bundle as a whole is NOT reader-atomically visible
+(there is no versioned pointer), so a running server could read a mixed
+snapshot. Writing therefore requires the explicit `--publish` flag, and the
+script prints the returned bundle manifest version.
+
+    python3 scripts/fetch_weather.py                 # fetch + validate (no writes)
+    python3 scripts/fetch_weather.py --publish       # write; app must be stopped
     python3 scripts/fetch_weather.py --hours 24 --stations 6
     python3 scripts/fetch_weather.py --dry-run       # fetch + validate, no writes
 """
@@ -90,18 +97,54 @@ def _trim_hourly(payload: dict, hours: int) -> dict:
     return {**payload, "properties": props}
 
 
+def _sort_stations(payload: dict) -> dict:
+    """Sort the FULL station list by normalized distance (None last).
+
+    Trimming before sorting could discard the nearest station just because NWS
+    ordered the response differently, so sort first, then trim.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    feats = list(payload.get("features") or [])
+
+    def distance(feature):
+        value = ((feature.get("properties") or {}).get("distance") or {}).get("value")
+        return (value is None, value if value is not None else float("inf"))
+
+    feats.sort(key=distance)
+    return {**payload, "features": feats}
+
+
 def _trim_stations(payload: dict, limit: int) -> dict:
     if not isinstance(payload, dict):
         return payload
     return {**payload, "features": (payload.get("features") or [])[:limit]}
 
 
+def _required_names(entries: list[dict]) -> list[str]:
+    """Required resources derived from the point metadata.
+
+    Zone alerts are required when the point names a forecast zone; the station
+    list is required when the point names an observation-stations URL; the
+    observation is required once a station list is present.
+    """
+    required = ["weather_points", "weather_hourly", "weather_alerts_point"]
+    point = next((e for e in entries if e["name"] == "weather_points"), None)
+    props = ((point or {}).get("payload") or {}).get("properties") or {}
+    if str(props.get("forecastZone") or "").strip():
+        required.append("weather_alerts_zone")
+    if str(props.get("observationStations") or "").strip():
+        required.append("weather_stations")
+    if any(e["name"] == "weather_stations" for e in entries):
+        required.append("weather_observation")
+    return required
+
+
 def _validate(entries: list[dict], now: datetime) -> list[str]:
     """Temporal/coverage invariants. Any error means the bundle must NOT publish."""
     errors: list[str] = []
     names = {e["name"] for e in entries}
-    for required in ("weather_points", "weather_hourly",
-                     "weather_alerts_point", "weather_observation"):
+    for required in _required_names(entries):
         if required not in names:
             errors.append(f"bundle incomplete: missing {required}")
 
@@ -191,6 +234,8 @@ def main() -> int:
     ap.add_argument("--hours", type=int, default=48)
     ap.add_argument("--stations", type=int, default=12)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--publish", action="store_true",
+                    help="write the frozen store; only while the app is stopped")
     ap.add_argument("--force-incoherent", action="store_true",
                     help="publish even if the forecast does not cover the replay clock")
     args = ap.parse_args()
@@ -249,7 +294,8 @@ def main() -> int:
     if stations_url:
         payload, eff, at = _get_json(stations_url)
         if payload is not None:
-            trimmed = _trim_stations(payload, args.stations)
+            sorted_payload = _sort_stations(payload)
+            trimmed = _trim_stations(sorted_payload, args.stations)
             entries.append({
                 "name": "weather_stations",
                 "params": {"grid": str(grid_id), "x": str(grid_x), "y": str(grid_y)},
@@ -287,20 +333,31 @@ def main() -> int:
             print(f"  - {err}")
         return 1
 
+    if args.dry_run and args.publish:
+        print("\nrefusing: --dry-run and --publish are mutually exclusive")
+        return 2
     if args.dry_run:
         print(f"\nvalidated {len(entries)} resources; --dry-run, nothing published")
         for entry in entries:
             print(f"  {entry['name']:24s} {entry.get('fetched_at')}")
         return 0
+    if not args.publish:
+        print(f"\nvalidated {len(entries)} resources; preview only.\n"
+              "Pass --publish WHILE THE APP IS STOPPED to write the frozen "
+              "store (publication is not reader-atomic across the bundle).")
+        for entry in entries:
+            print(f"  {entry['name']:24s} {entry.get('fetched_at')}")
+        return 0
 
     try:
-        published = cache.publish_envelopes(entries, cache_dir=target)
+        manifest = cache.publish_envelopes(entries, cache_dir=target)
     except Exception as exc:                                    # noqa: BLE001
         print(f"\nPublish failed (rolled back, all-or-none): {type(exc).__name__}: {exc}")
         return 1
-    print(f"\npublished {len(published)} weather fixtures atomically into {target}")
-    for path in published:
-        print(f"  {path.name}")
+    print(f"\npublished {manifest['count']} weather fixtures into {target}")
+    print(f"  bundle version={manifest['version']} at {manifest['published_at']}")
+    for path in manifest["files"]:
+        print(f"  {path}")
     return 0
 
 

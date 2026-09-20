@@ -70,8 +70,16 @@ Aggregate status is **truthful and non-contradictory**:
 - `stale` — all feeds are present but at least one is past its TTL. A stale
   **point** dependency propagates to the whole forecast result.
 - `partial` — at least one feed is available and at least one is unavailable
-  (e.g. the point alert feed works but the zone feed is down).
+  (e.g. the point alert feed works but the zone feed is down). A nested
+  `partial` (plan_risk's alert feed) propagates ahead of a stale sibling.
 - `unavailable` — no feed is available.
+
+The aggregator is **primary-aware**: the feed a result cannot exist without
+(hourly forecast, station list, observation) drives the status. Fresh metadata
+plus an unavailable primary yields `unavailable`, not a reassuring `partial`.
+When `include_zone=True` the zone alert feed DEPENDS on the point metadata, so
+an unavailable metadata marks an explicit unavailable `zone` source rather than
+silently omitting it.
 
 `stale` is `true` whenever any source is stale *or* unavailable, so `status ==
 "ok"` can never carry `stale: true`. `sources` exposes each feed so the UI can
@@ -170,11 +178,15 @@ used, and a `basis` that names the winning evidence:
   `forecast`);
 - `mixed` — alerts and forecast factors tie at the top level.
 
-**Missing data never reads as reassuring.** If required hazard fields
-(precipitation, temperature, wind) are absent across every overlapping hour and
-no stronger evidence exists, the result is `status: "unknown"`, not `none`. A
-forecast token like "Chance Rain Showers" with a null probability is scored
-conservatively (level `low`, factor `precip_token`), not dropped.
+**Missing data never reads as reassuring — and completeness is evaluated PER
+forecast period.** For every overlapping hour, the required hazard fields are
+precipitation (probability or a rain/snow token), temperature, and wind. If any
+hour has a gap and no stronger evidence exists, the result is `status:
+"unknown"`, not `none`; a mild complete hour cannot mask an incomplete hour. A
+token like "Rain Likely" with a null probability adds conservative `low`
+evidence even when a different hour reported a probability, and when a strong
+hour already raised the level the result keeps that level but records a
+`data_gap` evidence entry.
 
 **Wind ranges are read conservatively.** `25 to 45 mph` and `25-45 mph` are
 scored at 45 mph; `20 to 30 km/h` at 30 km/h; knots are converted. The unit is
@@ -219,7 +231,8 @@ committed fixtures.
 
 ```
 python3 scripts/fetch_weather.py --dry-run     # fetch + validate, no writes
-python3 scripts/fetch_weather.py               # validate + publish all-or-none
+python3 scripts/fetch_weather.py               # fetch + validate (preview only)
+python3 scripts/fetch_weather.py --publish     # write; APP MUST BE STOPPED
 ```
 
 The script:
@@ -229,15 +242,20 @@ The script:
 2. **Preserves real acquisition times.** Each envelope's `fetched_at` is the
    time that response was actually fetched; nothing is rewritten.
 3. **Stages the complete bundle in memory**, then validates temporal invariants:
-   required resources present; all fetched within a 10-minute span; hourly
-   forecast has periods and covers the acquisition time; the observation has a
-   parseable, non-future, ≤ 6 h timestamp.
-4. **Refuses an incoherent replay.** If the target store has a `bt_buses` replay
+   required resources derived from the point metadata; all fetched within a
+   10-minute span; hourly forecast has periods and covers the acquisition time;
+   the observation has a parseable, non-future, ≤ 6 h timestamp.
+4. **Sorts the FULL station list by distance before trimming**, so the nearest
+   station is never discarded by response order.
+5. **Refuses an incoherent replay.** If the target store has a `bt_buses` replay
    pin that the forecast does not cover, publishing is rejected (override only
    with an explicit `--force-incoherent`).
-5. **Publishes all-or-none** through `cache.publish_envelopes()`, which stages
-   every file and rolls back on failure. It never edits envelopes with
-   `Path.write_text()`.
+6. **Requires `--publish` and is explicitly NOT reader-atomic across the
+   bundle.** Each file is swapped atomically, but a concurrent reader could see
+   a mixed snapshot (there is no versioned pointer), so publication is an
+   offline, stopped-app operation. `cache.publish_envelopes()` returns a
+   manifest (`version`, `published_at`, `count`, `files`) and rolls back on
+   writer failure. It never edits envelopes with `Path.write_text()`.
 
 ---
 
