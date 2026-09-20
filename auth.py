@@ -2,6 +2,8 @@ import base64
 import json
 import os
 import secrets
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
 
@@ -133,7 +135,7 @@ def create_profile(first_name, last_name, major, graduation_year):
 def login_with_google():
     client = get_supabase_client()
     return client.auth.sign_in_with_oauth({"provider": "google"})
-
+    
 
 def get_profile():
     client = get_supabase_client()
@@ -186,6 +188,9 @@ def require_auth(headers: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     if not token:
         raise PermissionError("Authentication required.")
 
+    if isinstance(session.get("user"), dict):
+        return session["user"]
+
     client = get_supabase_client()
     try:
         user_response = client.auth.get_user()
@@ -200,12 +205,47 @@ def require_auth(headers: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     raise PermissionError("Authentication required.")
 
 
+def _google_oauth_env() -> tuple[str, str, str]:
+    client_id = (os.getenv("GOOGLE_CLIENT_ID") or "").strip()
+    client_secret = (os.getenv("GOOGLE_CLIENT_SECRET") or "").strip()
+    redirect_uri = (os.getenv("APP_URL") or "http://127.0.0.1:8321/api/auth/google/callback").strip()
+    return client_id, client_secret, redirect_uri
+
+
+def _decode_google_id_token(id_token: str) -> dict[str, Any]:
+    if not id_token:
+        return {}
+    try:
+        header_b64, payload_b64, _, = str(id_token).split(".")
+        if not payload_b64:
+            return {}
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
 def start_google_oauth(request_state: Optional[Mapping[str, Any]] = None):
+    client_id, _, redirect_uri = _google_oauth_env()
+    if client_id:
+        state_value = (request_state or {}).get("state") or secrets.token_urlsafe(32)
+        query = {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": "openid email profile",
+            "state": state_value,
+            "access_type": "offline",
+            "prompt": "consent",
+        }
+        return f"https://accounts.google.com/o/oauth2/v2/auth?{urllib.parse.urlencode(query)}"
+
     client = get_supabase_client()
     state_value = (request_state or {}).get("state") or secrets.token_urlsafe(32)
     response = client.auth.sign_in_with_oauth({
         "provider": "google",
-        "options": {"redirect_to": os.getenv("APP_URL", "http://127.0.0.1:8321/api/auth/google/callback")},
+        "options": {"redirect_to": redirect_uri},
     })
     redirect_url = response.get("url") if isinstance(response, dict) else str(response)
     if "?" in redirect_url:
@@ -225,6 +265,59 @@ def handle_google_oauth_callback(callback_params: Optional[Mapping[str, Any]], r
     received_state = params.get("state")
     if expected_state and received_state != expected_state:
         raise ValueError("Invalid OAuth state.")
+
+    client_id, client_secret, redirect_uri = _google_oauth_env()
+    if client_id and client_secret:
+        token_req = urllib.request.Request(
+            "https://oauth2.googleapis.com/token",
+            data=urllib.parse.urlencode({
+                "code": params["code"],
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urllib.request.urlopen(token_req, timeout=30) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        if "id_token" not in body and "access_token" not in body:
+            raise ValueError("OAuth token exchange failed.")
+        id_token = body.get("id_token")
+        claims = _decode_google_id_token(id_token) if id_token else {}
+        if not claims:
+            raise ValueError("OAuth token response did not include a valid ID token.")
+        now = datetime.now(timezone.utc).timestamp()
+        if str(claims.get("aud")) != client_id:
+            raise ValueError("OAuth ID token audience mismatch.")
+        if claims.get("iss") not in {"https://accounts.google.com", "accounts.google.com"}:
+            raise ValueError("OAuth ID token issuer mismatch.")
+        exp = claims.get("exp")
+        if exp is not None and float(exp) < now:
+            raise ValueError("OAuth ID token has expired.")
+        email = claims.get("email")
+        if not email:
+            raise ValueError("OAuth ID token missing email claim.")
+        user = {
+            "id": claims.get("sub") or email,
+            "email": email,
+            "name": claims.get("name") or email.split("@", 1)[0],
+            "picture": claims.get("picture"),
+            "provider": "google",
+        }
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=SESSION_MAX_AGE_SECONDS)
+        return {
+            "user": user,
+            "session": {
+                "access_token": body.get("access_token") or "",
+                "refresh_token": body.get("refresh_token") or "",
+                "expires_at": expires_at.isoformat(),
+                "provider": "google",
+                "user": user,
+            },
+        }
+
     client = get_supabase_client()
     try:
         session = client.auth.exchange_code_for_session(params["code"])

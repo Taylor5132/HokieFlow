@@ -171,6 +171,11 @@ document.addEventListener('click',event=>{if(event.target.closest('[data-action=
 function startGoogleLogin(){
  const message=$('#google-auth-error');
  try{
+  console.log('[HokieFlow auth]', {
+   googleAuthUrl: config.googleAuthUrl,
+   origin: window.location.origin,
+   href: config.googleAuthUrl ? new URL(config.googleAuthUrl, window.location.origin).href : null
+  });
   if(!config.googleAuthUrl)throw new Error('Google sign-in is temporarily unavailable. Please use email to continue.');
   const target=new URL(config.googleAuthUrl,window.location.origin);
   if(target.origin!==window.location.origin||!['http:','https:'].includes(target.protocol))throw new Error('Google sign-in is temporarily unavailable. Please use email to continue.');
