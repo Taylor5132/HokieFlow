@@ -119,34 +119,36 @@ class TestAuth(unittest.TestCase):
             self.assertEqual(require_auth(first)["email"], "a@example.com")
             self.assertEqual(require_auth(second)["email"], "b@example.com")
 
-    def test_google_oauth_start_uses_direct_google_params(self):
+    def test_google_oauth_start_uses_supabase_pkce(self):
         with mock.patch.dict("os.environ", {
-            "GOOGLE_CLIENT_ID": "client-123.apps.googleusercontent.com",
+            "SUPABASE_URL": "https://example.supabase.co",
             "APP_URL": "http://127.0.0.1:8321/api/auth/google/callback",
         }, clear=False), \
              mock.patch("auth.secrets.token_urlsafe", return_value="state-123"):
-            redirect = start_google_oauth({})
-        self.assertTrue(redirect.startswith("https://accounts.google.com/o/oauth2/v2/auth"))
-        self.assertIn("client_id=client-123.apps.googleusercontent.com", redirect)
-        self.assertIn("redirect_uri=http%3A%2F%2F127.0.0.1%3A8321%2Fapi%2Fauth%2Fgoogle%2Fcallback", redirect)
-        self.assertIn("response_type=code", redirect)
-        self.assertIn("scope=openid+email+profile", redirect)
-        self.assertIn("state=state-123", redirect)
+            redirect = start_google_oauth({"state": "state-123"})
+        self.assertTrue(redirect.startswith("https://example.supabase.co/auth/v1/authorize"))
+        self.assertIn("provider=google", redirect)
+        self.assertIn("redirect_to=http%3A%2F%2F127.0.0.1%3A8321%2Fapi%2Fauth%2Fgoogle%2Fcallback", redirect)
+        self.assertIn("code_challenge_method=s256", redirect)
+        self.assertIn("code_challenge=", redirect)
 
     def test_oauth_start_and_callback_validate_state(self):
         fake = FakeClient(oauth_url="https://example.com/start")
-        with mock.patch("auth.get_supabase_client", return_value=fake), \
+        with mock.patch.dict("os.environ", {
+            "SUPABASE_URL": "https://example.supabase.co",
+            "APP_URL": "http://127.0.0.1:8321/api/auth/google/callback",
+        }, clear=False), \
+             mock.patch("auth.get_supabase_client", return_value=fake), \
              mock.patch("auth.secrets.token_urlsafe", return_value="state-123"):
-            redirect = start_google_oauth({})
+            redirect = start_google_oauth({"state": "state-123"})
         self.assertIn("state-123", redirect)
 
         with mock.patch.dict("os.environ", {
-            "GOOGLE_CLIENT_ID": "",
-            "GOOGLE_CLIENT_SECRET": "",
+            "SUPABASE_URL": "https://example.supabase.co",
             "APP_URL": "http://127.0.0.1:8321/api/auth/google/callback",
         }, clear=False), \
              mock.patch("auth.get_supabase_client", return_value=FakeClient()):
-            result = handle_google_oauth_callback({"state": "state-123", "code": "abc"}, {"state": "state-123"})
+            result = handle_google_oauth_callback({"code": "abc"}, {"state": "state-123"})
         self.assertEqual(result["user"]["email"], "oauth@example.com")
 
     def test_require_auth_rejects_an_expired_cookie_payload(self):
