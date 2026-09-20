@@ -1348,6 +1348,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/dining/places":
             self._json(ui_files.dining_places_endpoint())
             return
+        if path == "/api/classes":
+            from app.class_import import search_endpoint
+            self._json(search_endpoint({k: v[0] for k, v in query.items()}))
+            return
+        if path == "/api/events":
+            self._json(ui_files.campus_events_endpoint())
+            return
         if path == "/api/transit/stops":
             self._json(ui_files.transit_stops_endpoint())
             return
@@ -1383,6 +1390,18 @@ class Handler(BaseHTTPRequestHandler):
                                  "dependencies with 'pip install -r requirements.txt'",
                         "status": "unavailable",
                         "detail": AUTH_UNAVAILABLE_REASON}, 503)
+            return
+        if path == "/api/classes/preview":
+            from app.class_import import preview_endpoint
+            if int(self.headers.get("Content-Length") or 0) > 1048576:
+                self.close_connection = True
+                self._json({"error": "Calendar upload is too large."}, 413)
+                return
+            try:
+                payload = self._read_json()
+                self._json(preview_endpoint(payload))
+            except (ValueError, KeyError, TypeError) as exc:
+                self._json({"error": str(exc)}, 400)
             return
         if path == "/api/auth/register":
             payload = self._read_json()

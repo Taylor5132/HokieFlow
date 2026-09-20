@@ -40,6 +40,7 @@ _ASSET_TYPES = {
     "home-live.js": "text/javascript; charset=utf-8",
     "bus-location.js": "text/javascript; charset=utf-8",
     "dining.js": "text/javascript; charset=utf-8",
+    "class-import.js": "text/javascript; charset=utf-8",
     "schedule.js": "text/javascript; charset=utf-8",
     "directions.js": "text/javascript; charset=utf-8",
     "preferences.js": "text/javascript; charset=utf-8",
@@ -305,3 +306,28 @@ def route_endpoint(payload: dict) -> tuple[dict, int]:
             "Path geometry withheld pending the recorded VT GIS redistribution "
             "permission; distance and directions are still real."]
     return body, 200
+
+
+def campus_events_endpoint():
+    """Expose Taylor's browse/calendar contract without writing a calendar."""
+    from hokieday import events
+    candidates = [config.CACHE_DIR / "events" / "events_september_2026.json",
+                  config.FIXTURES_DIR / "events" / "events_september_2026.json"]
+    try:
+        path = next(p for p in candidates if p.exists())
+        snapshot = events.load_snapshot(path)
+        now = config.now()
+        result = events.browse(snapshot, start=now, now=now,
+                               include_cancelled=False, include_uncertain=False, limit=100)
+        rows = []
+        for event in result.events:
+            if event.invalid_range or event.status == "parser-failed":
+                continue
+            calendar = events.to_calendar_event(event)
+            if event.duration_unknown and not event.all_day:
+                calendar["end"] = None
+            rows.append({"id": event.id, **calendar})
+        return {"events": rows, "state": result.state, "notices": list(result.notices),
+                "month": snapshot.month, "fetched_at": snapshot.fetched_at}
+    except Exception:
+        return {"events": [], "state": "unavailable", "notices": ["Campus events could not load. Please try again."]}
