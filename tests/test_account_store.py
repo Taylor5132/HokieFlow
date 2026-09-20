@@ -138,9 +138,11 @@ class AccountStoreTests(unittest.TestCase):
             self.api.error = code
             result = ui_files.enrich_account({"user": self.user}, self.user, headers=self.headers)
             self.assertIn("storageError", result)
+            self.assertEqual(result["storageErrorCode"], code)
             self.assertNotIn("data", result)
             saved, actual = ui_files.save_account(self.user, self.data, 0, headers=self.headers)
             self.assertEqual(actual, status)
+            self.assertEqual(saved["code"], code)
             self.assertNotIn("secret provider detail", json.dumps(saved))
 
     def test_invalid_data_rejected_before_database_write(self):

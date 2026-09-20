@@ -143,6 +143,7 @@ def enrich_account(body: dict, user: object, *, headers=None, access_token=None)
         # A failed read is not an empty account. The UI blocks saves until
         # a successful reload so it cannot overwrite unknown existing data.
         body["storageError"] = str(exc)
+        body["storageErrorCode"] = exc.code
     return body
 
 
@@ -155,7 +156,7 @@ def save_account(user: object, data: object, version: object, *, headers=None) -
         result = account_store.save(uid, _account_token(headers), data, version)
         return {**result, "user": user_ref(user)}, 200
     except account_store.StorageError as exc:
-        return {"error": str(exc)}, exc.status
+        return {"error": str(exc), "code": exc.code}, exc.status
 
 # --------------------------------------------------------------------------- #
 # GET endpoints

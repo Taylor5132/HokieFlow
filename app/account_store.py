@@ -16,9 +16,10 @@ log = logging.getLogger(__name__)
 
 
 class StorageError(Exception):
-    def __init__(self, message, status=503):
+    def __init__(self, message, status=503, code="storage_unavailable"):
         super().__init__(message)
         self.status = status
+        self.code = code
 
 
 def row_id(uid):
@@ -28,13 +29,17 @@ def row_id(uid):
 def _failure(exc):
     # Never log provider messages: they may contain submitted data or tokens.
     code = str(getattr(exc, "code", ""))
+    safe_code = code if code in {"23505", "42501", "PGRST301", "PGRST302", "PGRST303",
+                                "PGRST205", "PGRST204", "42P01", "42703", "PGRST100"} else "storage_unavailable"
+    if isinstance(exc, RuntimeError):
+        safe_code = "storage_configuration"
     log.warning("Account storage failed (%s, code=%s)", type(exc).__name__,
                 code if code.isalnum() else "unknown")
     if code == "23505":
-        return StorageError("Your schedule changed in another tab. Reload and try again.", 409)
+        return StorageError("Your schedule changed in another tab. Reload and try again.", 409, safe_code)
     if code in ("42501", "PGRST301", "PGRST302", "PGRST303"):
-        return StorageError("Your account could not access saved data. Please sign in again.", 401)
-    return StorageError("We couldn't access your saved schedule. Please try again shortly.")
+        return StorageError("Your account could not access saved data. Please sign in again.", 401, safe_code)
+    return StorageError("We couldn't access your saved schedule. Please try again shortly.", code=safe_code)
 
 
 @contextmanager
