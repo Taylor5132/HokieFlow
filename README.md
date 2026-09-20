@@ -15,6 +15,7 @@ hokieday/
     cache.py           # cache-first fetch: live | cache modes
     gtfs.py            # static GTFS -> departures          [worker: gtfs]
     livebus.py         # live buses -> crowding + lateness   [worker: livebus]
+    classes.py         # Banner timetable parsing, search, ICS import, recurrence
     dining.py          # menu, nutrition, allergens, hours   [worker: dining]
     weather.py         # NWS forecast/alerts/observation + leg risk badges
     tools.py           # deterministic tools + plan_day/re-planning loop
@@ -67,13 +68,37 @@ mean **+0.96 min** — physically sensible. Override with `DEMO_NOW=<iso8601>`.
 
 ```bash
 export DEMO_MODE=cache
-python3 -m unittest discover -s tests -v     # 719 tests, no network
+python3 -m unittest discover -s tests -v     # 820 tests, no network
 ```
 
 With `DEMO_MODE=cache` nothing touches the network and the clock is pinned. If a
 demo-day idea needs a network call, it is wrong.
 
 > No pytest, no pandas on this machine (Python 3.14.7) — tests use stdlib `unittest`, and the core library is stdlib-only.
+
+## Course search (live catalog, offline fallback)
+
+`GET /api/classes/search?q=<course|subject|CRN|title words>` answers from the
+public VT timetable. The query parser is deterministic (`classes.query_filters`):
+`CS 3114` → subject + number, `83568` → CRN, `CS` → subject, `data structures` →
+title words.
+
+```bash
+# capture the catalog so search also works offline (one polite POST per query)
+python3 scripts/fetch_classes.py --term 202609 --subject CS
+python3 scripts/fetch_classes.py --term 202609 --subject MATH --course-number 1225
+```
+
+* **Live** — one rate-limited POST to `selfservice.banner.vt.edu` (no
+  credentials, no cookies, never HokieSPA), cached under `cache/` for 10 minutes
+  and returned with `source: "banner_live"`.
+* **Replay** — every committed capture for the term is searched and the answer
+  carries `source: "snapshot"` with the capture's own `fetched_at`. Nothing is
+  invented and a term with no capture returns `state: "unavailable"`.
+
+The agent can answer the same question through its `search_classes` tool, which
+is snapshot-based on purpose (the package never touches the network) and always
+reports the capture time.
 
 ## Live mode
 

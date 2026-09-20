@@ -9,7 +9,7 @@ as such.
 (package `hokieday/`, imports, file names, config keys).
 
 **As verified:** 2026-09-20 after VT GIS, reviewed NWS weather, public class/ICS,
-FoodPro basic-directory, September 2026 events integration, and the provider-neutral grounded agent layer (live Gemini path exercised end-to-end; all 8 tools verified with `gemini-3.1-flash-lite`). Offline suite: **732 tests, 0 failures** under `DEMO_MODE=cache`. Live bus
+FoodPro basic-directory, September 2026 events integration, and the provider-neutral grounded agent layer (live Gemini path exercised end-to-end; all 9 tools, including course-catalog search, verified with `gemini-3.1-flash-lite`). Offline suite: **820 tests, 0 failures** under `DEMO_MODE=cache`. Live bus
 fixture captured **2026-09-19T15:22:29Z**. See §12 for the exact verification commands.
 
 ---
@@ -78,7 +78,7 @@ when reality contradicts Plan A, a **re-plan that states exactly what changed**.
 | **D. Navigate** | "Turn-by-turn directions" | 🔵 Handed off | We open the phone's maps app; we do not build turn-by-turn |
 | **E. Discover later** | "What's happening on campus?" | ✅ Yes (Sept 2026, Blacksburg) | Frozen normalized snapshot + browse/search/filter/gap-fit; add-to-schedule export |
 | **E. Discover later** | Weather risk during an outdoor leg | 🟡 Backend ready | NWS client and deterministic risk are implemented; planner/API/UI wiring remains |
-| **E. Discover later** | Browse public classes / import CRNs or ICS | 🟡 Backend ready | Banner parser, ICS import, conflicts and next-class contracts implemented; app/Lakebase wiring remains |
+| **E. Discover later** | Browse public classes / import CRNs or ICS | 🟢 Search shipped | Live `GET /api/classes/search` over the public Banner timetable (one rate-limited POST, cached), offline answers from committed captures, `search_classes` agent tool, Schedule-tab search box that adds a section to the schedule; ICS import and conflicts implemented |
 | **E. Discover later** | Library / gym / campus status / SafeRide | 🔵 Identified | See §7 |
 
 ---
@@ -437,7 +437,7 @@ clock; replay is pinned; and the heavier `/api/status` is fetched once at boot.
 | **Location / walking** | 8 named places (1 verified) + device origin | 🟡 | Hard-coded registry + browser geolocation | Per request / static | Building coordinates await VT GIS calibration; geolocation needs HTTPS | Origin label ± accuracy; walk estimate |
 | **Weather** | `hokieday.weather` normalizes NWS point/hourly/alerts/observation and scores outdoor legs | 🟡 | NWS `https://api.weather.gov/points/{lat},{lon}` | 3 min–24 h by resource | Keyless, official, cached; backend only; replay unavailable until coherent capture; KBCB is airport observation | Live forecast evidence may be shown after API wiring; never imply certainty or show weather in current replay |
 | **Events** | 27 Blacksburg September 2026 events (from a 67-candidate crawl) | 🟡 | `https://events.vt.edu/sitemap.xml` + public detail HTML (AEM; no API) | On crawl (snapshot `fetched_at`) | No API; 33 of 67 detail fetches failed; snapshot is partial, PII-scrubbed and does not claim complete coverage | Browse/search/filter/gap-fit; add-to-schedule export; typed partial/empty/no-match/out-of-scope states |
-| **Classes / calendar** | `hokieday.classes`: public Banner HTML parser, CRN selection, bounded ICS import, conflicts, schedule records and next-class contract | 🟡 | Public POST `HZSKVTSC.P_ProcRequest`; user-provided ICS/CRNs | Per term / user import | Backend only; only term 202609 has verified window; Banner weekly recurrence is explicitly assumed and excluded from deadlines by default; no personal VT system access | Figma may use documented loading/TBA/conflict/stale/recurrence-unavailable states; current app must not claim automatic personal schedule sync |
+| **Classes / calendar** | `hokieday.classes`: public Banner HTML parser, deterministic query parser, snapshot search, CRN selection, bounded ICS import, conflicts, schedule records and next-class contract | 🟢 | Live `GET /api/classes/search` (cache/ holds live captures; fixtures/ holds committed snapshots); public POST `HZSKVTSC.P_ProcRequest`; user-provided ICS/CRNs | Per term / user import / 10-minute live cache | Answers say `source: banner_live` or `snapshot` with the capture's `fetched_at`; only term 202609 has a verified window; Banner weekly recurrence is explicitly assumed and excluded from deadlines by default; no personal VT system access | Figma may use documented loading/TBA/conflict/stale/recurrence-unavailable states; never claim automatic personal schedule sync or live registration data |
 | **Library / study** | None | 🔵 | `https://lib.vt.edu/about-us/hours.html`; bookings `https://kiosk.lib.vt.edu/bookings/`; space search `https://calendar.lib.vt.edu/reserve/group-study` | Daily | HTML/booking systems; no documented API | Roadmap only |
 | **Gym occupancy** | None | 🔵 | Rec Sports Connect2 live counts, e.g. `https://www.connect2mycloud.com/Widgets/Data/locationCount?type=bar&key=874fbaa7-d67f-48a0-8aa5-6d4ebbdc0b08` | ~minutes | Undocumented widget endpoint; per-facility keys | Roadmap only |
 | **Campus status / closures** | None | 🔵 | `https://www.vt.edu/status.html`; impacts `https://www.facilities.vt.edu/campus-impacts.html`; closures viewer `https://experience.arcgis.com/experience/2f37a5b71b2e41c4b0f5522eddc4b262` | On change | Status page is not a clean API; ArcGIS viewer is JS-rendered | Roadmap only |
@@ -467,7 +467,7 @@ forcing GTFS. B1 and P1 are therefore closed below.
 | B7 | **Campus status / closures** | Unlocks a safety banner and route-avoidance copy | Status + active closures parsed; UI banner when active | vt.edu/status, ArcGIS |
 | B8 | **Library hours** | Unlocks a study-spot job | Hours for Newman/others; `is_open_now`, `closes_in_min` | LibCal/HTML |
 | B9 | **Gym occupancy** | Unlocks "how busy is the gym" | Live counts per facility with `observed_at` | Connect2 |
-| B10 | 🟡 **PARTIAL — Class/ICS backend** | Public search, CRN records, bounded ICS, conflicts and next-class contracts are implemented | Remaining: app endpoints/UI, schedule persistence, fixture/snapshot selection, VT GIS classroom join and explicit Banner term-assumption consent | Public Banner + user-controlled ICS |
+| B10 | 🟢 **Class search shipped** | Deterministic query parser, live Banner search with cache + rate limit, offline snapshot answers, `search_classes` agent tool, Schedule-tab search box that adds a section to the schedule | Remaining: schedule persistence per CRN, VT GIS classroom join, explicit Banner term-assumption consent | Public Banner + user-controlled ICS |
 | B11 | **Trained lateness model** | Replaces "no_model" with a defensible prediction | ≥2,000 labelled rows, MLflow run, batch scores; UI shows basis + confidence | B4 |
 | B12 | **SafeRide availability** | Unlocks a nighttime safety option | A documented data path exists; otherwise ship phone/app link only | VTPD |
 

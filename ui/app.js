@@ -18,7 +18,7 @@ const paths = {
 const icon = name => `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${paths[name] || paths.plan}"/></svg>`;
 let preferenceStorage;try{preferenceStorage=window.localStorage;}catch{}
 const preferences=loadPreferences(preferenceStorage);document.documentElement.dataset.theme=preferences.theme;let notificationMessage='',notificationBusy=false;const sentReminders=new Set();
-const state = {tab:'home',answer:null,clock:null,clockFailed:false,busy:false,error:'',query:'',review:'fits',status:null, savedClass:null, homeData:null, homeError:'',user:null,accountReady:false,accountError:'',accountData:{savedClass:null,reduceMotion:false,plans:[],events:[]},accountVersion:0,accountSaving:false};
+const state = {tab:'home',answer:null,clock:null,clockFailed:false,busy:false,error:'',query:'',review:'fits',status:null, savedClass:null, homeData:null, homeError:'',user:null,accountReady:false,accountError:'',accountData:{savedClass:null,reduceMotion:false,plans:[],events:[]},accountVersion:0,accountSaving:false,classQuery:'',classResults:null,classBusy:false,classError:''};
 let googleAuthErrorMessage = (() => {
   // Supabase reports OAuth failures by sending the browser to the Site URL with
   // error / error_code / error_description in the query (or the fragment),
@@ -110,9 +110,10 @@ document.addEventListener('submit',event=>{
  if(event.target.id==='class-form'){event.preventDefault();const fields=new FormData(event.target);const course=Object.fromEntries(['code','title','building','room','time'].map(key=>[key,String(fields.get(key)||'').trim()]));if(!course.code||!course.building)return;void saveAccount({...state.accountData,savedClass:course}).then(()=>{closeSheet();render();announce('Class saved to your account.');$('[data-action="edit-class"]')?.focus();}).catch(showAccountError);}
  if(event.target.id==='event-form'){event.preventDefault();void submitEvent(event.target);}
  if(event.target.id==='auth-form'){event.preventDefault();void submitAuth(event.target);}
+ if(event.target.id==='class-search-form'){event.preventDefault();void runClassSearch();}
 
 });
-document.addEventListener('input',event=>{if(event.target.id==='request')state.query=event.target.value;});
+document.addEventListener('input',event=>{if(event.target.id==='request')state.query=event.target.value;if(event.target.id==='class-search-input')state.classQuery=event.target.value;});
 document.addEventListener('change',event=>{if(event.target.id==='review-state')state.review=event.target.value;});
 document.addEventListener('click',event=>{
  const el=event.target.closest('button,a');if(!el)return;
@@ -120,6 +121,7 @@ document.addEventListener('click',event=>{
  if(el.dataset.prompt){state.query=el.dataset.prompt;$('#request').value=state.query;$('#request').focus();return;}
  if(el.dataset.leg!==undefined){const leg=state.answer?.itinerary?.legs?.[Number(el.dataset.leg)];if(leg)openSheet(leg.type==='eat'?leg.item:leg.type==='bus'?'Scheduled bus leg':`Walk to ${leg.to}`,`<p>${escape((preview?'Illustrative · ':'')+sourceForLeg(leg))}</p><p>${numberOrDash(leg.minutes)} minutes · ${escape(leg.method||'Method unavailable')}</p>${leg.type==='eat'?`<div class="allergen unknown">${escape(allergenLabel(leg))}</div><p>${numberOrDash(leg.kcal)} kcal · ${numberOrDash(leg.protein_g)} g protein</p>`:'<p>Check the route details before setting off.</p>'}`);return;}
  const action=el.dataset.action;
+ if(el.dataset.addClass){void addClassFromSearch(el.dataset.addClass);return;}
  if(el.dataset.theme){preferences.theme=el.dataset.theme;document.documentElement.dataset.theme=preferences.theme;savePreferences(preferenceStorage,preferences);render();$(`.theme-options [data-theme="${preferences.theme}"]`)?.focus();return;}
  if(action==='notifications'){void toggleNotifications();return;}
  if(action==='nearby-buses')locateBuses();
@@ -205,12 +207,52 @@ function events(){return state.user?state.accountData.events||[]:[];}
 const eventTime=d=>new Intl.DateTimeFormat('en-US',{hour:'numeric',minute:'2-digit'}).format(d);
 function eventRows(items){return items.map(e=>`<button class="schedule-event" data-edit-event="${escape(e.id)}"><span class="event-date">${escape(e.occurrenceStart.toLocaleDateString('en-US',{month:'short',day:'numeric'}))}<small>${escape(eventTime(e.occurrenceStart))}</small></span><span><strong>${escape(e.title)}</strong><small>${escape(e.location||'No location')} · ${escape(e.kind)}</small></span>${icon('arrow')}</button>`).join('');}
 function upcomingCard(){const items=upcoming(events());return `<section class="home-card" id="upcoming"><div class="section-title"><h2 class="eyebrow">Up next</h2><button class="text-button" data-tab="plan">Your schedule ${icon('arrow')}</button></div>${!state.user?`<p>Sign in to save classes and events.</p><button class="primary" data-action="signup">Create your account ${icon('arrow')}</button>`:items.length?eventRows(items):`<p>No upcoming events.</p><button class="primary" data-action="add-event">Add to your schedule +</button>`}</section>`;}
+const CLASS_DAY_INDEX={M:1,T:2,W:3,R:4,F:5,S:6,U:0};
+function classClock(value){const m=/^(\d{1,2}):(\d{2})/.exec(String(value||''));if(!m)return '';const h=Number(m[1]);return `${h%12===0?12:h%12}:${m[2]} ${h<12?'AM':'PM'}`;}
+function classWhen(meeting){if(!meeting||!meeting.begin)return 'Time not set (TBA)';return `${(meeting.days||[]).join('')} ${classClock(meeting.begin)}–${classClock(meeting.end)}`.trim();}
+function nextClassStart(days,begin){const m=/^(\d{1,2}):(\d{2})/.exec(String(begin||''));if(!(days||[]).length||!m)return null;const clock=campusMs()??Date.now();const now=new Date(clock);for(let i=0;i<8;i++){const day=new Date(now.getFullYear(),now.getMonth(),now.getDate()+i,Number(m[1]),Number(m[2]),0,0);if(day<=now)continue;if((days||[]).some(code=>CLASS_DAY_INDEX[code]===day.getDay()))return day;}return null;}
+function classSearchCard(){
+ const result=state.classResults;
+ const stamp=result?.snapshot?.fetched_at;
+ const provenance=result?`<p class="helper">${result.source==='banner_live'?'Virginia Tech timetable · live':'Virginia Tech timetable · captured'}${result.term_name?` · ${escape(result.term_name)}`:''}${stamp?` · as of ${escape(new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}).format(new Date(stamp)))}`:''}${result.snapshot?.is_stale?' · older capture':''}</p>`:'';
+ const rows=(result?.sections||[]).map(section=>{const meeting=(section.meetings||[])[0]||{};const where=[meeting.building,meeting.room].filter(Boolean).join(' ');return `<button class="nearby-bus-row dining-nearby-row" data-add-class="${escape(section.crn)}"><span><strong>${escape(section.subject)} ${escape(section.course_number)} · ${escape(section.title)}</strong><small>CRN ${escape(section.crn)} · ${escape(classWhen(meeting))}${where?` · ${escape(where)}`:''}</small></span><span class="departure-chips"><b class="distance-chip">${state.user?'Add':'Sign in'}</b></span></button>`;}).join('');
+ const empty=result&&!rows?`<p class="helper">${result.state==='unavailable'?escape(result.reason||'The course catalog is unavailable right now.'):'No sections matched that search.'}</p>`:'';
+ return `<section class="home-card" id="class-search"><div class="section-title"><h2 class="eyebrow">Find a class</h2></div><form id="class-search-form" class="class-form"><label>Course, subject, or CRN<input id="class-search-input" name="query" maxlength="60" autocomplete="off" placeholder="CS 3114 · 83568 · data structures" value="${escape(state.classQuery)}"></label><button class="primary" type="submit" ${state.classBusy?'disabled':''}>${state.classBusy?'Searching…':'Search'} ${icon('arrow')}</button></form>${provenance}${state.classError?`<p class="error" role="alert">${escape(state.classError)}</p>`:''}${empty}${rows}${rows?'<p class="helper">Tap a section to add it to your schedule.</p>':''}</section>`;
+}
+async function runClassSearch(){
+ const query=(state.classQuery||'').trim();
+ if(!query){state.classError='Type a course, subject, or CRN to search.';render();return;}
+ state.classBusy=true;state.classError='';render();
+ try{state.classResults=await getJSON(`/api/classes/search?q=${encodeURIComponent(query)}&limit=25`);}
+ catch(error){state.classResults=null;state.classError=error.message;}
+ finally{state.classBusy=false;render();}
+}
+async function addClassFromSearch(crn){
+ if(!state.user){authScreen('login');return;}
+ const section=(state.classResults?.sections||[]).find(s=>String(s.crn)===String(crn));
+ if(!section)return;
+ const meeting=(section.meetings||[]).find(m=>m.begin&&(m.days||[]).length);
+ if(!meeting){showAccountError(new Error('That section has no scheduled meeting time yet (TBA).'));return;}
+ const start=nextClassStart(meeting.days,meeting.begin);
+ if(!start){showAccountError(new Error('Could not work out the next meeting time for that section.'));return;}
+ const [endHour,endMinute]=String(meeting.end||meeting.begin).split(':').map(Number);
+ const end=new Date(start.getFullYear(),start.getMonth(),start.getDate(),endHour,endMinute,0,0);
+ const until=new Date(start.getFullYear(),start.getMonth(),start.getDate()+120);
+ const item={id:crypto.randomUUID(),title:`${section.subject} ${section.course_number}`,kind:'class',location:[meeting.building,meeting.room].filter(Boolean).join(' '),start:start.toISOString(),end:end.toISOString(),repeat:'weekly',repeatUntil:dateKey(until)};
+ try{
+  await saveAccount({...state.accountData,events:[...events(),item]});
+  selectedDay=dateKey(start);calendarMonth=new Date(start.getFullYear(),start.getMonth(),1);
+  announce(`${item.title} added to your schedule.`);
+  openSheet('Added to your schedule.',`<p>${escape(item.title)} · ${escape(classWhen(meeting))}${item.location?` · ${escape(item.location)}`:''}</p><p class="helper">It repeats weekly until the end of the term. Edit or delete it from the Schedule tab.</p>`);
+  render();
+ }catch(error){showAccountError(error);}
+}
 function schedulePage(){
- if(!state.user)return `${heading('','Schedule','')}${upcomingCard()}`;
+ if(!state.user)return `${heading('','Schedule','')}${upcomingCard()}${classSearchCard()}`;
  const year=calendarMonth.getFullYear(),month=calendarMonth.getMonth(),days=new Date(year,month+1,0).getDate(),offset=new Date(year,month,1).getDay();
  const monthEvents=occurrences(events(),new Date(year,month,1),new Date(year,month+1,1));
  const selected=occurrences(events(),new Date(selectedDay+'T00:00'),new Date(selectedDay+'T23:59:59'));
- return `${heading('','Schedule','')}<div class="calendar-top"><button aria-label="Previous month" data-calendar-move="-1">‹</button><h2>${calendarMonth.toLocaleDateString('en-US',{month:'long',year:'numeric'})}</h2><button aria-label="Next month" data-calendar-move="1">›</button></div><div class="calendar-grid">${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d=>`<span class="calendar-weekday">${d}</span>`).join('')}${'<span></span>'.repeat(offset)}${Array.from({length:days},(_,i)=>{const key=dateKey(new Date(year,month,i+1));return `<button data-day="${key}" aria-label="${key}" aria-pressed="${key===selectedDay}" ${key===dateKey(new Date())?'aria-current="date"':''}>${i+1}${monthEvents.some(e=>dateKey(e.occurrenceStart)===key)?'<i aria-hidden="true"></i>':''}</button>`;}).join('')}</div><div class="section-title"><button class="text-button" data-action="calendar-today">Today</button><span class="helper">Times in ${escape(Intl.DateTimeFormat().resolvedOptions().timeZone)}</span></div><button class="primary" data-action="add-event">Add class or event +</button><section class="day-agenda"><h2 class="eyebrow">${escape(new Date(selectedDay+'T12:00').toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric'}))}</h2>${selected.length?eventRows(selected):'<p class="helper">No events.</p>'}</section>`;
+ return `${heading('','Schedule','')}<div class="calendar-top"><button aria-label="Previous month" data-calendar-move="-1">‹</button><h2>${calendarMonth.toLocaleDateString('en-US',{month:'long',year:'numeric'})}</h2><button aria-label="Next month" data-calendar-move="1">›</button></div><div class="calendar-grid">${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d=>`<span class="calendar-weekday">${d}</span>`).join('')}${'<span></span>'.repeat(offset)}${Array.from({length:days},(_,i)=>{const key=dateKey(new Date(year,month,i+1));return `<button data-day="${key}" aria-label="${key}" aria-pressed="${key===selectedDay}" ${key===dateKey(new Date())?'aria-current="date"':''}>${i+1}${monthEvents.some(e=>dateKey(e.occurrenceStart)===key)?'<i aria-hidden="true"></i>':''}</button>`;}).join('')}</div><div class="section-title"><button class="text-button" data-action="calendar-today">Today</button><span class="helper">Times in ${escape(Intl.DateTimeFormat().resolvedOptions().timeZone)}</span></div><button class="primary" data-action="add-event">Add class or event +</button>${classSearchCard()}<section class="day-agenda"><h2 class="eyebrow">${escape(new Date(selectedDay+'T12:00').toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric'}))}</h2>${selected.length?eventRows(selected):'<p class="helper">No events.</p>'}</section>`;
 }
 function eventEditor(id){if(!state.user){authScreen('login');return;}const e=events().find(e=>e.id===id);openSheet(e?'Your event.':'Make it a date.',`<form id="event-form" class="class-form" data-id="${escape(e?.id||'')}"><label>Title<input name="title" required maxlength="100" value="${escape(e?.title||'')}" placeholder="CS 2506, study group, lunch…"></label><label>Type<select name="kind"><option ${e?.kind==='class'?'selected':''} value="class">Class</option><option ${e?.kind==='event'?'selected':''} value="event">Event</option></select></label><label>Location<input name="location" maxlength="150" value="${escape(e?.location||'')}" placeholder="Building, room, or meeting spot"></label><label>Starts<input name="start" type="datetime-local" required value="${e?localInput(e.start):selectedDay+'T09:00'}"></label><label>Ends<input name="end" type="datetime-local" required value="${e?localInput(e.end):selectedDay+'T10:00'}"></label><label>Repeat<select name="repeat"><option value="none">Does not repeat</option><option value="weekly" ${e?.repeat==='weekly'?'selected':''}>Every week on this day</option></select></label><label>Repeat through<input type="date" name="repeatUntil" value="${escape(e?.repeatUntil||'')}"></label><p class="helper">Times use ${escape(Intl.DateTimeFormat().resolvedOptions().timeZone)}. Editing a weekly event changes the whole series.</p><p class="error" id="event-error" role="alert" hidden></p><button class="primary" type="submit">Save event ${icon('check')}</button>${e?.location?`<button class="text-button" type="button" data-dining-place="${escape(e.location)}">Get directions ${icon('pin')}</button>`:''}${e?`<button class="text-button" type="button" data-delete-event="${escape(e.id)}">Delete ${e.repeat==='weekly'?'series':'event'}</button>`:''}</form>`);}
 async function submitEvent(form){const f=Object.fromEntries(new FormData(form));const start=new Date(f.start),end=new Date(f.end);const error=$('#event-error');if(!f.title.trim()||!Number.isFinite(+start)||!Number.isFinite(+end)||end<=start||f.repeat==='weekly'&&(!f.repeatUntil||f.repeatUntil<f.start.slice(0,10))){error.hidden=false;error.textContent='Add a title, an end time after the start, and an end date for weekly events.';return;}const button=form.querySelector('[type=submit]');button.disabled=true;const item={id:form.dataset.id||crypto.randomUUID(),title:f.title.trim(),kind:f.kind,location:f.location.trim(),start:start.toISOString(),end:end.toISOString(),repeat:f.repeat,repeatUntil:f.repeat==='weekly'?f.repeatUntil:null};try{await saveAccount({...state.accountData,events:[...events().filter(e=>e.id!==item.id),item]});selectedDay=dateKey(start);calendarMonth=new Date(start.getFullYear(),start.getMonth(),1);closeSheet();render();announce('Schedule saved.');}catch(e){error.hidden=false;error.textContent=e.message;}finally{button.disabled=false;}}

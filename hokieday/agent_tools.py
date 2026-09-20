@@ -14,11 +14,12 @@ from datetime import date, datetime, time, timedelta
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from . import config, tools, weather
+from . import classes, config, tools, weather
 
 MAX_TOOL_ARGUMENT_BYTES = 8_192
 MAX_TOOL_OUTPUT_BYTES = 24_000
 MAX_SCHEDULE_ITEMS = 200
+_CATALOG_MAX_AGE_S = 6 * 3600   # when a course capture starts being called stale
 _MAX_STRING = 300
 _CAMPUS_TZ = ZoneInfo(config.CAMPUS_TZ)
 _COORD_KEYS = frozenset({"lat", "lon", "coords", "from_coords", "to_coords",
@@ -281,6 +282,65 @@ def _window_row(start: datetime, end: datetime) -> dict:
         "start_time": start.strftime("%-I:%M %p"),
         "end_time": end.strftime("%-I:%M %p"),
         "minutes": round((end - start).total_seconds() / 60, 1),
+    }
+
+
+def _classes_handler(args: dict, context: AgentContext) -> dict:
+    """Search the VT course catalog from committed Banner captures.
+
+    Snapshot-only on purpose: the live Banner POST lives in app/class_search.py
+    (the package never talks to the network), and the agent answers must stay
+    deterministic and offline-testable. The capture time is always reported so
+    a student can tell this is a catalogue as of that moment, not a live
+    registration system.
+    """
+    text = str(args.get("query") or "").strip()[:60]
+    filters = classes.query_filters(text) if text else {}
+    paths = sorted(config.FIXTURES_DIR.glob("classes_snapshot_*.json"))
+    limit = 5
+    if not paths:
+        return {"state": "unavailable", "query": text,
+                "sections": [], "reason": "No course catalog is available.",
+                "source": "banner_public_snapshot"}
+    envelope = classes.search_from_snapshots(
+        paths, filters=filters, query_text=text, limit=limit,
+        max_age_s=_CATALOG_MAX_AGE_S, now=context.now)
+    if envelope.get("state") == "unavailable":
+        return {"state": "unavailable", "query": text, "sections": [],
+                "reason": envelope.get("reason", "No course catalog is available."),
+                "source": "banner_public_snapshot"}
+    rows = []
+    for section in envelope.get("sections", [])[:limit]:
+        meetings = section.get("meetings") or []
+        first = meetings[0] if meetings else {}
+        rows.append({
+            "crn": section.get("crn"),
+            "course": f"{section.get('subject')} {section.get('course_number')}",
+            "title": section.get("title"),
+            "instructor": section.get("instructor") or None,
+            "days": first.get("days"),
+            "start": first.get("begin"),
+            "end": first.get("end"),
+            "building": first.get("building"),
+            "room": first.get("room"),
+            "is_tba": bool(first.get("is_tba")),
+        })
+    snapshot = envelope.get("snapshot") or {}
+    return {
+        "state": "results" if rows else "no_results",
+        "query": text,
+        "term": envelope.get("term"),
+        "term_name": envelope.get("term_name"),
+        "count": len(rows),
+        "truncated": bool(envelope.get("truncated")),
+        "sections": rows,
+        "catalog": {
+            "captured_at": snapshot.get("fetched_at"),
+            "age_seconds": snapshot.get("age_seconds"),
+            "is_stale": snapshot.get("is_stale"),
+            "note": "public VT timetable capture, not a live registration system",
+        },
+        "source": "banner_public_snapshot",
     }
 
 
@@ -553,6 +613,9 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         _obj({"location": _string(max_length=60),
               "foodpro_id": _string(max_length=10)}),
         _hours_handler),
+    ToolSpec(
+        "search_classes", "Search the Virginia Tech course catalog for sections by course (\"CS 3114\"), subject (\"CS\"), CRN, or words in the title (\"data structures\"). Use this for the catalog; use get_campus_schedule for the student's OWN saved classes.",
+        _obj({"query": _string(max_length=60)}, ("query",)), _classes_handler),
 )
 
 

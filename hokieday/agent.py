@@ -148,6 +148,8 @@ def _has_content(execution: ToolExecution) -> bool:
     if name == "plan_day":
         # An infeasible plan is still usable: its own rationale explains why.
         return bool(data.get("itinerary")) or data.get("feasible") is False
+    if name == "search_classes":
+        return bool(data.get("sections"))
     return True
 
 

@@ -904,6 +904,45 @@ def search(
     return out
 
 
+def query_filters(text: str | None) -> dict[str, Any]:
+    """Map what a student types to :func:`search` filters.
+
+    Handles the shapes people actually type::
+
+        "CS 3114", "cs3114", "CS-3114"   -> subject + course number
+        "83568"                          -> a CRN
+        "CS"                             -> subject (all levels)
+        "3114"                           -> course number
+        "data structures"                -> title words
+        "CS 3114 data structures"        -> subject + number + title
+
+    Never guesses silently: anything unrecognised becomes a title search, and
+    the caller can read the returned filters to say what it looked for.
+    """
+    raw = " ".join(str(text or "").split())
+    if not raw:
+        return {}
+    # VT CRNs are five digits and course numbers are three or four, so length
+    # (not is_valid_crn alone) decides which a bare number is.
+    if re.fullmatch(r"\d{5}", raw):
+        return {"crn": raw}
+    head = re.match(r"^([A-Za-z]{2,8})\s*-?\s*(\d{3,4}[A-Za-z]?)\b\s*(.*)$", raw)
+    if head:
+        filters = {"subject": head.group(1).upper(),
+                   "course_number": head.group(2).upper()}
+        rest = (head.group(3) or "").strip()
+        if rest:
+            filters["title_contains"] = rest
+        return filters
+    if re.fullmatch(r"\d{3,4}[A-Za-z]?", raw):
+        return {"course_number": raw.upper()}
+    # A bare short token is a subject only when it is obviously meant as one:
+    # three letters or fewer, or typed in capitals ("CS", "ECE", "MATH").
+    if re.fullmatch(r"[A-Za-z]{2,8}", raw) and (len(raw) <= 3 or raw.isupper()):
+        return {"subject": raw.upper()}
+    return {"title_contains": raw}
+
+
 @dataclass(frozen=True)
 class SelectionResult:
     found: tuple[ClassSection, ...]
@@ -2517,6 +2556,80 @@ def search_result_json(
         "errors": list(parse.errors),
         "ui_states": list(UI_STATES),
     }
+
+
+def find_snapshots(paths: Iterable[str | Path],
+                   term: str | None = None) -> list[TimetableSnapshot]:
+    """Loadable captures for `term` (any term when None), newest capture first."""
+    out: list[TimetableSnapshot] = []
+    for path in paths:
+        try:
+            snapshot = load_snapshot(path)
+        except (ValueError, OSError):
+            continue
+        if term and snapshot.term != str(term):
+            continue
+        out.append(snapshot)
+    out.sort(key=lambda s: s.fetched_at, reverse=True)
+    return out
+
+
+def search_from_snapshots(
+    paths: Iterable[str | Path],
+    *,
+    filters: dict[str, Any] | None = None,
+    term: str | None = None,
+    query_text: str = "",
+    limit: int = 50,
+    max_age_s: float = 6 * 3600,
+    now: datetime | None = None,
+) -> dict:
+    """Answer a search from committed captures only. Never touches a network.
+
+    Captures are per query (one subject, or one course), so every file for the
+    term is searched and sections are de-duplicated by CRN with the freshest
+    copy winning -- otherwise a CS-only capture would answer a MATH query with
+    an empty list and look like "no such course".
+
+    The response is :func:`search_result_json` with one addition: sections are
+    capped at ``limit`` and ``truncated`` says whether anything was dropped. A
+    term with no capture returns ``state="unavailable"`` and a ``reason``.
+    """
+    want = dict(filters or {})
+    snapshots = find_snapshots(paths, term)
+    if not snapshots:
+        return {
+            "schema": SCHEMA_SEARCH,
+            "term": str(term or ""),
+            "term_name": term_name(str(term)) if term else "",
+            "query": {"q": query_text, **want} if query_text else want,
+            "state": "unavailable",
+            "count": 0,
+            "sections": [],
+            "reason": ("no committed capture for "
+                       f"{term_name(str(term)) if term else 'that term'}"
+                       + (f" ({term})" if term else "")),
+        }
+    sections: list[ClassSection] = []
+    seen: set[str] = set()
+    for snapshot in snapshots:
+        for section in snapshot_sections(snapshot).sections:
+            if section.crn in seen:
+                continue
+            seen.add(section.crn)
+            sections.append(section)
+    newest = snapshots[0]
+    hits = search(sections, **want)
+    parse = TimetableParse(term=newest.term, sections=tuple(hits),
+                           snapshot_id=newest.snapshot_id)
+    envelope = search_result_json(
+        parse, newest,
+        query={"q": query_text, **want} if query_text else want,
+        max_age_s=max_age_s, now=now)
+    envelope["snapshot_ids"] = [s.snapshot_id for s in snapshots]
+    envelope["truncated"] = len(hits) > limit
+    envelope["sections"] = envelope["sections"][:limit]
+    return envelope
 
 
 def schedule_json(

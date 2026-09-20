@@ -43,6 +43,9 @@ feasibility, or weakens safety constraints.
 6. `get_next_departures`: service-filtered static schedule.
 7. `find_food`: FoodPro search with immutable hard diet/allergen/kcal filters.
 8. `get_hours`: FoodPro opening windows.
+9. `search_classes`: public VT timetable search (course, subject, CRN, or title
+   words) over committed Banner captures, always reporting the capture time so
+   the catalog is never presented as live registration data.
 
 Model arguments cannot contain URLs, shell commands, file paths, arbitrary
 properties, student IDs, raw schedules, or coordinates. Request-scoped schedule

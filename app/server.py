@@ -121,6 +121,7 @@ from hokieday.agent_tools import AgentContext  # noqa: E402
 # where `from . import x` raises "attempted relative import with no known parent
 # package". REPO is on sys.path just above, so `app` resolves either way -- as a
 # namespace package when run as a script, and as app.server when tests import it.
+from app import class_search  # noqa: E402
 from app import mapview  # noqa: E402
 from app import ui_files  # noqa: E402
 from app.gemini_provider import GeminiProvider  # noqa: E402
@@ -1522,6 +1523,26 @@ class Handler(BaseHTTPRequestHandler):
             # cannot leak another session's coordinates or race the iteration.
             self._json([{"key": k, "verified": bool(v.get("verified"))}
                         for k, v in config.static_places()])
+            return
+        if path == "/api/classes/search":
+            params = {key: values[0] for key, values in query.items()}
+            # Course numbers are three or four digits; a five-digit bare number
+            # is a CRN and query_filters already decided that. Clamp everything
+            # so a hand-written request cannot ask Banner for the whole term.
+            try:
+                limit = int(params.get("limit") or 25)
+            except ValueError:
+                limit = 25
+            days = [d for d in (params.get("days") or "").replace(" ", "").split(",") if d]
+            self._json(class_search.search(
+                params.get("q") or params.get("query") or "",
+                term=(params.get("term") or "").strip() or None,
+                subject=(params.get("subject") or "").strip() or None,
+                course_number=(params.get("number") or params.get("course_number") or "").strip() or None,
+                crn=(params.get("crn") or "").strip() or None,
+                days=days or None,
+                limit=max(1, min(limit, class_search.MAX_RESULTS)),
+                now=config.now()))
             return
         if path == "/api/dining/places":
             self._json(ui_files.dining_places_endpoint())
