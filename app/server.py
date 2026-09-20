@@ -1293,7 +1293,8 @@ class Handler(BaseHTTPRequestHandler):
         # One guard for every account route: with the optional auth packages
         # missing, answer 503 with the install hint rather than raising from an
         # unwrapped call site and killing the connection.
-        if path.startswith("/api/auth/") and not AUTH_AVAILABLE:
+        if (path.startswith("/api/auth/") or path == "/api/account/data") \
+                and not AUTH_AVAILABLE:
             self._json({"error": "accounts are unavailable; install the optional "
                                  "dependencies with 'pip install -r requirements.txt'",
                         "status": "unavailable",
@@ -1378,12 +1379,54 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json({"error": "not found"}, 404)
 
+    def _account_save(self) -> None:
+        """Save account data. Shared by POST (kept) and PUT (what the UI sends).
+
+        ui/app.js calls `PUT /api/account/data`, while this server originally
+        implemented the route only inside do_POST and defined no do_PUT at all.
+        BaseHTTPRequestHandler then answered the UI's request with a bare 501 and
+        closed the connection, so saving a class, a plan or a schedule event
+        failed in the deployed app while working against serve.py (which does
+        implement do_PUT). One implementation now serves both verbs.
+        """
+        if not AUTH_AVAILABLE:
+            self._json({"error": "accounts are unavailable; install the optional "
+                                 "dependencies with 'pip install -r requirements.txt'",
+                        "status": "unavailable",
+                        "detail": AUTH_UNAVAILABLE_REASON}, 503)
+            return
+        try:
+            user = require_auth({"Authorization": self.headers.get("Authorization"),
+                                 "Cookie": self.headers.get("Cookie")})
+        except PermissionError:
+            self._json({"error": "authentication required"}, 401)
+            return
+        payload = self._read_json()
+        host = self.headers.get("Host", "")
+        origin = self.headers.get("Origin")
+        same_origin = origin in (None, f"https://{host}", f"http://{host}")
+        if not same_origin or self.headers.get("X-HokieFlow-Request") != "1":
+            self._json({"error": "forbidden"}, 403)
+            return
+        result, code = ui_files.save_account(user, payload.get("data"),
+                                             payload.get("version"))
+        self._json(result, code)
+
+    def do_PUT(self) -> None:                 # noqa: N802
+        """Only the one PUT route the client uses; 404 for anything else."""
+        path = self.path.split("?")[0]
+        if path == "/api/account/data":
+            self._account_save()
+            return
+        self._json({"error": "not found"}, 404)
+
     def do_POST(self) -> None:                # noqa: N802
         path = self.path.split("?")[0]
         # One guard for every account route: with the optional auth packages
         # missing, answer 503 with the install hint rather than raising from an
         # unwrapped call site and killing the connection.
-        if path.startswith("/api/auth/") and not AUTH_AVAILABLE:
+        if (path.startswith("/api/auth/") or path == "/api/account/data") \
+                and not AUTH_AVAILABLE:
             self._json({"error": "accounts are unavailable; install the optional "
                                  "dependencies with 'pip install -r requirements.txt'",
                         "status": "unavailable",
@@ -1418,20 +1461,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"user": None}, 200)
             return
         if path == "/api/account/data":
-            try:
-                user = require_auth({"Authorization": self.headers.get("Authorization"), "Cookie": self.headers.get("Cookie")})
-            except PermissionError:
-                self._json({"error": "authentication required"}, 401)
-                return
-            payload = self._read_json()
-            host = self.headers.get("Host", "")
-            origin = self.headers.get("Origin")
-            same_origin = origin in (None, f"https://{host}", f"http://{host}")
-            if not same_origin or self.headers.get("X-HokieFlow-Request") != "1":
-                self._json({"error": "forbidden"}, 403)
-                return
-            result, code = ui_files.save_account(user, payload.get("data"), payload.get("version"))
-            self._json(result, code)
+            self._account_save()
             return
         if path == "/api/auth/google":
             payload = self._read_json()

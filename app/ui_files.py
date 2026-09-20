@@ -41,13 +41,11 @@ _ASSET_TYPES = {
     "directions.js": "text/javascript; charset=utf-8",
     "preferences.js": "text/javascript; charset=utf-8",
     "buildings.js": "text/javascript; charset=utf-8",
-    "vt-gis.js": "text/javascript; charset=utf-8",
 }
 
 _CACHEABLE = {"styles.css", "app.js", "config.js", "model.js", "fixtures.js",
               "home-live.js", "bus-location.js", "dining.js", "schedule.js",
-              "directions.js", "preferences.js", "buildings.js",
-              "vt-gis.js"}
+              "directions.js", "preferences.js", "buildings.js"}
 
 
 def _make_permit() -> vtgis.RedistributionPermit | None:
@@ -164,29 +162,32 @@ def save_account(user: object, data: object, version: object) -> tuple[dict, int
 def dining_places_endpoint() -> dict:
     """Curated campus dining directory (CONNECTING.md contract).
 
-    The planner's place registry already carries the curated coordinates the
-    trip planner uses, so the UI browses exactly the places plans can route
-    to. Menus/allergens stay in /api/ask results; this list never fabricates
-    hours or open-now state it does not have.
+    Source is hokieday.dining_places -- the curated DINING list -- not
+    config.static_places(), which is the PLANNER's registry of routable places
+    (Burruss Hall, Stop 1600, ...). Serving the planner registry here put
+    non-dining buildings on the dining screens, and it omits `building`, so each
+    card's subtitle fell back to a generic string.
+
+    Coordinates are published building reference points, not entrances; the
+    browser computes straight-line distances. Hours/open-now and menus are
+    deliberately absent rather than guessed.
     """
+    from hokieday import dining_places as directory
+    payload = directory.dining()
     places = []
-    for key, row in config.static_places():
-        name = str(key)
-        low = name.lower()
-        category = ("dining-hall" if ("d2" in low or "dietrick" in low
-                                      or "owens" in low or "west end" in low)
-                    else "cafe" if ("coffee" in low or "cafe" in low)
-                    else "market" if "market" in low else "dining")
+    for row in payload.get("places") or []:
         places.append({
-            "id": name,
-            "name": name,
-            "category": category,
+            "id": row.get("name"),
+            "name": row.get("name"),
+            "building": row.get("building"),
             "lat": row.get("lat"),
             "lon": row.get("lon"),
-            # Omitted, never guessed: no fabricated hours/description here.
+            "source_url": row.get("source_url"),
+            "category": "dining",
         })
-    return {"places": places, "note": ("coordinates match the planner place "
-            "registry; verified flags are deliberate")}
+    return {"places": places, "source": payload.get("source"),
+            "note": ("curated dining directory; coordinates are building "
+                     "reference points, distances are straight-line estimates")}
 
 
 def transit_stops_endpoint() -> dict:
@@ -203,9 +204,38 @@ def transit_stops_endpoint() -> dict:
 
 
 def transit_departures_endpoint(stop_id: str) -> dict:
-    """Departure board rows for one stop, service-filtered (schedule truth)."""
+    """Departure board rows for one stop, service-filtered (schedule truth).
+
+    The row field names are the UI's contract (`departure_at`, `route`,
+    `stop_id`, `pattern`), not the planner tool's (`dep_time`, `route_id`,
+    `head_sign`). ui/home-live.js parses `departure_at` and groups on `route`,
+    so returning the tool's names meant every row parsed to NaN and the board
+    rendered empty even when departures existed.
+
+    Only real source values are mapped. `pattern` carries the head sign (the
+    destination text the source publishes); `destination_loop` is left to the
+    caller because the schedule feed does not state a loop colour.
+    """
     result = tools.get_next_departures(str(stop_id or ""))
-    return {"stop_id": result.get("stop_id"), "departures": result.get("departures", []),
+    stop_name = None
+    try:
+        stop = tools._src(None)._g().stops.get(str(stop_id))
+        stop_name = getattr(stop, "name", None)
+    except Exception:                                        # noqa: BLE001
+        stop_name = None
+    rows = []
+    for row in result.get("departures") or []:
+        rows.append({
+            "stop_id": row.get("stop_id"),
+            "stop_name": stop_name,
+            "route": row.get("route_id"),
+            "departure_at": row.get("dep_time"),
+            "pattern": row.get("head_sign"),
+            "trip_id": row.get("trip_id"),
+            "in_min": row.get("in_min"),
+            "is_realtime": row.get("is_realtime"),
+        })
+    return {"stop_id": result.get("stop_id"), "departures": rows,
             "reason": result.get("reason")}
 
 
