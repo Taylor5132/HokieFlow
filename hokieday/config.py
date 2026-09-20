@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,10 @@ DATA_DIR = Path(os.environ.get("HOKIEDAY_DATA", REPO_DIR / "data"))
 # ---------------------------------------------------------------- demo mode
 # "live"  -> hit the network, write through to cache/, fall back to stale cache
 # "cache" -> never touch the network; read the FROZEN fixtures/ only
+# unittest is an offline-only consumer. Pin its default before any gitignored
+# `.env` can accidentally opt a developer's test process into paid/live calls.
+if "unittest" in sys.modules:
+    os.environ.setdefault("DEMO_MODE", "cache")
 DEMO_MODE = os.environ.get("DEMO_MODE", "live").strip().lower()
 CACHE_ONLY = DEMO_MODE == "cache"
 
