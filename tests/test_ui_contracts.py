@@ -14,6 +14,7 @@ import json
 import os
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("DEMO_MODE", "cache")   # must precede hokieday imports
 
@@ -526,3 +527,128 @@ class OAuthHostContract(unittest.TestCase):
         source = (REPO / "ui" / "app.js").read_text(encoding="utf-8")
         self.assertIn("escape(googleAuthErrorMessage)", source,
                       "auth_error must be rendered, not captured and dropped")
+
+
+class AuthSessionContract(unittest.TestCase):
+    """What the browser is handed after a successful sign-in.
+
+    ui/app.js renders `Hi, ${state.user.name}` and takes `name[0]` for the
+    avatar, but /api/auth/me used to answer with the id and email only, so a
+    signed-in account rendered as "Hi, undefined" and the account panel threw.
+    Sign-in also finishes inside a redirect, which leaves no visible failure:
+    /api/status therefore publishes stage counters for it.
+    """
+
+    SECRET = "contract-test-secret-0123456789abcdef"
+
+    @classmethod
+    def setUpClass(cls):
+        import threading
+        from http.server import ThreadingHTTPServer
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def _call(self, method, path, payload=None, cookie=None):
+        import http.client
+        headers = {"Content-Type": "application/json"}
+        if cookie:
+            headers["Cookie"] = cookie
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
+        conn.request(method, path,
+                     body=json.dumps(payload) if payload is not None else None,
+                     headers=headers)
+        response = conn.getresponse()
+        headers_out = dict(response.getheaders())
+        raw = response.read()
+        conn.close()
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            body = raw
+        return response.status, headers_out, body
+
+    def _signed_cookie(self, payload):
+        """The documented cookie format: base64url(json).hmac_sha256(secret)."""
+        import base64
+        import hashlib
+        import hmac
+        body = base64.urlsafe_b64encode(
+            json.dumps(payload, separators=(",", ":"),
+                       sort_keys=True).encode()).rstrip(b"=").decode()
+        signature = base64.urlsafe_b64encode(
+            hmac.new(self.SECRET.encode(), body.encode(),
+                     hashlib.sha256).digest()).rstrip(b"=").decode()
+        return f"hokieflow_session={body}.{signature}"
+
+    @unittest.skipIf(not server.AUTH_AVAILABLE,
+                     "auth needs supabase + python-dotenv (pip install -r requirements.txt)")
+    def test_me_carries_the_display_name_the_client_renders(self):
+        payload = {
+            "access_token": "jwt",
+            "expires_at": "2999-01-01T00:00:00+00:00",
+            "user": {"id": "u1", "email": "student@vt.edu", "name": "A Student",
+                     "picture": "https://example.test/a.png", "provider": "google"},
+        }
+        with mock.patch.dict(os.environ, {"SESSION_SECRET": self.SECRET}):
+            status, _, body = self._call("GET", "/api/auth/me",
+                                         cookie=self._signed_cookie(payload))
+        self.assertEqual(status, 200)
+        self.assertEqual(body["user"]["name"], "A Student",
+                         "the greeting and avatar initial read user.name")
+        self.assertEqual(body["user"]["email"], "student@vt.edu")
+
+    @unittest.skipIf(not server.AUTH_AVAILABLE,
+                     "auth needs supabase + python-dotenv (pip install -r requirements.txt)")
+    def test_a_forged_session_cookie_is_still_refused(self):
+        payload = {"access_token": "jwt", "user": {"id": "u1", "email": "x@vt.edu"}}
+        forged = self._signed_cookie(payload).replace("hokieflow_session=",
+                                                      "hokieflow_session=") + "x"
+        with mock.patch.dict(os.environ, {"SESSION_SECRET": self.SECRET}):
+            status, _, body = self._call("GET", "/api/auth/me", cookie=forged)
+        self.assertEqual(status, 200)
+        self.assertIsNone(body["user"])
+
+    def test_user_ref_keeps_a_name_from_a_raw_provider_object(self):
+        class RawUser:
+            id = "u2"
+            email = "raw@vt.edu"
+            user_metadata = {"full_name": "Raw Student"}
+            app_metadata = {"provider": "google"}
+
+        self.assertEqual(ui_files.user_ref(RawUser())["name"], "Raw Student")
+        self.assertEqual(ui_files.user_ref({"id": "u3", "email": "netid@vt.edu"})["name"],
+                         "netid", "no display name still yields what the greeting needs")
+
+    def test_registration_without_a_session_does_not_sign_anyone_in(self):
+        """Supabase returns a user but no session until the email is confirmed."""
+        fake = lambda email, password: {"user": {"id": "u4", "email": email},
+                                        "session": None}  # noqa: E731
+        with mock.patch.object(server, "AUTH_AVAILABLE", True), \
+                mock.patch.object(server, "register_user", fake):
+            status, headers, body = self._call("POST", "/api/auth/register",
+                                               {"email": "new@vt.edu",
+                                                "password": "a-long-enough-password"})
+        self.assertEqual(status, 201)
+        self.assertNotIn("Set-Cookie", headers,
+                         "no session token means no signed-in cookie")
+        self.assertIn("message", body)
+
+    def test_status_publishes_the_sign_in_funnel_without_secrets(self):
+        status, _, body = self._call("GET", "/api/status")
+        self.assertEqual(status, 200)
+        auth = body["auth"]
+        self.assertIn("available", auth)
+        self.assertIn("canonical_origin", auth)
+        for stage in ("oauth_started", "callback_reached", "state_ok",
+                      "exchange_ok", "session_accepted"):
+            self.assertIn(stage, auth["funnel"], "sign-in must be observable")
+        text = json.dumps(auth).lower()
+        self.assertNotIn("token", text)
+        self.assertNotIn("secret", text)

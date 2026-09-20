@@ -4,6 +4,7 @@ import hmac
 import json
 import os
 import secrets
+import threading
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
@@ -14,6 +15,36 @@ SESSION_COOKIE_NAME = "hokieflow_session"
 OAUTH_STATE_COOKIE_NAME = "hokieflow_oauth_state"
 SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 7
 GOOGLE_CALLBACK_PATH = "/api/auth/google/callback"
+
+# ---------------------------------------------------------------------------
+# OAuth funnel
+#
+# Sign-in failures happen inside a redirect, so the browser lands on the home
+# screen looking signed out whatever went wrong: the state cookie was never
+# sent, Supabase rejected the code, or /api/auth/me never saw a session. These
+# counters record which stage each attempt reached. They are exposed through
+# /api/status: counters only, never codes, tokens, or error text.
+# ---------------------------------------------------------------------------
+
+_FUNNEL_LOCK = threading.Lock()
+_FUNNEL: dict[str, int] = {
+    "oauth_started": 0,
+    "callback_reached": 0,
+    "state_ok": 0,
+    "exchange_ok": 0,
+    "session_accepted": 0,
+}
+
+
+def _bump(stage: str) -> None:
+    with _FUNNEL_LOCK:
+        _FUNNEL[stage] = _FUNNEL.get(stage, 0) + 1
+
+
+def funnel() -> dict[str, int]:
+    """A copy of the sign-in stage counters (safe to publish)."""
+    with _FUNNEL_LOCK:
+        return dict(_FUNNEL)
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +266,11 @@ def _user_to_dict(user: Any) -> dict[str, Any]:
     }
 
 
+def to_session_user(user: Any) -> dict[str, Any]:
+    """The compact user shape the session cookie and the UI both carry."""
+    return _user_to_dict(user)
+
+
 def _user_from_token(token: str) -> Optional[dict[str, Any]]:
     """Ask Supabase whether an access token is valid and who it belongs to."""
     try:
@@ -282,11 +318,13 @@ def require_auth(headers: Optional[Mapping[str, Any]]) -> dict[str, Any]:
 
     user = session.get("user")
     if isinstance(user, dict) and user.get("id"):
+        _bump("session_accepted")
         return user
 
     token = session.get("access_token")
     user = _user_from_token(token) if token else None
     if user:
+        _bump("session_accepted")
         return user
 
     raise PermissionError("Authentication required.")
@@ -376,6 +414,7 @@ def start_google_oauth(request_state: Optional[Mapping[str, Any]] = None) -> str
         "code_challenge": _pkce_challenge(_pkce_verifier(state_value)),
         "code_challenge_method": "s256",
     }
+    _bump("oauth_started")
     return f"{_supabase_url()}/auth/v1/authorize?{urllib.parse.urlencode(query)}"
 
 
@@ -388,6 +427,7 @@ def handle_google_oauth_callback(
     request_state: Optional[Mapping[str, Any]] = None,
 ):
     params = dict(callback_params or {})
+    _bump("callback_reached")
     if params.get("error"):
         raise ValueError(str(params.get("error_description") or params["error"]))
     code = params.get("code")
@@ -399,6 +439,7 @@ def handle_google_oauth_callback(
     state_value = (request_state or {}).get("state")
     if not state_value:
         raise ValueError("Missing OAuth state. Please start the sign-in again.")
+    _bump("state_ok")
 
     client = get_supabase_client()
     try:
@@ -408,6 +449,7 @@ def handle_google_oauth_callback(
         })
     except Exception as exc:
         raise ValueError(str(exc)) from exc
+    _bump("exchange_ok")
 
     supa_session = _get(response, "session")
     supa_user = _get(response, "user") or _get(supa_session, "user")

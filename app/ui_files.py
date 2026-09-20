@@ -83,10 +83,36 @@ def serve(path: str) -> tuple[int, bytes, str, list[tuple[str, str]]] | None:
 # --------------------------------------------------------------------------- #
 
 def user_ref(user: object) -> dict:
-    """Compact, stable identity for UI state (never the raw provider object)."""
+    """Compact identity for UI state (never the raw provider object).
+
+    The client renders `Hi, ${user.name}` and takes `user.name[0]` for the
+    avatar, so the display name has to survive here. Accepts either the
+    normalized dict auth.py builds or a raw Supabase user object.
+    """
     if isinstance(user, dict):
-        return {"id": user.get("id"), "email": user.get("email")}
-    return {"id": getattr(user, "id", None), "email": getattr(user, "email", None)}
+        metadata = user.get("user_metadata") or {}
+        app_metadata = user.get("app_metadata") or {}
+        email = user.get("email")
+        return {
+            "id": user.get("id"),
+            "email": email,
+            "name": (user.get("name") or metadata.get("full_name")
+                     or metadata.get("name")
+                     or (email.split("@", 1)[0] if email else None)),
+            "picture": user.get("picture") or metadata.get("avatar_url") \
+                or metadata.get("picture"),
+            "provider": user.get("provider") or app_metadata.get("provider"),
+        }
+    metadata = getattr(user, "user_metadata", None) or {}
+    email = getattr(user, "email", None)
+    return {
+        "id": getattr(user, "id", None),
+        "email": email,
+        "name": metadata.get("full_name") or metadata.get("name") \
+            or (email.split("@", 1)[0] if email else None),
+        "picture": metadata.get("avatar_url") or metadata.get("picture"),
+        "provider": (getattr(user, "app_metadata", None) or {}).get("provider"),
+    }
 
 
 def enrich_account(body: dict, user: object) -> dict:

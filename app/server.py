@@ -61,6 +61,8 @@ try:                                                          # noqa: SIM105
         clear_oauth_state_cookie,
         clear_session_cookie,
         canonical_origin,
+        funnel,
+        to_session_user,
         get_oauth_state_cookie,
         get_session_cookie,
         handle_google_oauth_callback,
@@ -90,6 +92,13 @@ except Exception as _auth_exc:                                 # noqa: BLE001
 
     clear_oauth_state_cookie = _auth_unavailable
     canonical_origin = lambda *a, **k: None  # noqa: E731
+    to_session_user = _auth_unavailable
+
+    def funnel(*_args, **_kwargs):
+        """Same shape as auth.funnel() so diagnostics stay stable."""
+        return {stage: 0 for stage in ("oauth_started", "callback_reached",
+                                       "state_ok", "exchange_ok",
+                                       "session_accepted")}
     clear_session_cookie = _auth_unavailable
     get_oauth_state_cookie = _auth_unavailable
     get_session_cookie = _auth_unavailable
@@ -1014,6 +1023,32 @@ def _client_agent_budget_available(client_ip: str) -> bool:
         return True
 
 
+def _session_payload(auth_response) -> dict:
+    """The session cookie payload for an email/password sign-in.
+
+    Returns {} when Supabase created no session (a sign-up that still needs
+    email confirmation, for example), so a caller never mints a signed-in
+    cookie without one. The user is embedded the way the Google callback does
+    it, so /api/auth/me does not depend on a Supabase round trip that can fail
+    quietly and leave the browser looking signed out.
+    """
+    if not isinstance(auth_response, dict):
+        return {}
+    session = auth_response.get("session") or {}
+    if not isinstance(session, dict) or not session.get("access_token"):
+        return {}
+    payload = {
+        "access_token": session.get("access_token"),
+        "refresh_token": session.get("refresh_token"),
+        "expires_at": session.get("expires_at") or "",
+        "provider": "email",
+    }
+    account = auth_response.get("user")
+    if account is not None:
+        payload["user"] = to_session_user(account)
+    return payload
+
+
 def configured_agent_provider():
     """Build the opt-in live provider from environment configuration.
 
@@ -1217,6 +1252,11 @@ def status() -> dict:
             "model": configured_model,
             "fallback": "bounded_parser",
             "reason": agent_reason,
+        },
+        "auth": {
+            "available": AUTH_AVAILABLE,
+            "canonical_origin": canonical_origin(),
+            "funnel": funnel(),
         },
         "assumptions": {
             "eat_minutes": tools.EAT_MINUTES,
@@ -1578,8 +1618,16 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._read_json()
             try:
                 user = register_user(payload.get("email"), payload.get("password"))
-                session_cookie = set_session_cookie({"access_token": user.get("session", {}).get("access_token"), "refresh_token": user.get("session", {}).get("refresh_token"), "expires_at": user.get("session", {}).get("expires_at") or ""})
-                self._json({"user": user.get("user")}, 201, [("Set-Cookie", session_cookie)])
+                session = _session_payload(user)
+                session_cookie = set_session_cookie(session) if session else ""
+                response = {"user": ui_files.user_ref(user.get("user"))}
+                if session_cookie:
+                    self._json(response, 201, [("Set-Cookie", session_cookie)])
+                else:
+                    # Confirmation pending: no session yet, so no signed-in cookie.
+                    response["message"] = ("Check your email to confirm the account "
+                                           "before signing in.")
+                    self._json(response, 201)
             except Exception as exc:                           # noqa: BLE001
                 self._json({"error": str(exc)}, 400)
             return
@@ -1587,8 +1635,12 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._read_json()
             try:
                 user = login_user(payload.get("email"), payload.get("password"))
-                session_cookie = set_session_cookie({"access_token": user.get("session", {}).get("access_token"), "refresh_token": user.get("session", {}).get("refresh_token"), "expires_at": user.get("session", {}).get("expires_at") or ""})
-                self._json({"user": user.get("user")}, 200, [("Set-Cookie", session_cookie)])
+                session = _session_payload(user)
+                session_cookie = set_session_cookie(session) if session else ""
+                if not session_cookie:
+                    raise ValueError("Sign-in did not create a session.")
+                self._json({"user": ui_files.user_ref(user.get("user"))}, 200,
+                           [("Set-Cookie", session_cookie)])
             except Exception as exc:                           # noqa: BLE001
                 self._json({"error": str(exc)}, 401)
             return
