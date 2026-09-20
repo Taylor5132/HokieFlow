@@ -23,3 +23,13 @@ class LoopTests(unittest.TestCase):
         from hokieday.transit import destination_loop
         self.assertEqual(destination_loop('SME',[{'isBusStop':'Y','patternPointName':'Maroon Bay 7'}]),'maroon')
         self.assertIsNone(destination_loop('Other',[{'isBusStop':'Y','patternPointName':'Downtown'}]))
+
+class FreshnessTests(unittest.TestCase):
+    def test_departures_keep_provider_capture_time(self):
+        from unittest.mock import patch
+        from hokieday import transit
+        stamp='2026-09-20T01:00:00-04:00'
+        with patch.object(transit.cache,'post_form_json_with_metadata',return_value=({'success':True,'data':[]},{'fetched_at':stamp})) as read:
+            result=transit.departures('8006')
+        self.assertEqual(result['fetched_at'],stamp)
+        self.assertEqual(read.call_args.kwargs['max_age_s'],15)

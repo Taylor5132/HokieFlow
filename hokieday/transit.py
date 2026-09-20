@@ -95,11 +95,12 @@ def pattern_loop(pattern):
 
 def departures(stop):
     if not re.fullmatch(r'[0-9]{1,8}',stop):raise ValueError('Invalid stop code')
-    payload=fetch(('departures',stop),BT+'getNextDeparturesForStop',30,{'stopCode':stop,'numOfTrips':9})
+    key=('departures',stop)
+    payload, meta = cache.post_form_json_with_metadata(_cache_name(key), BT+'getNextDeparturesForStop', {'stopCode':stop,'numOfTrips':9}, params={'k':str(key)}, max_age_s=15, timeout=10)
     rows = normalize_departures(payload,stop)
     patterns = list({row['pattern'] for row in rows})
     with ThreadPoolExecutor(max_workers=9) as pool:
         loops = dict(zip(patterns,pool.map(pattern_loop,patterns)))
     for row in rows:
         row['destination_loop'] = loops.get(row['pattern'])
-    return {'departures':rows,'fetched_at':fetched_at(('departures',stop)),'source':'Blacksburg Transit','kind':'adjusted departure estimates'}
+    return {'departures':rows,'fetched_at':meta.get('fetched_at'),'source':'Blacksburg Transit','kind':'adjusted departure estimates'}

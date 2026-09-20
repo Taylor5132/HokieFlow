@@ -6,12 +6,13 @@ export function mountScrollMotion(root) {
   const preference = matchMedia('(prefers-reduced-motion: reduce)');
   const seen = new WeakSet();
   const active = new Map();
+  const headers = new WeakSet();
   const selector = '.home-card, #upcoming, .dining-place, .about-feature, .team-credits, .settings-account, .answer, .copyright';
   let frame = 0;
   function clear(element, tween) {
     tween.scrollTrigger?.kill();
     tween.kill();
-    gsap.set(element, {clearProps: 'opacity,transform'});
+    gsap.set(element, {clearProps: 'opacity,transform,--rule-progress'});
     active.delete(element);
   }
   function sync() {
@@ -20,16 +21,22 @@ export function mountScrollMotion(root) {
       if (!element.isConnected || preference.matches) clear(element, tween);
     }
     if (preference.matches) return;
+    const header=root.querySelector('.home-header');
+    if(header&&!headers.has(header)){
+      headers.add(header);
+      const line=gsap.fromTo(header,{'--rule-progress':0},{'--rule-progress':1,duration:1,ease:'power3.out',onComplete(){active.delete(header);}});
+      active.set(header,line);
+    }
     for (const element of root.querySelectorAll(selector)) {
       if (seen.has(element)) continue;
       seen.add(element);
       // Live bus/dining refreshes should never blink or replay visible content.
       // Only animate sections entering from below the current viewport.
       if (element.getBoundingClientRect().top < innerHeight * .92) continue;
-      const tween = gsap.fromTo(element, {opacity: .15, y: 26}, {
-        opacity: 1, y: 0, duration: .65, ease: 'power2.out',
+      const tween = gsap.fromTo(element, {opacity: .12, y: 42, scale:.985}, {
+        opacity: 1, y: 0, scale:1, duration: .85, ease: 'power2.out',
         scrollTrigger: {trigger: element, start: 'top 92%', once: true},
-        onComplete() {gsap.set(element, {clearProps: 'opacity,transform'}); active.delete(element);}
+        onComplete() {gsap.set(element, {clearProps: 'opacity,transform,--rule-progress'}); active.delete(element);}
       });
       active.set(element, tween);
     }
