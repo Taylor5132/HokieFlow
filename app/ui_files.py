@@ -119,71 +119,43 @@ def user_ref(user: object) -> dict:
     }
 
 
-def enrich_account(body: dict, user: object) -> dict:
-    """Add {data, version} from Supabase when configured.
+def _account_token(headers=None, access_token=None):
+    if access_token:
+        return access_token
+    if not headers:
+        return None
+    bearer = headers.get("Authorization") or headers.get("authorization") or ""
+    if str(bearer).lower().startswith("bearer "):
+        return str(bearer).split(" ", 1)[1].strip()
+    from auth import get_session_cookie
+    return get_session_cookie(headers.get("Cookie") or headers.get("cookie")).get("access_token")
 
-    Contract (CONNECTING.md): data is exactly {savedClass, reduceMotion,
-    plans, events}; version is a monotonic integer for optimistic concurrency.
-    No database configured -> account data stays absent and the UI keeps
-    working logged-in without cloud save.
-    """
-    try:
-        from database import supabase  # optional dependency, may be None
-    except Exception:                                    # noqa: BLE001
-        return body
-    client = supabase
-    if client is None:
-        return body
+
+def enrich_account(body: dict, user: object, *, headers=None, access_token=None) -> dict:
+    """Load UI state using the same user's session as the authenticated request."""
+    from app import account_store
     uid = user_ref(user).get("id")
     if not uid:
         return body
     try:
-        rows = (client.table("account_data")
-                .select("data, version")
-                .eq("user_id", uid)
-                .limit(1).execute().data) or []
-        if rows:
-            body["data"] = rows[0].get("data") or {}
-            body["version"] = int(rows[0].get("version") or 0)
-    except Exception:                                    # noqa: BLE001
-        pass
+        body.update(account_store.load(uid, _account_token(headers, access_token)))
+    except account_store.StorageError as exc:
+        # A failed read is not an empty account. The UI blocks saves until
+        # a successful reload so it cannot overwrite unknown existing data.
+        body["storageError"] = str(exc)
     return body
 
 
-def save_account(user: object, data: object, version: object) -> tuple[dict, int]:
-    """Optimistic-concurrency account save. 409 on a stale version."""
-    if not isinstance(data, dict):
-        return {"error": "data must be an object"}, 400
-    allowed = {"savedClass", "reduceMotion", "plans", "events"}
-    clean = {k: v for k, v in data.items() if k in allowed}
-    try:
-        from database import supabase
-        client = supabase
-    except Exception:                                    # noqa: BLE001
-        client = None
-    if client is None:
-        return {"error": "account storage is not configured"}, 503
+def save_account(user: object, data: object, version: object, *, headers=None) -> tuple[dict, int]:
+    from app import account_store
     uid = user_ref(user).get("id")
     if not uid:
         return {"error": "authentication required"}, 401
     try:
-        rows = (client.table("account_data")
-                .select("version").eq("user_id", uid).limit(1).execute().data) or []
-        current = int(rows[0].get("version") or 0) if rows else 0
-        try:
-            requested = int(version)
-        except (TypeError, ValueError):
-            requested = 0
-        if requested != current:
-            return {"error": "stale version — reload and retry",
-                    "version": current}, 409
-        client.table("account_data").upsert(
-            {"user_id": uid, "data": clean, "version": current + 1},
-            on_conflict="user_id").execute()
-        return {"ok": True, "data": clean, "version": current + 1}, 200
-    except Exception as exc:                             # noqa: BLE001
-        return {"error": f"save failed: {type(exc).__name__}"}, 500
-
+        result = account_store.save(uid, _account_token(headers), data, version)
+        return {**result, "user": user_ref(user)}, 200
+    except account_store.StorageError as exc:
+        return {"error": str(exc)}, exc.status
 
 # --------------------------------------------------------------------------- #
 # GET endpoints
