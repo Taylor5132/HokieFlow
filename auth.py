@@ -171,6 +171,19 @@ def register_user(email: str, password: str):
     response = client.auth.sign_up({"email": email, "password": password})
     if not response or not _get(response, "user"):
         raise ValueError("Registration failed.")
+
+    session = _get(response, "session")
+    session_token = _get(session, "access_token") if isinstance(session, Mapping) else None
+    if session_token:
+        return response
+
+    try:
+        sign_in_response = client.auth.sign_in_with_password({"email": email, "password": password})
+    except Exception:
+        return response
+
+    if sign_in_response and _get(sign_in_response, "user") and _get(sign_in_response, "session"):
+        return sign_in_response
     return response
 
 
