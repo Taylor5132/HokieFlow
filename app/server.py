@@ -1072,6 +1072,23 @@ def _session_payload(auth_response) -> dict:
     return payload
 
 
+def _agent_budget_snapshot() -> dict:
+    """Local provider headroom for /api/status; never touches the network."""
+    try:
+        from app.gemini_provider import budget_snapshot
+        return budget_snapshot()
+    except Exception:                                    # noqa: BLE001
+        return {}
+
+
+def _bounded_env_int(name: str, default: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(1, min(value, maximum))
+
+
 def configured_agent_provider():
     """Build the opt-in live provider from environment configuration.
 
@@ -1283,6 +1300,8 @@ def status() -> dict:
             "model": configured_model,
             "fallback": "bounded_parser",
             "reason": agent_reason,
+            "budget": _agent_budget_snapshot(),
+            "questions_per_ip_hour": _bounded_env_int("HOKIEFLOW_AI_QUESTIONS_PER_IP_HOUR", 10, 1000),
         },
         "auth": {
             "available": AUTH_AVAILABLE,

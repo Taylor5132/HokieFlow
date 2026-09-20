@@ -493,6 +493,28 @@ class ProviderBudgetTests(unittest.TestCase):
 
 
 class ServerBudgetTests(unittest.TestCase):
+    def test_status_reports_which_limit_is_closest(self):
+        """A demo that stops answering is usually a local guard, not a dead key.
+        The headroom must be readable without spending a provider call."""
+        from app import gemini_provider
+        block = server.status()["agent"]
+        self.assertIn("budget", block)
+        for key in ("calls_last_hour", "calls_last_hour_limit", "calls_today",
+                    "calls_today_limit", "remaining_this_hour", "remaining_today"):
+            self.assertIn(key, block["budget"], key)
+            self.assertIsInstance(block["budget"][key], int)
+        self.assertGreater(block["budget"]["calls_today_limit"], 0)
+        self.assertGreater(block["questions_per_ip_hour"], 0)
+        # Never the credential itself.
+        import json as _json
+        text = _json.dumps(block)
+        self.assertNotIn("AIza", text)
+        self.assertNotIn("api_key", text.lower())
+        # The snapshot is read-only: asking for it must not consume a call.
+        before = gemini_provider.budget_snapshot()["calls_today"]
+        gemini_provider.budget_snapshot()
+        self.assertEqual(before, gemini_provider.budget_snapshot()["calls_today"])
+
     def test_per_client_question_budget_is_bounded(self):
         with server._CLIENT_BUDGET_LOCK:
             server._CLIENT_QUESTION_TIMES.clear()

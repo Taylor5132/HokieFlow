@@ -84,6 +84,28 @@ def _save_budget_state(stamps: list[float]) -> None:
         pass
 
 
+def budget_snapshot() -> dict:
+    """How much of the local call budget is left, without spending any of it.
+
+    Published on /api/status so a rate-limited answer can be told apart from a
+    dead provider at a glance: a demo that suddenly answers nothing is usually
+    this guard or the per-client question throttle, not the Gemini key.
+    """
+    now = time.time()
+    hourly = _bounded_env_int("HOKIEFLOW_GEMINI_CALLS_PER_HOUR", 30, 10_000)
+    daily = _bounded_env_int("HOKIEFLOW_GEMINI_CALLS_PER_DAY", 120, 100_000)
+    stamps = [s for s in _load_budget_state() if now - s < 86_400]
+    in_hour = sum(1 for stamp in stamps if now - stamp < 3_600)
+    return {
+        "calls_last_hour": in_hour,
+        "calls_last_hour_limit": hourly,
+        "calls_today": len(stamps),
+        "calls_today_limit": daily,
+        "remaining_this_hour": max(0, hourly - in_hour),
+        "remaining_today": max(0, daily - len(stamps)),
+    }
+
+
 def _reserve_budget() -> None:
     """Guard the shared account quota, across processes and restarts."""
     now = time.time()
