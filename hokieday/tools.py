@@ -248,7 +248,7 @@ class LocalSource:
     # -------------------------------------------------------------- dining
     def food_search(self, location_num: str | None, diet: str | None,
                     avoid: tuple[str, ...], max_kcal: float | None,
-                    open_only: bool) -> dict:
+                    open_only: bool, max_age_s: float | None = None) -> dict:
         """Search one location, or ALL configured locations, without losing any.
 
         Returns {items, sources_ok, sources_skipped, statuses,
@@ -260,6 +260,12 @@ class LocalSource:
         planner can quote kcal). For an all-locations query nutrition is NOT
         fetched -- a campus-wide NutritiveReport sweep per search is exactly the
         cost blow-up this layer must avoid, so kcal is left unknown there.
+
+        A requested `max_kcal` is a HARD ceiling. When the single location's
+        nutrition is unavailable -- including nutrition captured after the
+        replay clock, which is refused as non-contemporaneous -- the location is
+        reported with a typed `nutrition_unavailable` skipped state instead of
+        returning rows whose calories are unproven.
         """
         today = self._now_local().date()
         if location_num in (None, ""):
@@ -297,12 +303,33 @@ class LocalSource:
         statuses: list[dict] = []
         for num in nums:
             name = config.DINING_LOCATIONS.get(num, "")
-            statuses.append(dining.location_status(num, today).as_dict())
+            statuses.append(dining.location_status(
+                num, today, max_age_s=max_age_s).as_dict())
+            # Prove calories BEFORE filtering when a hard ceiling is requested:
+            # a future-captured/absent nutrition source must surface as a typed
+            # skipped state, not as a silent "no items matched".
+            nut: dict = {}
+            if with_nutrition:
+                try:
+                    nut = dining.nutrition_for_location(
+                        num, today, max_age_s=max_age_s)
+                except Exception:                            # noqa: BLE001
+                    nut = {}
+                if max_kcal is not None and not nut:
+                    sources_skipped.append({
+                        "location_num": num, "location_name": name,
+                        "status": "nutrition_unavailable",
+                        "reason": ("max_kcal is a hard constraint but nutrition "
+                                   "is unavailable (missing, or captured after "
+                                   "the replay clock); refusing unproven rows"),
+                    })
+                    continue
             try:
                 items = dining.eat_options(
                     num, today, diet=diet, avoid=tuple(avoid or ()),
                     max_kcal=max_kcal,
                     open_only=open_only,
+                    max_age_s=max_age_s,
                 )
             except Exception as exc:                         # noqa: BLE001
                 # CacheMiss in replay mode (no fixture for this location), a
@@ -316,12 +343,6 @@ class LocalSource:
             sources_ok.append(num)
             # Nutrition is a cached per-location lookup; attach real macros so
             # the agent can quote a calorie count for a single-location pick.
-            nut: dict = {}
-            if with_nutrition:
-                try:
-                    nut = dining.nutrition_for_location(num, today)
-                except Exception:                            # noqa: BLE001
-                    nut = {}
             for it in items:
                 n = nut.get(it.recipe_id)
                 rows.append({
@@ -360,8 +381,16 @@ class LocalSource:
                                 open_only)["items"]
 
     def hours(self, foodpro_id: str) -> list[dict]:
+        now = self._now_local()
         try:
-            wins = dining.hours(str(foodpro_id), self._now_local().date())
+            # `open_windows` adds the PREVIOUS day's real overnight windows when
+            # `now` is early enough to fall inside one, so an early-morning plan
+            # does not miss a 22:00->02:00 window that began yesterday. A prior
+            # day that cannot be read is treated as no windows here (the dining
+            # status layer reports it as unknown); it is never invented by
+            # shifting today's windows backward.
+            wins, _prior = dining.open_windows(
+                str(foodpro_id), now.date(), now.replace(tzinfo=None))
         except Exception:                                    # noqa: BLE001
             return []
         out = []
@@ -696,7 +725,9 @@ def walk_time(from_place: str, to_place: str) -> dict:
 
 def find_food(location_num: str | None = None, diet: str | None = None,
               avoid: tuple[str, ...] = (), max_kcal: float | None = None,
-              open_only: bool = False, source: Any = None) -> dict:
+              open_only: bool = False, source: Any = None,
+              max_age_s: float | None = config.DEFAULT_MENU_CACHE_MAX_AGE_S
+              ) -> dict:
     """Menu items matching diet / allergen / kcal constraints -- one dining
     location, or every configured location when location_num is None.
 
@@ -724,7 +755,8 @@ def find_food(location_num: str | None = None, diet: str | None = None,
     try:
         search = getattr(src, "food_search", None)
         if callable(search):
-            res = search(loc, diet, avoid, max_kcal, bool(open_only))
+            res = search(loc, diet, avoid, max_kcal, bool(open_only),
+                         max_age_s=max_age_s)
             rows = res.get("items") or []
             sources_ok = res.get("sources_ok")
             sources_skipped = res.get("sources_skipped") or []
@@ -846,11 +878,18 @@ def predict_bus_delay(route_id: str, hour: int, source: Any = None) -> dict:
 STUDENT_PROFILES: dict[str, dict] = {
     # Obviously synthetic demo profiles: surrogate keys only -- no real names,
     # no PIDs, no academic data (SDD section 11).
+    #
+    # NO HIDDEN CALORIE CEILING. These profiles are demo aids, not user input,
+    # and a hidden ceiling would silently drop the demo's meal whenever replay
+    # nutrition is unavailable (it is: the committed D2 nutrition chunks were
+    # captured after the pinned replay clock and are refused as
+    # non-contemporaneous). An EXPLICIT max_kcal from the caller stays a hard
+    # constraint in find_food/eat_options.
     "demo-student-1": {
         "label": "synthetic demo profile 1 (not a real person)",
         "diet": "vegetarian",
         "avoid": ["Peanuts", "Tree Nuts"],
-        "max_kcal": 800,
+        "max_kcal": None,
     },
     "demo-student-2": {
         "label": "synthetic demo profile 2 (not a real person)",
@@ -862,7 +901,7 @@ STUDENT_PROFILES: dict[str, dict] = {
         "label": "synthetic demo profile 3 (not a real person)",
         "diet": None,
         "avoid": ["Milk"],
-        "max_kcal": 600,
+        "max_kcal": None,
     },
 }
 
@@ -924,10 +963,11 @@ def _build_itinerary(src: Any, *, start_dt: datetime, end_dt: datetime,
             waypoint = eat_place
             if item is not None:
                 eat_start = t
-                # openness at the planned eat time, from the hours fixture
+                # openness at the planned eat time, from the hours fixture.
+                # Do NOT filter on w["date"] == t.date(): an overnight window
+                # that began on D-1 has its close_dt on D and must still count.
                 open_now = any(
-                    datetime.strptime(str(w["date"]), "%Y-%m-%d").date() == t.date()
-                    and w["open_dt"] <= _naive(t) < w["close_dt"]
+                    w["open_dt"] <= _naive(t) < w["close_dt"]
                     for w in src.hours(str(eat_loc))
                 )
                 if open_now:

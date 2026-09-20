@@ -284,19 +284,25 @@ composite `status` follows a fixed precedence: **any unavailable source ->
 hours failure is never plain `ok`); else `hours_status == closed` -> `closed`;
 else `menu_status == empty` -> `empty`; else `ok`. `stale` is orthogonal (served
 copy older than `max_age_s`). `window_span` rolls `close <= open` to the next
-day and `is_open` also considers the previous-day occurrence, so an overnight
-window (e.g. DX 22:00:01 -> 02:00:00) reads correctly at 01:00; with multiple
-units the close is the union's LAST close.
+day. Each window is anchored to its OWN source date and is NEVER shifted
+backward: an overnight window (e.g. DX 22:00:01 -> 02:00:00) reads correctly at
+01:00 on the day AFTER it opened, and `dining.open_windows()` loads D-1's ACTUAL
+hours for an early-morning probe on D (a missing D-1 is `unavailable`/UNKNOWN,
+never a fabricated open/closed). With multiple units the close is the union's
+LAST close.
 
-**Future capture is not data.** A menu/hour envelope whose `fetched_at` is
-after `config.now()` (the replay/request clock) is rejected: `menu_result`
-returns `unavailable` (`not_yet_available`) with no rows and `hours()` raises
-`NotYetAvailableError`. This is why replay only serves D2 menus: any promoted
-later capture would otherwise read as fresh.
+**Future capture is not data.** A menu/hour/nutrition envelope whose
+`fetched_at` is after `config.now()` (the replay/request clock) is rejected:
+`menu_result` returns `unavailable` (`not_yet_available`) with no rows,
+`hours()` raises `NotYetAvailableError`, and nutrition chunks/derived all-menu
+envelopes are skipped so `kcal` stays unknown. This is why replay only serves D2
+menus, and why replay kcal is `None`: any promoted later capture would otherwise
+read as fresh.
 
-**Payload source-matching.** `menu_result` validates the payload's own
-`locationNum` and `date` against the normalized request; a mismatch returns
-`unavailable` (`source_mismatch`), never the wrong hall's rows.
+**Payload source-matching.** `menu_result` REQUIRES the payload's own
+`locationNum` and `date` to be present, parseable, and exactly equal to the
+normalized request; a missing or mismatched identity returns `unavailable`
+(`source_mismatch`), never the wrong hall's or day's rows.
 
 **`tools.find_food(location_num=None)`** searches every configured location and
 returns `sources_ok` / `sources_skipped` / `statuses`; no location is silently
@@ -304,7 +310,9 @@ dropped. Deterministic ranking is unchanged (meal-ish section, most filling,
 name). A **kcal ceiling is a hard constraint**: an all-locations `max_kcal`
 query does not fetch campus-wide nutrition, so it returns **no items** with
 typed `nutrition_unavailable` skipped entries and an explicit reason. A single
-location still attaches real macros and honors the ceiling.
+location attaches real macros and honors the ceiling when contemporaneous
+nutrition exists; when it does not (including future-captured replay data) the
+location is reported `nutrition_unavailable` and no unproven rows are returned.
 
 ---
 

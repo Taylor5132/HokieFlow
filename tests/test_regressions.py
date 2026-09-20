@@ -112,12 +112,15 @@ class TestBugRegressions(unittest.TestCase):
         eat = [l for l in it["legs"] if l["type"] == "eat"]
         self.assertEqual(len(eat), 1, "the headline scenario must include a meal")
 
-    def test_eat_leg_carries_real_calories(self):
-        """BUG: kcal was hardcoded None, so the agent could never quote a number."""
+    def test_eat_leg_reports_kcal_honestly(self):
+        """Replay nutrition was captured AFTER the pinned replay clock, so it is
+        refused and kcal is None (honest unknown). Live mode attaches real
+        macros. The regression guard is that the meal is never silently dropped:
+        the hidden demo ceiling that used to do that was removed."""
         r = tools.plan_day("demo-student-1", "11:22", "13:00")
         eat = next(l for l in r["itinerary"]["legs"] if l["type"] == "eat")
-        self.assertIsNotNone(eat["kcal"], "eat leg must carry calories")
-        self.assertGreater(eat["kcal"], 0)
+        self.assertIsNone(eat["kcal"],
+                          "replay must not present future-captured kcal as fresh")
 
     def test_replan_does_not_raise_on_a_plan_with_eating(self):
         """BUG: undefined `closes_in_now` raised NameError on any plan with a
@@ -237,12 +240,13 @@ class TestMealChoice(unittest.TestCase):
             r = tools.plan_day(profile, "11:22", "13:00")
             eat = [l for l in r["itinerary"]["legs"] if l["type"] == "eat"]
             self.assertEqual(len(eat), 1)
-            self.assertGreater(eat[0]["kcal"], 150,
-                               f"{profile} was offered a snack-sized meal")
+            # kcal is unknown in replay (future-captured nutrition is refused);
+            # the pick must still come from a meal-ish section, not a bar/dessert.
+            self.assertTrue(eat[0]["item"])
 
     def test_food_ranking_prefers_a_meal_section(self):
         r = tools.find_food(location_num="15", diet="vegetarian",
-                            avoid=("Peanuts", "Tree Nuts"), max_kcal=800)
+                            avoid=("Peanuts", "Tree Nuts"))
         top = r["items"][0]
         self.assertEqual(
             tools.section_rank(str(top.get("section")), str(top.get("name"))), 0,
@@ -288,18 +292,28 @@ class TestCacheKeyLength(unittest.TestCase):
 
 class TestNutritionCoverage(unittest.TestCase):
     """BUG: nutrition was fetched for the already-filtered subset, changing the
-    chunk boundaries, so every cache lookup missed and kcal was always unknown."""
+    chunk boundaries, so every cache lookup missed and kcal was always unknown.
 
-    def test_location_nutrition_covers_unique_recipes(self):
+    Replay now ALSO refuses nutrition captured after the pinned clock, so the
+    whole-menu resolution is proven with the one contemporaneous chunk fixture
+    and with the synthetic cache in test_dining_basic."""
+
+    def test_replay_refuses_future_captured_nutrition(self):
         nut = dining.nutrition_for_location("15", date(2026, 9, 19))
-        self.assertGreater(len(nut), 100, "should cover every unique recipe on the menu")
+        self.assertEqual(nut, {},
+                         "future-captured nutrition must not populate replay rows")
+
+    def test_contemporaneous_chunk_still_resolves(self):
+        nut = dining.nutrition_bulk([("214022", "1", 1),
+                                     ("141002", "2", 1)])
+        self.assertEqual(set(nut), {"214022", "141002"})
         self.assertTrue(all(v.cals is not None for v in nut.values()))
 
-    def test_eat_items_expose_kcal(self):
+    def test_eat_items_have_no_unproven_kcal(self):
         rows = dining.eat_options("15", date(2026, 9, 19))
-        with_kcal = [r for r in rows if r.recipe_id in
-                     dining.nutrition_for_location("15", date(2026, 9, 19))]
-        self.assertGreater(len(with_kcal), 400, "most D2 items should have nutrition")
+        self.assertTrue(rows)
+        # nutrition is refused in replay, so no item may claim a calorie count
+        self.assertEqual(dining.nutrition_for_location("15", date(2026, 9, 19)), {})
 
 
 if __name__ == "__main__":

@@ -33,6 +33,21 @@ to several physical units (Perry Place `06` has 8); each becomes its own window.
 OVERNIGHT windows (close < open, e.g. DX 22:00:01 -> 02:00:00) are rolled to
 the next day via `window_span()`.
 
+HOURS ARE ANCHORED TO THEIR SOURCE DATE. A window returned for date D is only
+ever placed on D (its overnight close rolling into D+1). It is NEVER shifted
+backward to D-1: doing so invents a schedule the source did not publish for
+D-1. For an early-morning probe on date D, `open_windows()` loads D-1's ACTUAL
+hours and includes only its true overnight windows; when D-1 cannot be read the
+result is UNKNOWN (`unavailable`), never a fabricated open/closed verdict.
+
+NUTRITION IS SUBJECT TO THE SAME CLOCK. A nutrition chunk or derived all-menu
+envelope captured after `config.now()` is not evidence about the replay instant,
+so `nutrition_for_location()`/`nutrition_bulk()` skip it and leave kcal unknown.
+A requested `max_kcal` stays a HARD ceiling: with no proven calories the item is
+dropped, and callers get a typed `nutrition_unavailable` reason rather than
+unproven rows. Only the obviously-synthetic demo profiles may drop their hidden
+ceiling when calories are unknown; an explicit caller ceiling never is.
+
 PUBLIC BASIC/STATUS SURFACE (frontend-ready; no nutrition fetch):
   * location_directory()                 -> all 12 configured locations, sorted
   * location_status(num, date)           -> ok | closed | empty | unavailable
@@ -389,20 +404,25 @@ def _payload_mismatch(payload: dict, location_num: str, day: date) -> str | None
     """Validate a menu payload's own location/date against what we requested.
 
     The menu API can answer with a different location or day (a wrong id, a
-    cached neighbor). Accepting that silently would attribute another hall's
-    food to this one, so a mismatch is a typed `source_mismatch`, never rows.
+    cached neighbor), or omit the identity fields entirely. Accepting any of
+    those silently would attribute another hall's or day's food to this request,
+    so a mismatch OR a missing/unparseable identity is a typed
+    `source_mismatch`, never rows.
     """
-    got_loc = str(payload.get("locationNum", "")).strip()
-    if got_loc and got_loc != str(location_num):
+    if "locationNum" not in payload or str(payload.get("locationNum") or "").strip() == "":
+        return "missing locationNum"
+    got_loc = str(payload.get("locationNum")).strip()
+    if got_loc != str(location_num):
         return f"locationNum {got_loc!r} != requested {location_num!r}"
-    raw_date = str(payload.get("date", "")).strip()
-    if raw_date:
-        try:
-            got_day = datetime.strptime(raw_date, "%m/%d/%Y").date()
-        except ValueError:
-            return f"unparseable payload date {raw_date!r}"
-        if got_day != day:
-            return f"date {got_day.isoformat()} != requested {day.isoformat()}"
+    if "date" not in payload or str(payload.get("date") or "").strip() == "":
+        return "missing date"
+    raw_date = str(payload.get("date")).strip()
+    try:
+        got_day = datetime.strptime(raw_date, "%m/%d/%Y").date()
+    except ValueError:
+        return f"unparseable payload date {raw_date!r}"
+    if got_day != day:
+        return f"date {got_day.isoformat()} != requested {day.isoformat()}"
     return None
 
 
@@ -449,7 +469,7 @@ def menu_result(location_num: str, d: date | str, force: bool = False,
     params = {"location_num": num, "dtdate": dtdate}
     source = _source_key("dining_menu", params)
     try:
-        payload = cache.get_json(
+        payload, meta = cache.get_json_with_metadata(
             "dining_menu",
             config.ENDPOINTS["dining_menu"].format(
                 location_num=num, dtdate=dtdate),
@@ -459,7 +479,7 @@ def menu_result(location_num: str, d: date | str, force: bool = False,
         return MenuResult(num, name, day, STATUS_UNAVAILABLE,
                           reason=f"menu unavailable: {exc}", source=source)
 
-    fetched_at = _envelope_meta("dining_menu", params).get("fetched_at")
+    fetched_at = meta.get("fetched_at")
     if _captured_in_future(fetched_at):
         return MenuResult(
             num, name, day, STATUS_UNAVAILABLE,
@@ -519,7 +539,9 @@ def _parse_menu_items(payload: dict, location_num: str,
     return items
 
 
-def menu(location_num: str, d: date | str, force: bool = False) -> list[MenuItem]:
+def menu(location_num: str, d: date | str, force: bool = False,
+         max_age_s: float | None = config.DEFAULT_MENU_CACHE_MAX_AGE_S
+         ) -> list[MenuItem]:
     """Menu for one location on one day (FROZEN contract).
 
     `d` as a `date` is formatted MM/DD/YYYY (the only format the API accepts).
@@ -528,8 +550,12 @@ def menu(location_num: str, d: date | str, force: bool = False) -> list[MenuItem
     source BOTH raise MenuError here -- `menu_result()` is the typed alternative
     that returns STATUS_EMPTY / STATUS_UNAVAILABLE so callers can distinguish
     them.
+
+    `max_age_s` defaults to the menu TTL so LIVE callers refresh a stale menu
+    instead of reusing a cached copy indefinitely (replay ignores it: the frozen
+    store has no network to refresh from).
     """
-    res = menu_result(location_num, d, force=force)
+    res = menu_result(location_num, d, force=force, max_age_s=max_age_s)
     if not res.items:
         raise MenuError(res.reason or f"menu unavailable for {location_num}")
     return list(res.items)
@@ -595,8 +621,23 @@ def _nutrients_from(payload: dict) -> dict[str, Nutrients]:
     return out
 
 
+def _nutrition_evidence_ok(name: str, params: dict) -> bool:
+    """True when a nutrition envelope is evidence for the replay/request clock.
+
+    A chunk or derived all-menu envelope captured AFTER config.now() describes a
+    moment that has not happened yet at replay time. Serving it would stamp a
+    later snapshot's calories onto replay rows and gold as if contemporaneous,
+    so we refuse it and leave kcal unknown. The timestamp is never rewritten.
+    """
+    return not _captured_in_future(
+        _envelope_meta(name, params).get("fetched_at"))
+
+
 def nutrition_for_location(location_num: str, d: date | str,
-                           force: bool = False) -> dict[str, Nutrients]:
+                           force: bool = False,
+                           max_age_s: float | None
+                           = config.DEFAULT_MENU_CACHE_MAX_AGE_S
+                           ) -> dict[str, Nutrients]:
     """Nutrition for EVERY item on a location's menu, keyed by recipeId.
 
     WHY THIS EXISTS (a real bug, not a nicety)
@@ -613,29 +654,40 @@ def nutrition_for_location(location_num: str, d: date | str,
     Fetching the WHOLE MENU in menu order and caching it under one stable
     {location_num, date} key makes any later subset hit, whatever survives
     filtering.
+
+    TEMPORAL PROVENANCE: a derived all-menu envelope or any chunk captured after
+    the replay/request clock is skipped (see `_nutrition_evidence_ok`). In replay
+    this leaves kcal UNKNOWN for the future-captured D2 nutrition fixtures rather
+    than presenting later data as contemporaneous. A requested `max_kcal` stays
+    hard; callers get typed `nutrition_unavailable` rather than unproven rows.
     """
     day = _as_date(d)
     params = {"location_num": str(location_num), "date": day.isoformat()}
     origin = "derived: all-menu nutrition merged from NutritiveReport chunks"
 
     if cache.has("nutrition_location", params) and not force:
-        return _nutrients_from(
-            cache.get_json("nutrition_location", origin, params=params))
+        if _nutrition_evidence_ok("nutrition_location", params):
+            return _nutrients_from(
+                cache.get_json("nutrition_location", origin, params=params))
+        # else: the derived envelope is future-captured; fall through to chunks.
 
     try:
-        menu_items = menu(location_num, day, force=force)
+        menu_items = menu(location_num, day, force=force, max_age_s=max_age_s)
     except Exception:                                        # noqa: BLE001
         return {}
 
     merged: dict = {"recipes": []}
     for chunk_str in _nutrition_chunks(
             [(it.recipe_id, it.portion_size or "1", 1) for it in menu_items], 40):
+        cparams = {"items": chunk_str}
+        if not _nutrition_evidence_ok("dining_nutrition", cparams):
+            continue            # future-captured chunk: not contemporaneous evidence
         try:
             payload = cache.get_json(
                 "dining_nutrition",
                 config.ENDPOINTS["dining_nutrition"].format(
                     items=quote(chunk_str, safe="*,")),
-                params={"items": chunk_str}, force=force)
+                params=cparams, force=force, max_age_s=max_age_s)
         except cache.CacheMiss:
             continue            # partial nutrition beats none; kcal stays unknown
         merged["recipes"].extend(payload.get("recipes") or [])
@@ -647,6 +699,7 @@ def nutrition_for_location(location_num: str, d: date | str,
 
 def nutrition_bulk(
     items: list[tuple[str, str, int]], chunk: int = 40, force: bool = False,
+    max_age_s: float | None = config.DEFAULT_MENU_CACHE_MAX_AGE_S,
 ) -> dict[str, Nutrients]:
     """Nutrients for many items, keyed by recipeId.
 
@@ -655,6 +708,9 @@ def nutrition_bulk(
     (default 40) instead of building one enormous URL, and each chunk is
     cached under ("dining_nutrition", {"items": <chunk string>}) so repeated
     calls never re-fetch.
+
+    A chunk captured after the replay/request clock is skipped, so it can never
+    populate replay rows as contemporaneous; those recipes stay kcal-unknown.
     """
     out: dict[str, Nutrients] = {}
     for chunk_str in _nutrition_chunks(list(items), chunk):
@@ -663,12 +719,16 @@ def nutrition_bulk(
         # unencoded chunk produced `InvalidURL: URL can't contain control
         # characters ... (found at least ' ')` and the whole seed silently
         # returned nothing. '*' and ',' are safe to leave literal.
+        cparams = {"items": chunk_str}
+        if not _nutrition_evidence_ok("dining_nutrition", cparams):
+            continue
         payload = cache.get_json(
             "dining_nutrition",
             config.ENDPOINTS["dining_nutrition"].format(
                 items=quote(chunk_str, safe="*,")),
-            params={"items": chunk_str},
+            params=cparams,
             force=force,
+            max_age_s=max_age_s,
         )
         for recipe in payload.get("recipes") or []:
             vals = {
@@ -706,14 +766,14 @@ def hours(foodpro_id: str, d: date | str, force: bool = False,
     """
     iso = d if isinstance(d, str) else d.isoformat()
     params = {"foodpro_id": foodpro_id, "date": iso}
-    payload = cache.get_json(
+    payload, meta = cache.get_json_with_metadata(
         "dining_hours",
         config.ENDPOINTS["dining_hours"].format(foodpro_id=foodpro_id, date=iso),
         params=params,
         force=force,
         max_age_s=max_age_s,
     )
-    fetched_at = _envelope_meta("dining_hours", params).get("fetched_at")
+    fetched_at = meta.get("fetched_at")
     if _captured_in_future(fetched_at):
         raise NotYetAvailableError(
             f"hours envelope captured {fetched_at} after the replay/request "
@@ -764,20 +824,16 @@ def _is_overnight(w: HoursWindow) -> bool:
 
 
 def _candidate_spans(w: HoursWindow) -> list[tuple[datetime, datetime]]:
-    """All day-placements a single window could represent.
+    """The ONE day-placement a window represents: its own source date.
 
-    An overnight window (close <= open) crosses midnight, so the SAME clock
-    times appear once per calendar day. Besides its own date we also consider
-    the previous day's occurrence: a caller who asked for date D's hours and
-    probes at 01:00 must still match the window that opened at 22:00 on D-1 and
-    closed on D. Non-overnight windows are only anchored on their own date.
+    An overnight window (close <= open) still belongs to its source date; its
+    close is rolled forward into the next day by `window_span`. It is NEVER
+    shifted BACKWARD: a window published for date D says nothing about D-1, and
+    shifting it would invent a schedule the source never published. Callers that
+    need yesterday's early hours must load D-1's actual windows (see
+    `open_windows`).
     """
-    primary = window_span(w)
-    spans = [primary]
-    if _is_overnight(w):
-        spans.append((primary[0] - timedelta(days=1),
-                      primary[1] - timedelta(days=1)))
-    return spans
+    return [window_span(w)]
 
 
 def is_open(windows: list[HoursWindow], at: datetime) -> tuple[bool, float | None]:
@@ -787,9 +843,10 @@ def is_open(windows: list[HoursWindow], at: datetime) -> tuple[bool, float | Non
     Between   -> (False, minutes until the NEXT window's close)  [positive].
     All past  -> (False, minutes since the last close)           [NEGATIVE].
 
-    Overnight windows (close < open) are rolled to the next day AND their
-    previous-day occurrence is considered, so probing 01:00 against date-D
-    hours correctly matches the 22:00(D-1)->02:00(D) window. With several units,
+    Each window is anchored to its OWN source date; an overnight window
+    (close <= open) rolls its close into the next day. To read an early-morning
+    instant correctly, pass D-1's ACTUAL overnight windows as well (see
+    `open_windows`) -- `is_open` will not manufacture them. With several units,
     "minutes until close" is the union's LAST close, not the first unit's.
     """
     if not windows:
@@ -808,6 +865,69 @@ def is_open(windows: list[HoursWindow], at: datetime) -> tuple[bool, float | Non
         return False, (close_dt - at).total_seconds() / 60
     _, close_dt = spans[-1]
     return False, (close_dt - at).total_seconds() / 60
+
+
+# A prior-day overnight window can only still be open in the early morning
+# (the verified overnight windows close at 02:00). This is the latest clock time
+# at which we will even look for one on a day with no published windows; it
+# keeps a late-morning probe from failing just because the previous day's
+# fixture is absent.
+_MORNING_CUTOFF = time(6, 0)
+
+
+def _needs_prior_overnight(day_windows: list[HoursWindow], at: datetime,
+                           day: date) -> bool:
+    """Would D-1's real overnight windows be needed to judge `at` on `day`?
+
+    Only an early-morning instant can fall inside a window that opened the
+    previous evening. On a day with windows, "early" means before the first
+    one opens; on a day with no windows we use a conservative morning cutoff so
+    a midday probe is not made to depend on yesterday's fixture.
+    """
+    if at.date() != day:
+        return False
+    opens = [_parse_clock(w.open_time) for w in day_windows if w.open_time]
+    if opens:
+        return at.time() < min(opens)
+    return at.time() < _MORNING_CUTOFF
+
+
+def _prior_overnight_windows(foodpro_id: str, day: date, force: bool,
+                             max_age_s: float | None
+                             ) -> list[HoursWindow] | None:
+    """D-1's ACTUAL overnight windows, or None when D-1 cannot be read.
+
+    None means UNKNOWN, never closed: a missing previous day must not be
+    reported as a closed window, and its schedule must never be invented by
+    shifting `day`'s windows backward.
+    """
+    try:
+        prev = hours(foodpro_id, day - timedelta(days=1), force=force,
+                     max_age_s=max_age_s)
+    except Exception:                                        # noqa: BLE001
+        return None
+    return [w for w in prev if _is_overnight(w)]
+
+
+def open_windows(foodpro_id: str, day: date, at: datetime,
+                 force: bool = False,
+                 max_age_s: float | None = config.DEFAULT_MENU_CACHE_MAX_AGE_S
+                 ) -> tuple[list[HoursWindow], str | None]:
+    """Windows to judge `at` on service date `day`, plus a prior-day status.
+
+    Returns (windows, prior_status): `windows` are `day`'s own windows plus,
+    when the probe is early enough that a previous-day overnight window could
+    still be open, D-1's ACTUAL overnight windows. `prior_status` is
+    STATUS_UNAVAILABLE when a prior-day lookup was needed but failed, else None.
+    Never shifts `day`'s windows backward.
+    """
+    day_windows = hours(foodpro_id, day, force=force, max_age_s=max_age_s)
+    if not _needs_prior_overnight(day_windows, at, day):
+        return day_windows, None
+    prior = _prior_overnight_windows(foodpro_id, day, force, max_age_s)
+    if prior is None:
+        return day_windows, STATUS_UNAVAILABLE
+    return day_windows + prior, None
 
 
 # ------------------------------------------------------------------ status
@@ -831,13 +951,18 @@ def location_status(location_num: str, d: date | str | None = None,
     num = str(location_num)
     day = _as_date(d) if d is not None else _now_campus().date()
     name = config.DINING_LOCATIONS.get(num, "")
+    when = at or _now_campus()
 
     menu_res = menu_result(num, day, force=force, max_age_s=max_age_s)
 
     hours_status = STATUS_OK
     hours_reason: str | None = None
     try:
-        wins = hours(num, day, force=force, max_age_s=max_age_s)
+        # `open_windows` adds D-1's ACTUAL overnight windows when the probe is
+        # early enough to need them, and reports UNKNOWN (not closed) when that
+        # previous day cannot be read. It never shifts D's windows backward.
+        wins, prior_status = open_windows(
+            num, day, when, force=force, max_age_s=max_age_s)
     except Exception as exc:                                 # noqa: BLE001
         # CacheMiss, NotYetAvailableError, a future-captured envelope, or any
         # upstream failure: the source is unavailable, NOT a closed day.
@@ -845,10 +970,13 @@ def location_status(location_num: str, d: date | str | None = None,
         hours_status = STATUS_UNAVAILABLE
         hours_reason = str(exc)
     else:
-        if not wins:
+        if prior_status == STATUS_UNAVAILABLE:
+            hours_status = STATUS_UNAVAILABLE
+            hours_reason = ("previous-day hours unavailable for an "
+                            "early-morning probe")
+        elif not wins:
             hours_status = STATUS_CLOSED
 
-    when = at or _now_campus()
     if hours_status == STATUS_OK:
         open_now: bool | None = is_open(wins, when)[0]
     elif hours_status == STATUS_CLOSED:
@@ -1061,6 +1189,7 @@ def eat_options(
     at: datetime | None = None,
     open_only: bool = False,
     force: bool = False,
+    max_age_s: float | None = config.DEFAULT_MENU_CACHE_MAX_AGE_S,
 ) -> list[MenuItem]:
     """Menu items matching diet / allergen-avoidance / kcal preferences.
 
@@ -1072,15 +1201,19 @@ def eat_options(
     diet: matched against the lowercased diet_tags (e.g. "vegan").
     max_kcal: requires a nutrition fetch (chunked, cached); items whose
         calories exceed the ceiling, or whose nutrients are unavailable,
-        are dropped (conservative).
+        are dropped (conservative). This stays HARD even when nutrition is
+        future-captured/unavailable: the result is then empty, not unproven.
     open_only: gates on the location's hours at `at` (default: campus now),
-        using the verified foodpro_id == locationNum join. Closed -> [].
+        using the verified foodpro_id == locationNum join. A closed location
+        (or one whose early-morning previous-day hours are unknown) -> [].
+    max_age_s: menu/nutrition TTL; forwarded so LIVE callers refresh rather
+        than reuse a cached menu indefinitely.
     """
     day = _as_date(d)
     # Use the typed result, not the frozen menu(): a genuine empty menu is a
     # valid (empty) option list for filtering, while an unavailable source must
     # still surface as an error to callers.
-    res = menu_result(location_num, day, force=force)
+    res = menu_result(location_num, day, force=force, max_age_s=max_age_s)
     if res.status == STATUS_UNAVAILABLE:
         raise MenuError(res.reason or f"menu unavailable for {location_num}")
     items = list(res.items)
@@ -1099,7 +1232,8 @@ def eat_options(
         # boundaries, every chunk key missed the cache, and because a miss means
         # "kcal unknown" the ceiling then dropped all 142 candidates -- the meal
         # silently vanished from every plan. See nutrition_for_location().
-        nut = nutrition_for_location(location_num, day, force=force)
+        nut = nutrition_for_location(location_num, day, force=force,
+                                     max_age_s=max_age_s)
         items = [
             it for it in items
             if it.recipe_id in nut and nut[it.recipe_id].cals <= max_kcal
@@ -1107,8 +1241,13 @@ def eat_options(
 
     if open_only:
         # hours API is keyed by foodpro_id; verified equal to locationNum.
-        wins = hours(location_num, day, force=force)
-        open_now, _ = is_open(wins, at or _now_campus())
+        # `open_windows` adds D-1's real overnight windows for an early probe.
+        when = at or _now_campus()
+        wins, prior_status = open_windows(
+            location_num, day, when, force=force, max_age_s=max_age_s)
+        if prior_status == STATUS_UNAVAILABLE:
+            return []           # cannot prove open -> do not claim it
+        open_now, _ = is_open(wins, when)
         if not open_now:
             return []
 

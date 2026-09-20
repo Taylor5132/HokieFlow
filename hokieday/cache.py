@@ -504,23 +504,61 @@ def has(name: str, params: dict | None = None) -> bool:
     return _json_path(name, params).exists()
 
 
+def read_envelope(name: str, params: dict | None = None) -> dict | None:
+    """Public snapshot of a cache envelope: payload AND provenance in ONE read.
+
+    This is the atomic primitive for callers that must not pair a payload with
+    a provenance stamp from a different file version. In DEMO_MODE=cache the
+    store is frozen, so the snapshot is exactly the replay truth. In live mode a
+    concurrent refresh can still replace the file before the next read, so a
+    caller that fetches and then snapshots must treat provenance as advisory --
+    use get_json_with_metadata() to keep the window as small as practical.
+
+    Returns None when the key is absent or the envelope is unreadable.
+    """
+    path = _json_path(name, params)
+    if not path.exists():
+        return None
+    try:
+        return _read_envelope(path)
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
 def metadata(name: str, params: dict | None = None) -> dict | None:
     """Public, read-only provenance for a cache key -- or None if absent.
 
     Exposes the envelope's capture fields (key, url, fetched_at, mode) WITHOUT
     the payload, so callers that only need provenance never reach into the
     private envelope helpers. A caller that needs payload + provenance together
-    should still call get_json() then metadata(); the pair is not atomic across
-    a concurrent live refresh, so provenance is advisory, not a lock.
+    should use get_json_with_metadata(); this call alone is not atomic across a
+    concurrent live refresh, so its provenance is advisory, not a lock.
     """
-    path = _json_path(name, params)
-    if not path.exists():
-        return None
-    try:
-        env = _read_envelope(path)
-    except Exception:                                        # noqa: BLE001
+    env = read_envelope(name, params)
+    if env is None:
         return None
     return {k: env.get(k) for k in ("key", "url", "fetched_at", "mode")}
+
+
+def get_json_with_metadata(name: str, url: str, *, params: dict | None = None,
+                           max_age_s: float | None = None, force: bool = False,
+                           timeout: int = 30) -> tuple[Any, dict]:
+    """Payload plus its provenance, from the SAME envelope where possible.
+
+    Replay (DEMO_MODE=cache): the frozen store cannot change, so payload and
+    provenance are guaranteed consistent -- this is a single atomic read.
+
+    Live: get_json() may refresh the file first, then one envelope read supplies
+    the provenance. A concurrent refresh in between can still make the stamp
+    newer than the payload, so provenance stays advisory here. This function
+    does NOT claim an atomic lock; it just removes the second full read.
+    """
+    payload = get_json(name, url, params=params, max_age_s=max_age_s,
+                       force=force, timeout=timeout)
+    env = read_envelope(name, params)
+    if env is None:
+        return payload, {}
+    return payload, {k: env.get(k) for k in ("key", "url", "fetched_at", "mode")}
 
 
 def put_json(name: str, url: str, payload: Any, *, params: dict | None = None) -> None:

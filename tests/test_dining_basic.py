@@ -41,7 +41,9 @@ def setUpModule():
 
 D = date(2026, 9, 19)                     # the frozen Saturday snapshot
 D2 = date(2026, 9, 20)
-AT = datetime(2026, 9, 19, 15, 22)        # inside the pinned replay clock
+# The pinned replay clock is 2026-09-19T15:22:29Z == 11:22 ET. `at` values are
+# CAMPUS-LOCAL (naive), so the pinned campus instant is 11:22, not 15:22.
+AT = datetime(2026, 9, 19, 11, 22)
 
 SYN_FETCHED = "2026-09-19T15:00:00+00:00"     # <= replay pin 15:22:29
 FUTURE_FETCHED = "2026-09-19T23:00:00+00:00"  # > replay pin: rejected
@@ -148,6 +150,42 @@ def _seed():
         ("dining_menu", {"location_num": "18", "dtdate": "09/19/2026"},
          _menu("18", [("Deli", [_recipe("R1", "Wrong Day")])],
                dtdate="09/18/2026"), SYN_FETCHED),
+        # source mismatch: payload missing BOTH identity fields
+        ("dining_menu", {"location_num": "72", "dtdate": "09/19/2026"},
+         {"meals": [{"mealName": "Lunch", "sections": [{
+             "sectionName": "Deli",
+             "recipes": [_recipe("R1", "No Identity")]}]}]},
+         SYN_FETCHED),
+        # source mismatch: payload missing just the date
+        ("dining_menu", {"location_num": "01", "dtdate": "09/19/2026"},
+         {"locationNum": "01", "meals": [{"mealName": "Lunch", "sections": [{
+             "sectionName": "Deli",
+             "recipes": [_recipe("R1", "No Date")]}]}]},
+         SYN_FETCHED),
+        # contemporaneous all-menu nutrition for 39 (captured BEFORE the pin), so
+        # a live-like kcal path can be exercised without future data.
+        ("nutrition_location", {"location_num": "39", "date": "2026-09-19"},
+         {"recipes": [
+             {"id": "R1", "nutrients": [{"name": "Cals", "value": "500"}]},
+             {"id": "R2", "nutrients": [{"name": "Cals", "value": "120"}]},
+             {"id": "R3", "nutrients": [{"name": "Cals", "value": "650"}]},
+         ]}, SYN_FETCHED),
+        # future-captured nutrition for 71: must be refused as non-contemporaneous
+        ("nutrition_location", {"location_num": "71", "date": "2026-09-19"},
+         {"recipes": [{"id": "R1",
+                       "nutrients": [{"name": "Cals", "value": "9999"}]}]},
+         FUTURE_FETCHED),
+        # a CONTEMPORANEOUS raw chunk for 71's one-item menu order; the future
+        # derived envelope above must be skipped and this chunk used instead.
+        ("dining_nutrition", {"items": "R1*1*1"},
+         {"recipes": [{"id": "R1",
+                       "nutrients": [{"name": "Cals", "value": "420"}]}]},
+         SYN_FETCHED),
+        # a Sunday-only overnight window with NO Saturday fixture: probing early
+        # Sunday must be UNKNOWN, not open (that would need Saturday's schedule).
+        ("dining_hours", {"foodpro_id": "72", "date": "2026-09-20"},
+         _hours("72", [("Synthetic Deet's", [("22:00:01", "02:00:00")])],
+                start="2026-09-20"), SYN_FETCHED),
         # closed day with an unreachable menu -> composite unavailable, not closed
         ("dining_hours", {"foodpro_id": "01", "date": "2026-09-19"}, [],
          SYN_FETCHED),
@@ -354,6 +392,22 @@ class TestSourceValidation(unittest.TestCase):
         self.assertIn("source_mismatch", res.reason)
         self.assertIn("date", res.reason)
 
+    def test_payload_missing_identity_is_source_mismatch(self):
+        # Neither locationNum nor date: identity is REQUIRED, not optional.
+        with SyntheticCache():
+            res = dining.menu_result("72", D)
+        self.assertEqual(res.status, dining.STATUS_UNAVAILABLE)
+        self.assertIn("source_mismatch", res.reason)
+        self.assertEqual(res.items, ())
+
+    def test_payload_missing_date_is_source_mismatch(self):
+        with SyntheticCache():
+            res = dining.menu_result("01", D)
+        self.assertEqual(res.status, dining.STATUS_UNAVAILABLE)
+        self.assertIn("source_mismatch", res.reason)
+        self.assertIn("date", res.reason)
+        self.assertEqual(res.items, ())
+
 
 # ============================================================ hours windows
 class TestOvernightHours(unittest.TestCase):
@@ -377,13 +431,35 @@ class TestOvernightHours(unittest.TestCase):
         self.assertAlmostEqual(mins, 60.0, delta=0.1)
 
     def test_previous_day_window_covers_next_day_early_hours(self):
-        # The 09-20 window is only in the 09-20 list; its previous-day
-        # occurrence (22:00 on 09-19 -> 02:00 on 09-20) must still match 01:00.
+        # 01:00 on 09-20 is covered by SATURDAY's real 22:00->02:00 window, not
+        # by Sunday's own window shifted backward. open_windows() loads the
+        # actual D-1 fixture; is_open() alone must never invent it.
         with SyntheticCache():
-            windows = dining.hours("71", D2)
+            sunday_only = dining.hours("71", D2)
+            self.assertFalse(
+                dining.is_open(sunday_only, datetime(2026, 9, 20, 1, 0))[0],
+                "Sunday's own window must not be shifted back onto Saturday")
+            windows, prior_status = dining.open_windows(
+                "71", D2, datetime(2026, 9, 20, 1, 0))
             is_open, mins = dining.is_open(windows, datetime(2026, 9, 20, 1, 0))
+        self.assertIsNone(prior_status)
         self.assertTrue(is_open)
         self.assertAlmostEqual(mins, 60.0, delta=0.1)
+
+    def test_missing_previous_day_is_unknown_not_open(self):
+        # Location 72 has a Sunday-only 22:00->02:00 window and NO Saturday
+        # fixture. At 01:00 Sunday the only window that could cover it began
+        # Saturday, so the honest answer is UNKNOWN -- never "open" (invented)
+        # and never "closed" (a claim we cannot support).
+        with SyntheticCache():
+            windows, prior_status = dining.open_windows(
+                "72", D2, datetime(2026, 9, 20, 1, 0))
+            st = dining.location_status("72", D2,
+                                        at=datetime(2026, 9, 20, 1, 0))
+        self.assertEqual(prior_status, dining.STATUS_UNAVAILABLE)
+        self.assertIsNone(st.open_now)
+        self.assertEqual(st.hours_status, dining.STATUS_UNAVAILABLE)
+        self.assertEqual(st.status, dining.STATUS_UNAVAILABLE)
 
     def test_before_opening_is_positive_and_after_close_is_negative(self):
         with SyntheticCache():
@@ -592,12 +668,47 @@ class TestPartialFailure(unittest.TestCase):
             self.assertEqual(entry["status"], "nutrition_unavailable")
         self.assertIn("max_kcal", res["reason"])
 
-    def test_single_location_kcal_query_still_proves_calories(self):
+    def test_single_location_kcal_query_refuses_future_nutrition(self):
+        # The committed D2 nutrition was captured AFTER the replay pin, so a
+        # single-location hard ceiling must return NO unproven items with a
+        # typed nutrition_unavailable state -- never rows with unknown kcal.
         res = tools.find_food(location_num="15", max_kcal=800,
                               avoid=("Peanuts",))
+        self.assertEqual(res["count"], 0)
+        self.assertEqual(res["items"], [])
+        self.assertEqual(res["sources_ok"], [])
+        self.assertEqual(res["sources_skipped"][0]["location_num"], "15")
+        self.assertEqual(res["sources_skipped"][0]["status"],
+                         "nutrition_unavailable")
+
+    def test_single_location_kcal_query_proves_calories_when_contemporaneous(
+            self):
+        # A synthetic cache whose nutrition was captured BEFORE the replay pin
+        # (the live-like case) still proves and attaches calories.
+        with SyntheticCache():
+            res = tools.find_food(location_num="39", max_kcal=800)
         self.assertGreater(res["count"], 0)
         self.assertTrue(all(r["kcal"] is not None for r in res["items"]))
-        self.assertEqual(res["sources_ok"], ["15"])
+        self.assertTrue(all(r["kcal"] <= 800 for r in res["items"]))
+        self.assertEqual(res["sources_ok"], ["39"])
+
+    def test_future_captured_nutrition_is_not_used(self):
+        # Real fixtures: D2's derived all-menu envelope (16:37Z) and every menu
+        # chunk (16:29Z) were captured AFTER the 15:22:29Z pin, so replay must
+        # leave kcal unknown rather than present later data as contemporaneous.
+        self.assertEqual(dining.nutrition_for_location("15", D), {})
+        # ...while the ONE contemporaneous chunk is still used normally.
+        good = dining.nutrition_bulk([("214022", "1", 1),
+                                      ("141002", "2", 1)])
+        self.assertEqual(set(good), {"214022", "141002"})
+
+    def test_future_derived_envelope_is_skipped_for_a_real_chunk(self):
+        # 71's derived all-menu envelope is future-captured; its contemporaneous
+        # raw chunk must win instead, proving the future envelope was skipped.
+        with SyntheticCache():
+            nut = dining.nutrition_for_location("71", D)
+        self.assertEqual(set(nut), {"R1"})
+        self.assertEqual(nut["R1"].cals, 420.0)
 
     def test_single_location_find_food_only_reports_that_location(self):
         res = tools.find_food(location_num="39")
@@ -637,6 +748,57 @@ class TestStalenessAndProvenance(unittest.TestCase):
                                    {"location_num": "39",
                                     "dtdate": "09/19/2026"}))
         self.assertEqual(res.fetched_at, SYN_FETCHED)
+
+
+# ============================================================ live TTL
+class TestLiveTTLForwarding(unittest.TestCase):
+    """LIVE paths must enforce the menu/nutrition TTL, not reuse cache forever."""
+
+    def test_menu_defaults_to_the_menu_ttl(self):
+        calls = []
+
+        def spy(name, url, **kw):
+            calls.append((name, kw.get("max_age_s")))
+            return {"locationNum": "39", "date": "09/19/2026", "meals": [{
+                "mealName": "Lunch", "sections": [{
+                    "sectionName": "Deli",
+                    "recipes": [_recipe("R1", "TTL Dish")]}]}]}, {}
+
+        with patch.object(dining.cache, "get_json_with_metadata",
+                          side_effect=spy):
+            dining.menu("39", D)
+        self.assertEqual(calls, [("dining_menu",
+                                  config.DEFAULT_MENU_CACHE_MAX_AGE_S)])
+
+    def test_eat_options_forwards_an_explicit_ttl(self):
+        calls = []
+
+        def spy(name, url, **kw):
+            calls.append((name, kw.get("max_age_s")))
+            return {"locationNum": "39", "date": "09/19/2026",
+                    "meals": []}, {}
+
+        with patch.object(dining.cache, "get_json_with_metadata",
+                          side_effect=spy):
+            dining.eat_options("39", D, max_age_s=42)
+        self.assertTrue(calls)
+        self.assertTrue(all(ttl == 42 for _, ttl in calls))
+
+    def test_find_food_forwards_ttl_to_single_location_nutrition(self):
+        seen = []
+        real = dining.nutrition_for_location
+
+        def spy(num, day, force=False, max_age_s="MISSING"):
+            seen.append(max_age_s)
+            return real(num, day, force=force, max_age_s=max_age_s)
+
+        with SyntheticCache():
+            with patch.object(dining, "nutrition_for_location",
+                              side_effect=spy):
+                tools.find_food(location_num="39", max_kcal=800,
+                                max_age_s=77)
+        self.assertTrue(seen)
+        self.assertTrue(all(v == 77 for v in seen), seen)
 
 
 # ============================================================ determinism

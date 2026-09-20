@@ -295,6 +295,21 @@ class CacheConcurrencyTest(unittest.TestCase):
         cache.put_json("derived2", "derived: y", {"v": 2})
         self.assertFalse(cache.has("derived2"))
 
+    def test_read_envelope_is_a_single_payload_plus_provenance_snapshot(self):
+        self._write_stale("atomic", {"v": 7}, age_s=10)
+        env = cache.read_envelope("atomic")
+        self.assertEqual(env["payload"], {"v": 7})
+        self.assertIn("fetched_at", env)
+        self.assertEqual(cache.read_envelope("absent"), None)
+
+    def test_get_json_with_metadata_returns_a_matched_pair(self):
+        self._write_stale("atomic", {"v": 7}, age_s=10)
+        payload, meta = cache.get_json_with_metadata(
+            "atomic", "http://x", max_age_s=60)
+        self.assertEqual(payload, {"v": 7})
+        self.assertEqual(meta["key"], "atomic")
+        self.assertIn("fetched_at", meta)
+
     def test_binary_cache_read_path_is_preserved(self):
         p = cache._bin_path("bt_gtfs")
         p.write_bytes(b"ZIPDATA")

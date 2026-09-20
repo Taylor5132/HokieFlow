@@ -100,3 +100,26 @@ restore a known-good frozen snapshot.
    you reintroduce the replay-clock drift (see above).
 7. **Never treat a blank allergen field as allergen-free.** 188 of 470 D2 items
    state no allergens; blank means UNKNOWN (SDD risk R8).
+## Data sources, attribution, and use
+
+This project is an unaffiliated student hackathon entry. Dining data comes from
+Virginia Tech's public **FoodPro** endpoints (`foodpro.students.vt.edu/menus/API/*`
+and `apps.students.vt.edu/hours/...`); transit data comes from **BT**'s public
+GTFS feed and live-bus endpoint; weather comes from the **NWS** API. Those marks
+and data belong to their respective owners.
+
+- **No endorsement.** Virginia Tech, BT, NWS, Deloitte, and Databricks have not
+  reviewed, approved, or endorsed HokieFlow or these fixtures.
+- **No redistribution claim.** The committed `fixtures/` are a small, frozen
+  cache captured for an offline demo and tests. They are not an official data
+  distribution; anyone reusing this repo should re-fetch from the upstream
+  sources under their terms rather than rely on the snapshot.
+- **Data-use caveat.** Menus, nutrition, and hours change constantly; allergen
+  and nutrition fields can be incomplete (`----` means missing, and a blank
+  allergen field means UNKNOWN). Do not use HokieFlow for allergy or dietary
+  decisions without verifying against the venue. Staff usernames and other
+  internal metadata that the APIs returned were removed from the committed
+  hours fixture; only unit names, FoodPro IDs, and hour windows are kept.
+- **Provenance is enforced, not cosmetic.** A menu, hours, or nutrition envelope
+  captured after `config.now()` is refused as non-contemporaneous, so replay
+  never presents later data as fresh.

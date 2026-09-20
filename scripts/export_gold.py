@@ -159,6 +159,10 @@ def build_bundle() -> dict:
                 "blank allergen field means UNKNOWN, not allergen-free",
                 "live bus positions are a replayed snapshot; sched_delta_min is "
                 "computed against the snapshot clock",
+                "in replay, nutrition captured after the pinned clock is refused "
+                "as non-contemporaneous, so eat_options.kcal is null and a "
+                "kcal ceiling drops unproven items; live mode attaches real "
+                "macros",
             ],
         },
         "stops": stops,

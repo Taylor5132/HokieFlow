@@ -3,6 +3,12 @@
 **Verified live on 2026-09-19 ~11:20 ET.** All endpoints below were actually called and returned usable data.
 Submission deadline: **Sun 2026-09-20 08:00 ET.** Judging 10:30–13:00, 4-minute pitch.
 
+> **Attribution / use.** Unaffiliated student hackathon project. FoodPro data is
+> Virginia Tech's; transit data is BT's; weather is NWS's. No endorsement by any
+> of them is implied. The committed `fixtures/` are a frozen demo/test snapshot,
+> not an official distribution — re-fetch upstream under their terms. See
+> `README.md` → "Data sources, attribution, and use".
+
 ---
 
 ## 1. DATA VERDICT — what we can actually use
