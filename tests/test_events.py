@@ -481,7 +481,9 @@ class FrozenSnapshotTests(unittest.TestCase):
     def test_snapshot_browse_and_gap_flow(self):
         now = events.parse_event_time(self.snap.fetched_at)
         res = events.browse(self.snap, now=now)
-        self.assertEqual(res.state, events.STATE_OK)
+        # The crawl saw 33 unreachable pages, so the snapshot is PARTIAL, never ok.
+        self.assertEqual(res.state, events.STATE_PARTIAL)
+        self.assertTrue(self.snap.fetch_failures)
         self.assertEqual(res.total, len(self.snap.events))
         free = events.browse(self.snap, free=True, now=now)
         self.assertTrue(all(e.admission == events.ADMISSION_FREE for e in free.events))
@@ -497,6 +499,318 @@ class FrozenSnapshotTests(unittest.TestCase):
         ics = events.to_ics(self.snap.events)
         self.assertEqual(ics.count("BEGIN:VEVENT"), len(self.snap.events))
         self.assertIn("END:VCALENDAR", ics)
+
+
+class PartialStateTests(unittest.TestCase):
+    def _snap(self, evs, **kw):
+        return events.Snapshot(
+            month="2026-09", generated_at="t", fetched_at="2026-09-19T15:00:00+00:00",
+            source={}, coverage={}, events=tuple(evs), **kw)
+
+    def test_any_fetch_or_parse_failure_is_partial_never_ok(self):
+        now = datetime(2026, 9, 19, 16, tzinfo=timezone.utc)
+        self.assertEqual(events.snapshot_state(self._snap([make_event()]), now=now),
+                         events.STATE_OK)
+        self.assertEqual(
+            events.snapshot_state(self._snap([make_event()], fetch_failures=("u",)), now=now),
+            events.STATE_PARTIAL)
+        self.assertEqual(
+            events.snapshot_state(self._snap([make_event()], parser_failures=("u",)), now=now),
+            events.STATE_PARTIAL)
+
+    def test_fetch_failures_round_trip(self):
+        snap = self._snap([make_event()], fetch_failures=("https://x/1",))
+        restored = events.Snapshot.from_dict(json.loads(json.dumps(snap.to_dict())))
+        self.assertEqual(restored.fetch_failures, ("https://x/1",))
+
+
+class UnknownEndTests(unittest.TestCase):
+    def test_unknown_end_lists_but_is_not_recommendable(self):
+        ev = make_event(end=None)
+        self.assertTrue(ev.duration_unknown)
+        self.assertTrue(ev.not_recommendable)
+        gap = events.Gap(datetime(2026, 9, 22, 9, tzinfo=TZ),
+                         datetime(2026, 9, 23, 0, tzinfo=TZ))
+        self.assertIsNone(events.fits_gap(ev, [gap]))
+        self.assertEqual(events.recommendable([ev], [gap]), [])
+        snap = events.Snapshot("2026-09", "t", "2026-09-19T15:00:00+00:00", {}, {},
+                               (ev,))
+        self.assertIn(ev.id, [e.id for e in events.browse(snap).events])
+        self.assertTrue(events.to_calendar_event(ev)["duration_unknown"])
+        self.assertFalse(events.to_calendar_event(ev)["recommendable"])
+
+    def test_known_end_is_recommendable(self):
+        ev = make_event()
+        self.assertFalse(ev.duration_unknown)
+        gap = events.Gap(datetime(2026, 9, 22, 9, tzinfo=TZ),
+                         datetime(2026, 9, 22, 13, tzinfo=TZ))
+        self.assertIsNotNone(events.fits_gap(ev, [gap]))
+
+
+class UrlPolicyTests(unittest.TestCase):
+    def test_allowed_fetch_url(self):
+        self.assertTrue(events.allowed_fetch_url("https://events.vt.edu/events/2026/09/x.html"))
+        self.assertTrue(events.allowed_fetch_url("https://events.vt.edu/sitemap.xml"))
+        self.assertTrue(events.allowed_fetch_url("https://events.vt.edu/"))
+        for bad in ("http://events.vt.edu/x", "https://evil.com/x",
+                    "https://events.vt.edu.evil.com/x", "https://events.vt.edu@evil.com/x",
+                    "https://localhost/x", "https://127.0.0.1/x",
+                    "https://events.vt.edu:8443/x", "https://events.vt.edu/../secret"):
+            self.assertFalse(events.allowed_fetch_url(bad), bad)
+
+    def test_resolve_url(self):
+        self.assertEqual(events.resolve_url("https://events.vt.edu/a/b.html", "/events/x.html"),
+                         "https://events.vt.edu/events/x.html")
+        self.assertEqual(events.resolve_url("https://events.vt.edu/a/b.html", "c.html"),
+                         "https://events.vt.edu/a/c.html")
+        self.assertIsNone(events.resolve_url("https://events.vt.edu/a", None))
+
+    def test_validate_month_fixed_scope(self):
+        self.assertTrue(events.validate_month("2026-09"))
+        self.assertFalse(events.validate_month("2026-10"))
+        self.assertFalse(events.validate_month(None))
+
+
+_REORDERED_DETAIL = """<html><head>
+<meta content='2026-09-22T10:00Z-0400' itemprop='startDate'/>
+<meta itemprop="endDate" content="2026-09-22T16:00Z-0400"/>
+<meta name=keywords content="Public;Free;In-Person"/>
+<link rel="canonical" href="/events/2026/09/relative.html">
+<title>Relative</title></head><body>
+<h1 class="vt-page-title">Relative <em>Title</em></h1>
+<span id=vt_event_location_building>Squires <b>Center</b></span>
+<span id="vt_event_location_address">Blacksburg, VA 24061</span>
+<span class="vt-event-free" itemprop="price" content="Free">Free</span>
+<a class="vt-tag-link" href="x">Free Food</a>
+<a class="reg" href="/register/here">Register</a>
+</body></html>"""
+
+
+def _unfold_ics(ics: str) -> list[str]:
+    out: list[str] = []
+    for line in ics.split("\r\n"):
+        if line.startswith(" ") and out:
+            out[-1] += line[1:]
+        else:
+            out.append(line)
+    return out
+
+
+class HtmlParserTests(unittest.TestCase):
+    def test_detail_reordered_attrs_and_single_quotes(self):
+        ev = events.parse_detail(_REORDERED_DETAIL,
+                                 "https://events.vt.edu/events/2026/09/page.html",
+                                 fetched_at="2026-09-19T15:00:00+00:00")
+        self.assertEqual(ev.title, "Relative Title")
+        self.assertEqual(ev.location_name, "Squires Center")
+        self.assertEqual(ev.canonical_url,
+                         "https://events.vt.edu/events/2026/09/relative.html")
+        self.assertEqual(ev.admission, events.ADMISSION_FREE)
+        self.assertEqual(ev.start, "2026-09-22T10:00-04:00")
+        self.assertIn("Free Food", ev.tags)
+        self.assertEqual(ev.registration_url, "https://events.vt.edu/register/here")
+
+    def test_listing_reordered_attrs_and_sr_only(self):
+        html = ("<ul><li class='item event-page categories arts admission free "
+                "types in-person'>"
+                "<a href='/events/2026/09/x.html' class='vt-list-item-title-link'>"
+                "Real Title <span class='sr-only'>, event</span></a></li></ul>")
+        cards = events.parse_listing(html, "https://events.vt.edu/events/2026.html")
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0].title, "Real Title")
+        self.assertEqual(cards[0].url, "https://events.vt.edu/events/2026/09/x.html")
+
+
+class BlacksburgTests(unittest.TestCase):
+    def test_explicit_other_city_overrides_venue_fallback(self):
+        self.assertFalse(events.is_blacksburg(
+            "900 N Glebe Rd, Arlington, VA 22203", "Virginia Tech Research Center", ()))
+
+    def test_blackburg_tag_wins(self):
+        self.assertTrue(events.is_blacksburg("", "", ("Blacksburg, VA 24061",)))
+
+    def test_online_only_rejected(self):
+        self.assertFalse(events.is_blacksburg(
+            "Blacksburg, VA 24061", "Squires", ("Online",)))
+
+    def test_unknown_address_uses_venue(self):
+        self.assertTrue(events.is_blacksburg("", "Moss Arts Center", ()))
+
+
+class FreeFoodTriStateTests(unittest.TestCase):
+    def test_none_is_not_matched_by_true_or_false(self):
+        unknown = make_event(free_food=None)
+        yes = make_event(id="evt_y", source_url="https://x/y", canonical_url="https://x/y",
+                         free_food=True)
+        no = make_event(id="evt_n", source_url="https://x/n", canonical_url="https://x/n",
+                        free_food=False)
+        self.assertEqual([e.id for e in events.filter_events([unknown, yes, no], free_food=True)],
+                         [yes.id])
+        self.assertEqual([e.id for e in events.filter_events([unknown, yes, no], free_food=False)],
+                         [no.id])
+
+
+class IcsHardeningTests(unittest.TestCase):
+    def test_all_day_exclusive_dtend(self):
+        ev = make_event(start="2026-09-22", end=None, all_day=True)
+        cal = events.to_calendar_event(ev)
+        self.assertIn("DTSTART;VALUE=DATE", cal["ics"])
+        self.assertEqual(cal["ics"]["DTSTART;VALUE=DATE"], "20260922")
+        self.assertEqual(cal["ics"]["DTEND;VALUE=DATE"], "20260923")
+        self.assertIn("DTSTART;VALUE=DATE:20260922", events.to_ics([ev]))
+
+    def test_crlf_injection_is_neutralized(self):
+        ev = make_event(title="Evil\r\nEND:VEVENT:injected")
+        ics = events.to_ics([ev])
+        raw_lines = ics.split("\r\n")
+        # exactly ONE real component terminator; the payload is escaped inline
+        self.assertEqual(sum(1 for line in raw_lines if line == "END:VEVENT"), 1)
+        self.assertNotIn("END:VEVENT:injected", raw_lines)
+        summary = [line for line in _unfold_ics(ics) if line.startswith("SUMMARY:")][0]
+        self.assertEqual(summary, "SUMMARY:Evil\\nEND:VEVENT:injected")
+
+    def test_long_unicode_folds_on_octet_boundaries(self):
+        title = "\u4f1a\u8bae" * 60 + " \U0001f600" * 10
+        ev = make_event(title=title)
+        ics = events.to_ics([ev])
+        for line in ics.split("\r\n"):
+            if line:
+                self.assertLessEqual(len(line.encode("utf-8")), 75)
+        summary = [line for line in _unfold_ics(ics) if line.startswith("SUMMARY:")][0]
+        self.assertEqual(summary[len("SUMMARY:"):], title)
+
+
+REPO = Path(config.REPO_DIR)
+
+
+class CrawlerLogicTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "crawl_events", REPO / "scripts" / "crawl_events.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        cls.mod = mod
+
+    def test_robots_delay_and_disallow(self):
+        text = ("User-agent: *\nAllow: /\nCrawl-delay: 10\n"
+                "User-agent: BadBot\nDisallow: /\n")
+        self.assertEqual(self.mod.parse_robots_crawl_delay(text), 10.0)
+        rp = self.mod.build_robot_parser(text)
+        self.assertTrue(rp.can_fetch("hokieday", "https://events.vt.edu/events/x.html"))
+        self.assertFalse(rp.can_fetch("BadBot", "https://events.vt.edu/events/x.html"))
+
+    def test_bad_month_refused_without_output(self):
+        import argparse
+        args = argparse.Namespace(month="2026-10", dry_run=False, from_cache=True,
+                                  throttle=10, out="/tmp/never.json",
+                                  state="/tmp/never_state.json", max_pages=200,
+                                  all_locations=False, include_summary=False)
+        self.assertEqual(self.mod.crawl(args), 2)
+
+    def test_planned_entries_resolve_and_allowlist(self):
+        entries = [
+            events.SitemapEntry("/events/2026/09/a.html", "2026-09-01"),
+            events.SitemapEntry("https://evil.com/events/2026/09/b.html", None),
+            events.SitemapEntry("https://events.vt.edu/events/2026/09/c.html", None),
+        ]
+        got = self.mod._planned_detail_entries(entries, 2026, 9)
+        self.assertIn("https://events.vt.edu/events/2026/09/a.html", got)
+        self.assertIn("https://events.vt.edu/events/2026/09/c.html", got)
+        self.assertNotIn("https://evil.com/events/2026/09/b.html", got)
+
+    def test_latest_ts_compares_instants_not_strings(self):
+        # 11:00-04:00 == 15:00Z, which is NEWER than 14:00Z even though the
+        # string sorts lower; max() over strings would pick the wrong one.
+        got = self.mod._latest_ts(["2026-09-10T14:00:00+00:00",
+                                   "2026-09-10T11:00:00-04:00"])
+        self.assertEqual(got, "2026-09-10T11:00:00-04:00")
+        self.assertIsNone(self.mod._latest_ts([]))
+
+    @staticmethod
+    def _seed_page(url, body, ts):
+        import hashlib
+        from hokieday import cache
+        params = {"u": hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]}
+        p = cache._bin_path("events_page", params)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(body)
+        env = {"key": p.stem, "url": url, "fetched_at": ts, "mode": "live",
+               "payload": {"bytes": len(body), "file": p.name}}
+        cache._json_path("events_page", params).write_text(json.dumps(env))
+
+    def test_from_cache_never_advances_fetched_at(self):
+        import argparse
+        import tempfile
+        from hokieday import config
+
+        old_cache = config.CACHE_DIR
+        seed_ts = "2026-09-01T00:00:00+00:00"
+        detail_url = "https://events.vt.edu/events/2026/09/study-abroad-fair.html"
+        sitemap = ("<?xml version='1.0'?><urlset>"
+                   f"<url><loc>{detail_url}</loc><lastmod>2026-09-01</lastmod></url>"
+                   "</urlset>")
+        with tempfile.TemporaryDirectory() as td:
+            config.CACHE_DIR = Path(td)
+            try:
+                self._seed_page("https://events.vt.edu/robots.txt",
+                                b"User-agent: *\nAllow: /\nCrawl-delay: 10\n", seed_ts)
+                self._seed_page("https://events.vt.edu/sitemap.xml",
+                                sitemap.encode("utf-8"), seed_ts)
+                self._seed_page(detail_url, read("detail_study_abroad.html").encode("utf-8"),
+                                seed_ts)
+                out = Path(td) / "out.json"
+                args = argparse.Namespace(
+                    month="2026-09", dry_run=False, from_cache=True, throttle=10,
+                    out=str(out), state=str(Path(td) / "state.json"),
+                    max_pages=200, all_locations=False, include_summary=False)
+                self.assertEqual(self.mod.crawl(args), 0)
+                snap = json.loads(out.read_text(encoding="utf-8"))
+                self.assertEqual(snap["fetched_at"], seed_ts)
+                self.assertEqual(snap["source"]["refresh"]["network_requests"], 0)
+                self.assertEqual(snap["source"]["refresh"]["read_only"], True)
+                self.assertEqual(len(snap["events"]), 1)
+            finally:
+                config.CACHE_DIR = old_cache
+
+
+class ToolsEventsTests(unittest.TestCase):
+    def test_get_events_typed_and_partial(self):
+        from hokieday import tools
+        res = tools.get_events(date="2026-09-22")
+        self.assertIn("state", res)
+        self.assertIn("coverage", res)
+        self.assertIsInstance(res["events"], list)
+        self.assertIn(res["state"],
+                      (events.STATE_PARTIAL, events.STATE_OK, events.STATE_NO_MATCH))
+
+    def test_get_events_out_of_scope(self):
+        from hokieday import tools
+        res = tools.get_events(date="2026-10-05")
+        self.assertEqual(res["state"], events.STATE_OUT_OF_SCOPE)
+        self.assertEqual(res["events"], [])
+
+    def test_get_events_legacy_list_source(self):
+        from hokieday import tools
+
+        class Src:
+            def events(self, date, tags):
+                return [{"title": "x"}]
+
+        self.assertEqual(tools.get_events(source=Src())["state"], events.STATE_OK)
+
+        class Empty:
+            def events(self, date, tags):
+                return []
+
+        self.assertEqual(tools.get_events(source=Empty())["state"], events.STATE_EMPTY)
+
+    def test_get_events_tags_require_all(self):
+        from hokieday import tools
+        res = tools.get_events(date="2026-09-22", tags=("Career Fair",))
+        for e in res["events"]:
+            self.assertIn("career", e["title"].lower())
 
 
 if __name__ == "__main__":

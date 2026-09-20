@@ -11,10 +11,12 @@ The `Source` protocol decouples the tools from where the data lives: today the
 local modules (hokieday.gtfs / livebus / dining), tomorrow Unity Catalog Delta
 tables read inside Databricks. `LocalSource` is the default implementation.
 
-Two honest absences, deliberately NOT faked:
-  * predict_bus_delay -- no model exists yet: basis="no_model", delta None;
-  * get_events        -- the events.vt.edu scrape was never built (SDD 5.6):
-                          [] + reason, never invented rows.
+One honest absence, deliberately NOT faked:
+  * predict_bus_delay -- no model exists yet: basis="no_model", delta None.
+
+get_events is now built: it browses the frozen September 2026 Blacksburg
+snapshot (hokieday.events) and returns a TYPED state/reason envelope rather
+than a bare list.
 
 CLOCK DISCIPLINE: every time comes from config.now() (the replay clock, pinned
 to the snapshot in DEMO_MODE=cache). This module contains no datetime.now()
@@ -28,7 +30,7 @@ from datetime import datetime, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
-from . import config, dining, gtfs, livebus
+from . import config, dining, events as events_mod, gtfs, livebus
 
 _CAMPUS_TZ = ZoneInfo(config.CAMPUS_TZ)
 
@@ -141,9 +143,9 @@ DINING_PLACES: dict[str, str] = {
 }
 
 EVENTS_REASON = (
-    "events feed not built: no scraper exists for events.vt.edu "
-    "(SDD.md section 5.6, known gap). Returning no data rather than "
-    "inventing events."
+    "events snapshot unavailable: no frozen September 2026 snapshot is "
+    "installed. Run scripts/crawl_events.py to build one; returning no data "
+    "rather than inventing events."
 )
 NO_MODEL_BASIS = "no_model"
 
@@ -170,7 +172,7 @@ class Source(Protocol):
 
     def hours(self, foodpro_id: str) -> list[dict]: ...
 
-    def events(self, date: str, tags: tuple[str, ...]) -> list[dict]: ...
+    def events(self, date: str, tags: tuple[str, ...]) -> dict: ...
 
 
 class LocalSource:
@@ -411,10 +413,64 @@ class LocalSource:
         return out
 
     # -------------------------------------------------------------- events
-    def events(self, date: str, tags: tuple[str, ...]) -> list[dict]:
-        # Deliberately empty: the events scrape does not exist yet (SDD 5.6).
-        # We do not fabricate rows to make the demo look fuller.
-        return []
+    def events(self, date: str, tags: tuple[str, ...]) -> dict:
+        """Browse the frozen September 2026 Blacksburg snapshot.
+
+        Returns a TYPED envelope ``{events, state, reason, coverage, month,
+        fetched_at}`` so the agent can speak the empty/partial/stale state
+        instead of a bare list. Never raises: a missing or corrupt snapshot
+        becomes an explicit empty state with a reason.
+        """
+        path = self._events_snapshot_path()
+        if path is None:
+            return {"events": [], "state": events_mod.STATE_EMPTY,
+                    "reason": EVENTS_REASON, "coverage": {},
+                    "month": events_mod.MONTH_KEY, "fetched_at": None}
+        try:
+            snap = events_mod.load_snapshot(path)
+        except Exception as exc:                          # noqa: BLE001
+            return {"events": [], "state": events_mod.STATE_EMPTY,
+                    "reason": f"events snapshot unreadable: {exc}",
+                    "coverage": {}, "month": events_mod.MONTH_KEY,
+                    "fetched_at": None}
+
+        day = _event_date_filter(date, self._now_local().date())
+        if day is not None and not (
+                day.year == events_mod.MONTH_YEAR and day.month == events_mod.MONTH_NUMBER):
+            return {"events": [], "state": events_mod.STATE_OUT_OF_SCOPE,
+                    "reason": (f"events scope is {events_mod.MONTH_KEY} "
+                               f"(Blacksburg); requested {day.isoformat()} is outside it"),
+                    "coverage": snap.coverage, "month": snap.month,
+                    "fetched_at": snap.fetched_at}
+
+        result = events_mod.browse(snap, date_=day, now=self._now_local())
+        rows = list(result.events)
+        if tags:
+            rows = [e for e in rows if _event_matches_tags(e, tags)]
+
+        if rows:
+            state = result.state
+        elif result.state == events_mod.STATE_EMPTY:
+            state = events_mod.STATE_EMPTY
+        else:
+            state = events_mod.STATE_NO_MATCH
+        notices = list(result.notices)
+        if not rows and state == events_mod.STATE_NO_MATCH:
+            notices.append("no events match the requested date/tags")
+        return {"events": [e.to_dict() for e in rows], "state": state,
+                "reason": (" | ".join(notices) or None),
+                "coverage": snap.coverage, "month": snap.month,
+                "fetched_at": snap.fetched_at}
+
+    def _events_snapshot_path(self) -> Any:
+        candidates = [
+            config.FIXTURES_DIR / "events" / "events_september_2026.json",
+            config.CACHE_DIR / "events" / "events_september_2026.json",
+        ]
+        for path in candidates:
+            if path.exists():
+                return path
+        return None
 
     # -------------------------------------------------- LocalSource extras
     # NOT part of the frozen Source protocol. plan_day reaches them via
@@ -492,6 +548,31 @@ def _src(source: Any) -> Any:
 # ---------------------------------------------------------------------------
 # small helpers
 # ---------------------------------------------------------------------------
+def _event_date_filter(value: Any, today: Any) -> Any:
+    """Resolve 'today'/'tomorrow'/ISO date to a date; '' -> None (no filter)."""
+    s = str(value or "").strip().lower()
+    if s == "":
+        return None
+    if s in ("today", "now"):
+        return today
+    if s == "tomorrow":
+        return today + timedelta(days=1)
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _event_matches_tags(ev: Any, tags: tuple[str, ...]) -> bool:
+    """All requested tags must appear somewhere in the event's text."""
+    hay = " ".join((
+        getattr(ev, "title", "") or "", getattr(ev, "category", "") or "",
+        getattr(ev, "location_name", "") or "", getattr(ev, "address", "") or "",
+        " ".join(getattr(ev, "tags", ()) or ()),
+    )).lower()
+    return all(str(t).strip().lower() in hay for t in tags if str(t).strip())
+
+
 def _place(name: str) -> dict | None:
     """Case-insensitive lookup in config.PLACES (a COPY of the row, or None).
 
@@ -838,20 +919,36 @@ def get_hours(foodpro_id: str, source: Any = None) -> dict:
 
 def get_events(date: str = "today", tags: tuple[str, ...] = (),
                source: Any = None) -> dict:
-    """Campus events for a date. ALWAYS [] + reason today: the events.vt.edu
-    scrape has not been built (SDD 5.6 known gap) and we do not invent events."""
+    """Campus events for a date, from the frozen September 2026 snapshot.
+
+    Returns a TYPED result: ``state`` is one of ok/no-match/empty/stale/partial/
+    out-of-scope, plus ``reason``, ``coverage`` and ``fetched_at``. Never raises
+    into the agent loop; a missing snapshot is an explicit empty state.
+    """
     src = _src(source)
     tags = tuple(tags or ())
     try:
-        rows = src.events(str(date), tags)
+        result = src.events(str(date), tags)
     except Exception as exc:                                 # noqa: BLE001
         return {"date": str(date), "tags": list(tags), "events": [],
-                "reason": f"events lookup failed: {exc}"}
-    if not rows:
-        return {"date": str(date), "tags": list(tags), "events": [],
-                "reason": EVENTS_REASON}
+                "state": events_mod.STATE_EMPTY,
+                "reason": f"events lookup failed: {exc}",
+                "coverage": {}, "fetched_at": None}
+
+    if isinstance(result, list):        # legacy Source returned a bare list
+        return {"date": str(date), "tags": list(tags), "events": result,
+                "state": (events_mod.STATE_OK if result else events_mod.STATE_EMPTY),
+                "reason": (None if result else EVENTS_REASON),
+                "coverage": {}, "fetched_at": None}
+
+    rows = list(result.get("events") or ())
     return {"date": str(date), "tags": list(tags), "events": rows,
-            "reason": None}
+            "state": result.get("state") or (
+                events_mod.STATE_OK if rows else events_mod.STATE_EMPTY),
+            "reason": result.get("reason"),
+            "coverage": result.get("coverage") or {},
+            "fetched_at": result.get("fetched_at"),
+            "month": result.get("month")}
 
 
 def predict_bus_delay(route_id: str, hour: int, source: Any = None) -> dict:

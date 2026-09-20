@@ -21,7 +21,7 @@ Submission deadline: **Sun 2026-09-20 08:00 ET.** Judging 10:30–13:00, 4-minut
 | 4 | **VT nutrition** | `.../menus/API/NutritiveReport.aspx?items=<id>*<portion>*<qty>,...` | ✅ **Real** | calories, protein, fat, carbs, fiber, sugar, added sugar, sodium, calcium, iron, vit A/C/D, potassium + %DV |
 | 5 | **VT dining hours** | `https://apps.students.vt.edu/hours/Api/NonRestricted/FoodProCentersOpen/readByFoodPro/15/2026-09-19` | ✅ **Real** | open_time/close_time windows, `announcements`, logo. `extra_data[foodpro_id]` **joins to the menu API** |
 | 6 | **Weather** | `https://api.weather.gov/points/37.2296,-80.4139` | ✅ **Real, no key** | forecast + hourly; no API key required |
-| 7 | **Campus events** | `https://events.vt.edu/events` | ⚠️ **Scrape only** | Server-rendered cards, richly tagged: `free-food`, `in-person`/`hybrid`, `paid`, `blacksburg-va-24061`, category, department. **No API** — BeautifulSoup it |
+| 7 | **Campus events** | `https://events.vt.edu/sitemap.xml` + public detail HTML | ✅ **Integrated (Sept 2026, Blacksburg)** | AEM/Ensemble CMS, **no JSON/RSS/ICS**. Normalized by `hokieday.events`; snapshot of 27 Blacksburg events; tags `free-food`, `in-person`/`hybrid`, `paid`, `blacksburg-va-24061`, category, department |
 | 8 | **FoodPro locations** | `.../menus/API/Locations.aspx` | ✅ **Real** | 12 locations with `locationNum` + `name` |
 | 9 | **Allergen taxonomy** | `.../menus/API/Allergens.aspx?locationNum=15` | ✅ **Real** | 10 allergens (Milk, Eggs, Fish, Crustacean Shellfish, Tree Nuts, Peanuts, Wheat, Soybeans, Gluten, Sesame) + diet codes (wcveg/wcvtn/wcha/wcal) |
 
@@ -117,7 +117,7 @@ agent runtime, Lakebase, Genie, and Databricks App hosting are roadmap boxes.
   ║  get_live_bus (+adherence)    ║
   ║  walk_time                    ║                 ╔═════════════════╗
   ║  find_food (diet/allergen/kcal)║                ║ LAKEBASE        ║
-  ║  get_hours · get_events(stub) ║◀───────────────▶║ profile/prefs   ║
+  ║  get_hours · get_events          ║◀───────────────▶║ profile/prefs   ║
   ║  predict_bus_delay(no_model)  ║                 ║ chat state      ║
   ║  plan_day  (orchestrator)     ║                 ╚═════════════════╝
   ╚═══════════┬═══════════════════╝
@@ -138,7 +138,7 @@ walk_time(from_place:str, to_place:str) -> {minutes, meters}          # haversin
 find_food(location_num:str, date:str, diet:str|None, avoid:[str], min_kcal:int|None,
           max_kcal:int|None) -> [{name, section, kcal, protein_g, allergens, diet_tags}]
 get_hours(foodpro_id:str, date:str) -> [{open_time, close_time}]
-get_events(date:str, tags:[str]|None) -> [{title, start, place, tags}]
+get_events(date:str, tags:[str]|None) -> {state, events:[...], reason, coverage, fetched_at}
 predict_dining_wait(location_num:str, ts:str) -> {wait_min, confidence}
 plan_day(student_id:str, start:str, end:str, prefs:dict) -> {itinerary, rationale, alternatives}
 ```

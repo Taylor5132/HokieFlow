@@ -38,8 +38,10 @@ import json
 import re
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 from . import config
@@ -76,10 +78,54 @@ STATE_EMPTY = "empty"
 STATE_STALE = "stale"
 STATE_PARTIAL = "partial"
 STATE_NO_MATCH = "no-match"
+STATE_OUT_OF_SCOPE = "out-of-scope"
 
 ADMISSION_FREE = "free"
 ADMISSION_PAID = "paid"
 ADMISSION_UNKNOWN = "unknown"
+
+# ---------------------------------------------------------------- url policy
+# Only the official public events host may ever be fetched, and only over
+# HTTPS and only on public content paths. This is the crawler's SSRF guard: it
+# rejects localhost, external hosts, non-HTTPS, userinfo, and traversal.
+ALLOWED_HOST = "events.vt.edu"
+ALLOWED_EXACT_PATHS = frozenset({
+    "/", "/index.html", "/events.html", "/sitemap.xml", "/robots.txt",
+    "/dc-events-all.html", "/categories.html",
+})
+ALLOWED_PATH_PREFIXES = ("/events/", "/categories/")
+
+
+def validate_month(month: str | None) -> bool:
+    """True only for the fixed integration scope (2026-09)."""
+    return month == MONTH_KEY
+
+
+def allowed_fetch_url(url: str) -> bool:
+    """True when ``url`` is a safe, public events.vt.edu GET target."""
+    try:
+        p = urlparse(url)
+    except ValueError:
+        return False
+    if p.scheme != "https" or p.hostname != ALLOWED_HOST:
+        return False
+    if p.username or p.password:
+        return False
+    if p.port not in (None, 443):
+        return False
+    path = p.path or "/"
+    if ".." in path or "\\" in path:
+        return False
+    if path in ALLOWED_EXACT_PATHS:
+        return True
+    return any(path.startswith(pref) for pref in ALLOWED_PATH_PREFIXES)
+
+
+def resolve_url(base_url: str, href: str | None) -> str | None:
+    """Resolve a possibly-relative href against its page URL."""
+    if not href:
+        return None
+    return urljoin(base_url, _html.unescape(href.strip()))
 
 # Substrings that place an event in the Blacksburg area. The address string on
 # a VT detail page is the most reliable signal; venue names are a fallback for
@@ -200,7 +246,7 @@ class EventCard:
     category: str | None = None
     admission: str = ADMISSION_UNKNOWN
     in_person: bool | None = None
-    free_food: bool = False
+    free_food: bool | None = None       # tri-state: True/False/None(unknown)
     location_hint: str | None = None
     month: str | None = None
 
@@ -228,7 +274,7 @@ class Event:
     status: str = STATUS_SCHEDULED
     summary: str | None = None
     in_person: bool | None = None
-    free_food: bool = False
+    free_food: bool | None = None       # tri-state: True/False/None(unknown)
     miss_streak: int = 0
     all_day: bool = False
 
@@ -244,6 +290,22 @@ class Event:
     @property
     def location_known(self) -> bool:
         return bool((self.location_name or "").strip() or (self.address or "").strip())
+
+    @property
+    def duration_unknown(self) -> bool:
+        """True when the source did not state an end time.
+
+        Such an event can be listed but never recommended into a free gap: we
+        cannot guarantee it fits, so ``fits_gap`` refuses it.
+        """
+        return self.end_dt is None
+
+    @property
+    def not_recommendable(self) -> bool:
+        """True when HokieFlow must not recommend this into a free gap."""
+        return (self.status in (STATUS_CANCELLED, STATUS_CANCELLED_UNCERTAIN,
+                                STATUS_PARSER_FAILED)
+                or self.duration_unknown)
 
     def to_dict(self) -> dict:
         return {
@@ -267,6 +329,8 @@ class Event:
             "summary": self.summary,
             "in_person": self.in_person,
             "free_food": self.free_food,
+            "duration_unknown": self.duration_unknown,
+            "not_recommendable": self.not_recommendable,
             "miss_streak": self.miss_streak,
             "all_day": self.all_day,
         }
@@ -293,7 +357,7 @@ class Event:
             status=str(row.get("status") or STATUS_SCHEDULED),
             summary=(str(row["summary"]) if row.get("summary") else None),
             in_person=row.get("in_person"),
-            free_food=bool(row.get("free_food")),
+            free_food=_opt_bool(row.get("free_food")),
             miss_streak=int(row.get("miss_streak") or 0),
             all_day=bool(row.get("all_day")),
         )
@@ -328,10 +392,39 @@ class BrowseResult:
 def parse_sitemap(xml_text: str) -> list[SitemapEntry]:
     """Parse a sitemap.org ``<urlset>`` into ordered ``SitemapEntry`` rows.
 
-    Tolerant by design: a missing ``<lastmod>`` yields ``None`` (the crawler
-    then falls back to a content hash), and relative ``<loc>`` values are kept
-    as-is for the caller to resolve.
+    Uses the stdlib XML parser (namespace-tolerant) with a tolerant regex
+    fallback. A missing ``<lastmod>`` yields ``None`` so the crawler always
+    revalidates that URL by content hash rather than freezing it.
     """
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return _parse_sitemap_regex(xml_text)
+
+    entries: list[SitemapEntry] = []
+    for el in root.iter():
+        if el.tag.split("}")[-1].lower() != "url":
+            continue
+        loc: str | None = None
+        lastmod: str | None = None
+        for child in el:
+            name = child.tag.split("}")[-1].lower()
+            value = (child.text or "").strip()
+            if name == "loc":
+                loc = value
+            elif name == "lastmod":
+                lastmod = value or None
+        if loc and loc.lower() != "nan":
+            entries.append(SitemapEntry(
+                url=_html.unescape(loc),
+                lastmod=(_html.unescape(lastmod) if lastmod else None),
+            ))
+    return entries
+
+
+def _parse_sitemap_regex(xml_text: str) -> list[SitemapEntry]:
     entries: list[SitemapEntry] = []
     for block in re.findall(r"<url>(.*?)</url>", xml_text, re.S | re.I):
         loc = re.search(r"<loc>\s*(.*?)\s*</loc>", block, re.S | re.I)
@@ -352,55 +445,198 @@ def sitemap_month_urls(entries: Sequence[SitemapEntry], year: int = MONTH_YEAR,
     return [e for e in entries if needle in e.url]
 
 
-def _strip_tags(text: str) -> str:
-    return _html.unescape(re.sub(r"<[^>]+>", " ", text or "")).strip()
-
-
 def _collapse(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def _first(html_text: str, pattern: str, group: int = 1, flags: int = re.S) -> str | None:
-    m = re.search(pattern, html_text, flags)
-    if not m:
+def _opt_bool(value: Any) -> bool | None:
+    """Tri-state boolean for JSON fields that can be True/False/None."""
+    if value is None:
         return None
-    return _collapse(_strip_tags(m.group(group)))
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("true", "yes", "1"):
+            return True
+        if low in ("false", "no", "0"):
+            return False
+        return None
+    return bool(value)
 
 
-_LISTING_CARD_RE = re.compile(
-    r'<li\s+class="([^"]*event-page[^"]*)"(.*?)</li>', re.S | re.I)
+# ------------------------------------------------------- tiny HTML DOM
+# The source is AEM with hand-authored markup. A regex keyed on attribute order
+# or quoting silently breaks when the CMS reorders attributes or switches to
+# single quotes, so all HTML extraction below goes through this stdlib
+# HTMLParser tree and reads attributes from a dict.
+class _Node:
+    __slots__ = ("tag", "attrs", "children", "text")
+
+    def __init__(self, tag: str, attrs: Mapping[str, str]):
+        self.tag = tag
+        self.attrs = dict(attrs)
+        self.children: list["_Node"] = []
+        self.text: list[str] = []
+
+    def classes(self) -> list[str]:
+        return (self.attrs.get("class") or "").split()
+
+    def has_cls(self, name: str) -> bool:
+        return name in self.classes()
+
+    def iter(self):
+        yield self
+        for child in self.children:
+            yield from child.iter()
+
+    def all_text(self, skip_tags: tuple[str, ...] = ("script", "style")) -> str:
+        parts = list(self.text)
+        for child in self.children:
+            if child.tag in skip_tags:
+                continue
+            parts.append(child.all_text(skip_tags))
+        return " ".join(p for p in parts if p)
 
 
-def parse_listing(html_text: str) -> list[EventCard]:
+_VOID_TAGS = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+    "meta", "param", "source", "track", "wbr",
+})
+
+
+class _Dom(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.root = _Node("#root", {})
+        self._stack: list[_Node] = [self.root]
+
+    def handle_starttag(self, tag, attrs):
+        node = _Node(tag, {str(k).lower(): (v if v is not None else "")
+                           for k, v in attrs})
+        self._stack[-1].children.append(node)
+        if tag not in _VOID_TAGS:
+            self._stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        node = _Node(tag, {str(k).lower(): (v if v is not None else "")
+                           for k, v in attrs})
+        self._stack[-1].children.append(node)
+
+    def handle_endtag(self, tag):
+        for i in range(len(self._stack) - 1, 0, -1):
+            if self._stack[i].tag == tag:
+                del self._stack[i:]
+                return
+
+    def handle_data(self, data):
+        self._stack[-1].text.append(data)
+
+
+def _parse_html(text: str) -> _Node:
+    parser = _Dom()
+    parser.feed(text or "")
+    parser.close()
+    return parser.root
+
+
+def _iter_nodes(root: _Node, *, tag: str | None = None, cls: str | None = None,
+                attr: tuple[str, str] | None = None):
+    for node in root.iter():
+        if tag is not None and node.tag != tag:
+            continue
+        if cls is not None and not node.has_cls(cls):
+            continue
+        if attr is not None and str(node.attrs.get(attr[0], "")).lower() != attr[1].lower():
+            continue
+        yield node
+
+
+def _first_node(root: _Node, *, tag: str | None = None, cls: str | None = None,
+                attr: tuple[str, str] | None = None) -> _Node | None:
+    return next(_iter_nodes(root, tag=tag, cls=cls, attr=attr), None)
+
+
+def _by_id(root: _Node, element_id: str) -> _Node | None:
+    return _first_node(root, attr=("id", element_id))
+
+
+def _node_text(node: _Node | None) -> str:
+    return _collapse(node.all_text()) if node is not None else ""
+
+
+def _visible_text(node: _Node | None, skip_cls: tuple[str, ...] = ("sr-only",)) -> str:
+    """Text of a node, excluding decorative/screen-reader-only descendants."""
+    if node is None:
+        return ""
+    parts: list[str] = []
+
+    def walk(n: _Node) -> None:
+        if n is not node and any(n.has_cls(c) for c in skip_cls):
+            return
+        parts.extend(n.text)
+        for child in n.children:
+            walk(child)
+
+    walk(node)
+    return _collapse(" ".join(p for p in parts if p))
+
+
+def _meta_content(root: _Node, key: str, value: str) -> str | None:
+    for node in _iter_nodes(root, tag="meta"):
+        if str(node.attrs.get(key, "")).lower() == value.lower():
+            content = node.attrs.get("content")
+            if content:
+                return _collapse(_html.unescape(content))
+    return None
+
+
+def _canonical_url(root: _Node, source_url: str) -> str:
+    for node in _iter_nodes(root, tag="link"):
+        rels = str(node.attrs.get("rel", "")).lower().split()
+        if "canonical" in rels and node.attrs.get("href"):
+            return resolve_url(source_url, node.attrs["href"]) or source_url
+    og = _meta_content(root, "property", "og:url")
+    return resolve_url(source_url, og) if og else source_url
+
+
+def parse_listing(html_text: str, base_url: str = "") -> list[EventCard]:
     """Extract listing cards (URL, title, class-encoded filters) from a listing page.
 
     The card CSS classes are the *only* cheap source of category / admission /
     in-person / free-food / location for events we choose not to detail-fetch.
+    ``base_url`` resolves relative hrefs against the listing page's own URL.
     """
+    root = _parse_html(html_text)
+    site_base = base_url or f"https://{ALLOWED_HOST}/"
     cards: list[EventCard] = []
-    for m in _LISTING_CARD_RE.finditer(html_text):
-        classes, body = m.group(1), m.group(2)
-        link = re.search(
-            r'vt-list-item-title-link"\s+href="([^"]+)"[^>]*>(.*?)</a>', body, re.S)
-        if not link:
+    for li in _iter_nodes(root, tag="li", cls="event-page"):
+        link = _first_node(li, tag="a", cls="vt-list-item-title-link")
+        if link is None:
             continue
-        url = _html.unescape(link.group(1).strip())
-        title = _collapse(_strip_tags(
-            re.sub(r'<span class="sr-only">.*?</span>', "", link.group(2), flags=re.S)))
+        url = resolve_url(site_base, link.attrs.get("href"))
+        if not url:
+            continue
+        title = _visible_text(link)
         if not title:
             continue
+        classes = " ".join(li.classes())
         cat = _class_value(classes, "categories")
         admission = _admission_from_class(classes)
         types = re.findall(r"(?:^|\s)types ([\w-]+)", classes)
-        in_person: bool | None
         if "online" in types:
-            in_person = False
+            in_person: bool | None = False
         elif "in-person" in types or "hybrid" in types:
             in_person = True
         else:
             in_person = None
         feats = re.findall(r"(?:^|\s)features ([\w-]+)", classes)
-        loc = _class_value(classes, "locations")
+        if "free-food" in feats:
+            free_food: bool | None = True
+        elif feats:
+            free_food = False
+        else:
+            free_food = None
         month_m = re.search(r"/events/(\d{4})/(\d{2})/", url)
         cards.append(EventCard(
             url=url,
@@ -408,8 +644,8 @@ def parse_listing(html_text: str) -> list[EventCard]:
             category=cat,
             admission=admission,
             in_person=in_person,
-            free_food=("free-food" in feats),
-            location_hint=loc,
+            free_food=free_food,
+            location_hint=_class_value(classes, "locations"),
             month=(f"{month_m.group(1)}-{month_m.group(2)}" if month_m else None),
         ))
     return cards
@@ -438,15 +674,19 @@ def _admission_from_class(classes: str) -> str:
 
 def parse_tags(html_text: str) -> tuple[str, ...]:
     """Merged, order-preserving tags from ``meta keywords`` + tag links."""
+    return _tags_from_root(_parse_html(html_text))
+
+
+def _tags_from_root(root: _Node) -> tuple[str, ...]:
     tags: list[str] = []
-    meta = re.search(r'<meta\s+name="keywords"\s+content="([^"]*)"', html_text, re.I)
-    if meta:
-        for t in _html.unescape(meta.group(1)).split(";"):
+    keywords = _meta_content(root, "name", "keywords")
+    if keywords:
+        for t in keywords.split(";"):
             t = t.strip()
             if t:
                 tags.append(t)
-    for m in re.finditer(r'class="vt-tag-link"[^>]*>(.*?)</a>', html_text, re.S | re.I):
-        t = _collapse(_strip_tags(m.group(1)))
+    for node in _iter_nodes(root, cls="vt-tag-link"):
+        t = _node_text(node)
         if t:
             tags.append(t)
     seen: set[str] = set()
@@ -459,14 +699,16 @@ def parse_tags(html_text: str) -> tuple[str, ...]:
     return tuple(out)
 
 
-def _find_registration_url(html_text: str) -> str | None:
+def _registration_from_root(root: _Node, base_url: str) -> str | None:
     """First plausible registration/RSVP/ticket link, excluding map/social/PII."""
-    for m in re.finditer(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', html_text, re.S | re.I):
-        href = _html.unescape(m.group(1).strip())
+    for a in _iter_nodes(root, tag="a"):
+        href = resolve_url(base_url, a.attrs.get("href"))
+        if not href:
+            continue
         low = href.lower()
         if low.startswith(("mailto:", "tel:", "javascript:", "#")):
             continue
-        blob = (href + " " + _strip_tags(m.group(2))).lower()
+        blob = (href + " " + _node_text(a)).lower()
         if re.search(r"map|share|facebook|twitter|instagram|linkedin|youtube|"
                      r"add-to-calendar|ical", blob):
             continue
@@ -489,10 +731,12 @@ def extract_summary(html_text: str, limit: int = 160) -> str | None:
 
     We never store the full description: it is copyrighted editorial content.
     """
-    m = re.search(r'itemprop="description"[^>]*>(.*?)</div>', html_text, re.S | re.I)
-    if not m:
-        return None
-    text = _collapse(_strip_tags(m.group(1)))
+    return _summary_from_root(_parse_html(html_text), limit)
+
+
+def _summary_from_root(root: _Node, limit: int = 160) -> str | None:
+    node = _first_node(root, attr=("itemprop", "description"))
+    text = _node_text(node)
     if not text:
         return None
     if len(text) > limit:
@@ -508,37 +752,34 @@ def parse_detail(html_text: str, source_url: str, *,
                  timezone_name: str = CAMPUS_TZ) -> Event:
     """Normalize one event detail page.
 
-    Raises ``EventParseError`` when required fields (title, startDate) are
-    missing so the crawler records an explicit parser failure rather than
-    inventing an event.
+    All extraction is attribute-dict based (HTMLParser), so reordered
+    attributes or single quotes do not silently break it. Raises
+    ``EventParseError`` when required fields (title, startDate) are missing so
+    the crawler records an explicit parser failure rather than inventing one.
     """
-    canonical = _first(html_text, r'<link[^>]+rel="canonical"[^>]+href="([^"]+)"') \
-        or _first(html_text, r'<meta[^>]+property="og:url"[^>]+content="([^"]+)"') \
-        or source_url
+    root = _parse_html(html_text)
+    canonical = _canonical_url(root, source_url)
 
-    title = _first(html_text, r"<h1[^>]*>(.*?)</h1>") \
-        or _first(html_text, r'itemprop="name"[^>]*>(.*?)</')
+    title = _node_text(_first_node(root, tag="h1")) \
+        or _node_text(_first_node(root, attr=("itemprop", "name")))
     if not title:
         raise EventParseError(f"no title in {source_url}")
 
-    start_raw = _first(html_text, r'itemprop="startDate"[^>]*content="([^"]+)"')
+    start_raw = _meta_content(root, "itemprop", "startDate")
     if not start_raw:
         raise EventParseError(f"no startDate in {source_url}")
     try:
         start_dt = parse_event_time(start_raw)
-        end_dt = parse_event_time(
-            _first(html_text, r'itemprop="endDate"[^>]*content="([^"]+)"'))
+        end_raw = _meta_content(root, "itemprop", "endDate")
+        end_dt = parse_event_time(end_raw)
     except ValueError as exc:                        # malformed timestamp
         raise EventParseError(f"bad timestamp in {source_url}: {exc}") from exc
     if start_dt is None:
         raise EventParseError(f"empty startDate in {source_url}")
 
-    location_name = _first(
-        html_text, r'id="vt_event_location_building"[^>]*>\s*(.*?)\s*</span>') or ""
-    street = _first(
-        html_text, r'id="vt_event_location_address"[^>]*>\s*(.*?)\s*</span>') or ""
-    city = _first(
-        html_text, r'id="vt_event_location_3"[^>]*>\s*(.*?)\s*</span>') or ""
+    location_name = _node_text(_by_id(root, "vt_event_location_building"))
+    street = _node_text(_by_id(root, "vt_event_location_address"))
+    city = _node_text(_by_id(root, "vt_event_location_3"))
     parts: list[str] = []
     for part in (street, city):
         if part and part.lower() not in ", ".join(parts).lower():
@@ -546,13 +787,11 @@ def parse_detail(html_text: str, source_url: str, *,
     address = ", ".join(parts)
     if not location_name and not address:
         # fall back to the whole address block's text
-        block = _first(html_text, r'itemprop="address"[^>]*>(.*?)</span>\s*</span>')
-        if block:
-            location_name = block
+        location_name = _node_text(_first_node(root, attr=("itemprop", "address")))
 
-    tags = parse_tags(html_text)
+    tags = _tags_from_root(root)
 
-    admission = _admission_from_detail(html_text)
+    admission = _admission_from_root(root)
     if admission == ADMISSION_UNKNOWN and card is not None:
         admission = card.admission
 
@@ -563,15 +802,18 @@ def parse_detail(html_text: str, source_url: str, *,
     in_person = _in_person_from_tags(tags)
     if in_person is None and card is not None:
         in_person = card.in_person
-    free_food = any(_norm(t) in ("free food", "free-food", "food provided", "refreshments")
-                    for t in tags) or (card.free_food if card else False)
+
+    free_food = _free_food_from_tags(tags)
+    if free_food is None and card is not None:
+        free_food = card.free_food
 
     accessibility = bool(
-        re.search(r"vt-event-access-contacts-text|itemprop=\"accessibility\"", html_text)
+        _first_node(root, cls="vt-event-access-contacts-text")
+        or _first_node(root, attr=("itemprop", "accessibility"))
         or any(_norm(t).startswith("accessib") for t in tags)
     )
 
-    summary = extract_summary(html_text) if include_summary else None
+    summary = _summary_from_root(root) if include_summary else None
 
     return Event(
         id=event_id(canonical),
@@ -586,7 +828,7 @@ def parse_detail(html_text: str, source_url: str, *,
         tags=tags,
         category=category,
         admission=admission,
-        registration_url=_find_registration_url(html_text),
+        registration_url=_registration_from_root(root, source_url),
         accessibility=accessibility,
         source_lastmod=source_lastmod,
         fetched_at=fetched_at,
@@ -595,21 +837,20 @@ def parse_detail(html_text: str, source_url: str, *,
         in_person=in_person,
         free_food=free_food,
         miss_streak=0,
-        all_day=False,
+        all_day="T" not in start_raw,
     )
 
 
-def _admission_from_detail(html_text: str) -> str:
-    if re.search(r'itemprop="price"[^>]*content="[Ff]ree"', html_text):
+def _admission_from_root(root: _Node) -> str:
+    price_node = _first_node(root, attr=("itemprop", "price"))
+    price = (price_node.attrs.get("content") if price_node else None) or ""
+    if price.strip().lower() in ("free", "0", "0.00"):
         return ADMISSION_FREE
-    if re.search(r'class="vt-event-free"', html_text):
+    if price.strip():
+        return ADMISSION_PAID
+    if _first_node(root, cls="vt-event-free"):
         return ADMISSION_FREE
-    price = re.search(r'itemprop="price"[^>]*content="([^"]+)"', html_text)
-    if price:
-        value = price.group(1).strip().lower()
-        if value and value not in ("free", "0", "0.00"):
-            return ADMISSION_PAID
-    if re.search(r'class="vt-event-paid"', html_text):
+    if _first_node(root, cls="vt-event-paid"):
         return ADMISSION_PAID
     return ADMISSION_UNKNOWN
 
@@ -635,28 +876,70 @@ def _in_person_from_tags(tags: Sequence[str]) -> bool | None:
     return None
 
 
+def _free_food_from_tags(tags: Sequence[str]) -> bool | None:
+    """Tri-state free-food signal: True/False/None(not stated).
+
+    We return ``None`` (unknown) unless the source explicitly states it; a
+    missing feature is not evidence that food is absent.
+    """
+    for t in tags:
+        n = _norm(t)
+        if n in ("free food", "free-food", "food provided", "refreshments"):
+            return True
+        if n in ("no free food", "no food"):
+            return False
+    return None
+
+
 def _norm(value: str) -> str:
     return re.sub(r"[^a-z0-9-]+", " ", (value or "").lower()).strip()
 
 
 # ---------------------------------------------------------------- geo / scope
+_US_STATE = ("VA", "DC", "MD", "NC", "WV", "TN", "KY", "OH", "PA", "NY",
+             "NJ", "DE", "CA", "TX", "FL")
+_OTHER_CITY_RE = re.compile(
+    r",\s*([A-Za-z][A-Za-z .'-]*?)\s*,\s*(?:" + "|".join(_US_STATE) + r")\b", re.I)
+
+
+def _explicit_other_city(address: str) -> str | None:
+    """Return the city when an address explicitly names a non-Blacksburg city.
+
+    ``"900 N Glebe Rd, Arlington, VA 22203"`` -> ``"arlington"``. A street-only
+    address (no ``, City, ST``) returns ``None`` so venue-name fallback still
+    works for campus buildings whose city is in a separate field.
+    """
+    m = _OTHER_CITY_RE.search(address or "")
+    if not m:
+        return None
+    city = m.group(1).strip().lower()
+    return city or None
+
+
 def is_blacksburg(address: str = "", location_name: str = "",
                   tags: Sequence[str] = ()) -> bool:
-    """Blacksburg-area predicate.
+    """Blacksburg-area predicate (order matters).
 
-    Primary signal is the postal address ("Blacksburg, VA 24061"). Venue names
-    in the building field are a fallback for rows with a blank/near-blank
-    address. Online-only events are never Blacksburg.
+    1. Online-only events are never Blacksburg.
+    2. An explicit non-Blacksburg city in the address overrides any venue-name
+       fallback (e.g. the Arlington VT Research Center).
+    3. A Blacksburg address hint, a Blacksburg tag, or a known campus venue
+       makes it Blacksburg.
     """
-    if any(_norm(t) in ("online", "virtual") for t in tags):
+    lowered_tags = [_norm(t) for t in tags]
+    if any(t in ("online", "virtual") for t in lowered_tags):
         return False
+    if any("blacksburg" in t for t in lowered_tags):
+        return True
     hay_addr = (address or "").lower()
     hay_loc = (location_name or "").lower()
     if any(h in hay_addr for h in _BLACKSBURG_ADDRESS_HINTS):
         return True
+    other = _explicit_other_city(address)
+    if other is not None and other != "blacksburg":
+        return False
     if any(h in hay_loc for h in _BLACKSBURG_VENUE_HINTS):
         return True
-    # A VT-branded building with a 240xx zip anywhere in the combined string.
     combined = f"{hay_addr} {hay_loc}"
     return any(h in combined for h in ("24060", "24061"))
 
@@ -734,7 +1017,7 @@ def filter_events(events: Iterable[Event], *,
             is_free = e.admission == ADMISSION_FREE
             if is_free != free:
                 continue
-        if free_food is not None and bool(e.free_food) != free_food:
+        if free_food is not None and e.free_food is not free_food:
             continue
         if in_person is not None and e.in_person is not in_person:
             continue
@@ -769,9 +1052,10 @@ def browse(snapshot: "Snapshot", *,
             "This event snapshot is older than "
             f"{EVENTS_STALE_AFTER_H} h; times may have changed.")
     if base_state == STATE_PARTIAL:
+        failed = len(snapshot.parser_failures) + len(snapshot.fetch_failures)
         notices.append(
-            f"{len(snapshot.parser_failures)} event page(s) could not be parsed "
-            "and are missing from results.")
+            f"{failed} event page(s) could not be fetched or parsed and may be "
+            "missing from results.")
     if base_state == STATE_EMPTY:
         return BrowseResult(events=(), total=0, state=STATE_EMPTY,
                             notices=tuple(notices + [
@@ -856,19 +1140,19 @@ def fits_gap(event: Event, gaps: Iterable[Gap | tuple | list | Mapping]) -> Gap 
     """Return the first free gap that **fully contains** the event, else None.
 
     "Fully inside" is inclusive of both boundaries: an event ending exactly
-    when a class begins still fits. A missing end time is treated as a
-    zero-length event at its start. An event that only partially overlaps a
-    gap does NOT fit.
+    when a class begins still fits. An UNKNOWN end time is never treated as a
+    zero-length event -- we cannot prove it fits, so it is not recommendable
+    (it still lists in browse).
     """
     st = _event_start(event)
-    if st is None:
+    if st is None or event.duration_unknown:
         return None
-    en = event.end_dt or st
+    en = event.end_dt
     for gap in gaps:
         gs, ge = _gap_bounds(gap)
         if gs is None or ge is None:
             continue
-        if st >= gs and en <= ge:
+        if st >= gs and en is not None and en <= ge:
             return gap
     return None
 
@@ -877,15 +1161,16 @@ def recommendable(events: Iterable[Event], gaps: Iterable[Gap | tuple | list | M
                   *, include_cancelled: bool = False) -> list[Event]:
     """Events that fit fully inside a free gap and are safe to recommend.
 
-    Cancelled and cancelled-uncertain events are excluded by default: we never
-    recommend something we are not sure is still happening.
+    Cancelled, cancelled-uncertain, parser-failed and duration-unknown events
+    are excluded: we never recommend something we cannot prove is happening or
+    that we cannot prove fits the gap.
     """
     gaps = list(gaps)
     out = []
     for e in events:
         if not include_cancelled and e.status in (STATUS_CANCELLED, STATUS_CANCELLED_UNCERTAIN):
             continue
-        if e.status == STATUS_PARSER_FAILED:
+        if e.not_recommendable:
             continue
         if fits_gap(e, gaps) is not None:
             out.append(e)
@@ -933,6 +1218,7 @@ class Snapshot:
     coverage: dict
     events: tuple[Event, ...]
     parser_failures: tuple[str, ...] = ()
+    fetch_failures: tuple[str, ...] = ()
     schema: str = "hokieday.events/snapshot/1"
 
     def to_dict(self) -> dict:
@@ -944,6 +1230,7 @@ class Snapshot:
             "source": self.source,
             "coverage": self.coverage,
             "parser_failures": list(self.parser_failures),
+            "fetch_failures": list(self.fetch_failures),
             "events": [e.to_dict() for e in self.events],
         }
 
@@ -957,6 +1244,7 @@ class Snapshot:
             coverage=dict(row.get("coverage") or {}),
             events=tuple(Event.from_dict(e) for e in (row.get("events") or ())),
             parser_failures=tuple(str(u) for u in (row.get("parser_failures") or ())),
+            fetch_failures=tuple(str(u) for u in (row.get("fetch_failures") or ())),
             schema=str(row.get("schema") or "hokieday.events/snapshot/1"),
         )
 
@@ -970,12 +1258,13 @@ def snapshot_state(snapshot: Snapshot, *, now: datetime | None = None,
                    stale_after_h: float = EVENTS_STALE_AFTER_H) -> str:
     """One of ``empty``/``partial``/``stale``/``ok`` (worst state wins).
 
-    Order matters: an empty snapshot is empty even if also stale; a partial
-    crawl is flagged partial so the UI can say "some results may be missing".
+    ANY fetch or parse failure makes the snapshot ``partial`` (never ``ok``):
+    the crawl saw pages it could not turn into events. An empty snapshot is
+    empty even if also stale.
     """
     if not snapshot.events:
         return STATE_EMPTY
-    if snapshot.parser_failures:
+    if snapshot.parser_failures or snapshot.fetch_failures:
         return STATE_PARTIAL
     fetched = parse_event_time(snapshot.fetched_at)
     if fetched is None:
@@ -990,14 +1279,41 @@ def snapshot_state(snapshot: Snapshot, *, now: datetime | None = None,
 
 
 # ---------------------------------------------------------------- calendar export
+def _ics_text(value: str | None) -> str:
+    """Escape a TEXT value per RFC 5545 and neutralize CR/LF injection.
+
+    Real newlines become the two-character ``\n`` escape, so a title containing
+    ``END:VEVENT`` can never terminate the property or the component.
+    """
+    text = (value or "").replace("\r\n", "\n").replace("\r", "\n")
+    return (text.replace("\\", "\\\\").replace(";", "\\;")
+                .replace(",", "\\,").replace("\n", "\\n"))
+
+
+def _ics_uri(value: str | None) -> str:
+    """URI value: strip control characters (including CR/LF) without TEXT escaping."""
+    return re.sub(r"[\x00-\x1f\x7f]", "", value or "")
+
+
 def to_calendar_event(event: Event, *, dtstamp: datetime | None = None) -> dict:
     """A standard calendar-event dict + ICS-ready fields.
 
     This only EXPORTS a payload for the frontend's "add to schedule" action; it
-    never writes a user's calendar.
+    never writes a user's calendar. All-day events use ``VALUE=DATE`` with an
+    exclusive DTEND (the day after), per RFC 5545.
     """
     st = _event_start(event) or config.now(_EVT_TZ)
-    en = event.end_dt or (st + timedelta(hours=1))
+    if event.all_day:
+        start_date = to_campus(st).date()
+        end_date = start_date + timedelta(days=1)      # DATE DTEND is exclusive
+        en = datetime.combine(end_date, time.min, tzinfo=_EVT_TZ)
+        dtstart_key, dtstart_val = "DTSTART;VALUE=DATE", _ics_date(start_date)
+        dtend_key, dtend_val = "DTEND;VALUE=DATE", _ics_date(end_date)
+    else:
+        en = event.end_dt or (st + timedelta(hours=1))
+        dtstart_key, dtstart_val = "DTSTART", _ics_dt(st)
+        dtend_key, dtend_val = "DTEND", _ics_dt(en)
+
     stamp = dtstamp or _as_datetime(event.fetched_at) or config.now(timezone.utc)
     if stamp.tzinfo is None:
         stamp = stamp.replace(tzinfo=timezone.utc)
@@ -1006,6 +1322,17 @@ def to_calendar_event(event: Event, *, dtstamp: datetime | None = None) -> dict:
     location = event.location_name or event.address or "Location not specified"
     description = event.summary or (
         f"{event.title} — {location}. Source: {event.source_url}")
+    ics = {
+        "UID": f"{event.id}@events.vt.edu",
+        "DTSTAMP": _ics_utc(stamp),
+        dtstart_key: dtstart_val,
+        dtend_key: dtend_val,
+        "SUMMARY": _ics_text(event.title),
+        "LOCATION": _ics_text(location),
+        "DESCRIPTION": _ics_text(description),
+        "URL": _ics_uri(event.source_url),
+        "STATUS": status,
+    }
     return {
         "uid": f"{event.id}@events.vt.edu",
         "title": event.title,
@@ -1013,22 +1340,14 @@ def to_calendar_event(event: Event, *, dtstamp: datetime | None = None) -> dict:
         "end": to_campus(en).isoformat(timespec="minutes"),
         "timezone": event.timezone,
         "all_day": event.all_day,
+        "duration_unknown": event.duration_unknown,
+        "recommendable": not event.not_recommendable,
         "location": location,
         "address": event.address,
         "url": event.source_url,
         "description": description,
         "status": event.status,
-        "ics": {
-            "UID": f"{event.id}@events.vt.edu",
-            "DTSTAMP": _ics_utc(stamp),
-            "DTSTART": _ics_dt(st),
-            "DTEND": _ics_dt(en),
-            "SUMMARY": _ics_escape(event.title),
-            "LOCATION": _ics_escape(location),
-            "DESCRIPTION": _ics_escape(description),
-            "URL": event.source_url,
-            "STATUS": status,
-        },
+        "ics": ics,
     }
 
 
@@ -1044,28 +1363,52 @@ def _ics_utc(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def _ics_escape(text: str) -> str:
-    return (text or "").replace("\\", "\\\\").replace(";", "\\;") \
-        .replace(",", "\\,").replace("\n", "\\n")
+def _ics_date(d: date) -> str:
+    return d.strftime("%Y%m%d")
+
+
+def _fold_line(line: str, limit: int = 75) -> list[str]:
+    """RFC 5545 folding on UTF-8 octets (never split a multi-byte character)."""
+    if len(line.encode("utf-8")) <= limit:
+        return [line]
+    out: list[str] = []
+    current = ""
+    current_len = 0
+    for ch in line:
+        size = len(ch.encode("utf-8"))
+        if current and current_len + size > limit:
+            out.append(current)
+            current = " " + ch          # continuation lines start with one space
+            current_len = 1 + size
+        else:
+            current += ch
+            current_len += size
+    if current:
+        out.append(current)
+    return out
 
 
 def to_ics(events: Iterable[Event], *, cal_name: str = "HokieFlow Events",
            dtstamp: datetime | None = None) -> str:
-    """Serialize events to an ICS document string (no file is written)."""
+    """Serialize events to an ICS document string (no file is written).
+
+    Lines are folded on UTF-8 octet boundaries so long Unicode titles survive
+    round-trip; CR/LF and URI control characters are neutralized.
+    """
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
         "PRODID:-//HokieFlow//events.vt.edu//EN",
         "CALSCALE:GREGORIAN",
-        f"X-WR-CALNAME:{_ics_escape(cal_name)}",
     ]
+    for chunk in _fold_line(f"X-WR-CALNAME:{_ics_text(cal_name)}"):
+        lines.append(chunk)
     for e in events:
         payload = to_calendar_event(e, dtstamp=dtstamp)["ics"]
         lines.append("BEGIN:VEVENT")
-        for key in ("UID", "DTSTAMP", "DTSTART", "DTEND", "SUMMARY",
-                    "LOCATION", "DESCRIPTION", "URL", "STATUS"):
-            if payload.get(key):
-                lines.append(f"{key}:{payload[key]}")
+        for key, value in payload.items():
+            if value:
+                lines.extend(_fold_line(f"{key}:{value}"))
         lines.append("END:VEVENT")
     lines.append("END:VCALENDAR")
     return "\r\n".join(lines) + "\r\n"
@@ -1077,8 +1420,9 @@ __all__ = [
     "Event", "Gap", "BrowseResult", "Snapshot", "STATUS_SCHEDULED",
     "STATUS_CANCELLED", "STATUS_CANCELLED_UNCERTAIN", "STATUS_PARSER_FAILED",
     "STATUS_STALE", "STATUS_UNKNOWN", "STATE_OK", "STATE_EMPTY", "STATE_STALE",
-    "STATE_PARTIAL", "STATE_NO_MATCH", "ADMISSION_FREE", "ADMISSION_PAID",
-    "ADMISSION_UNKNOWN", "parse_event_time", "to_campus", "in_month",
+    "STATE_PARTIAL", "STATE_NO_MATCH", "STATE_OUT_OF_SCOPE", "ADMISSION_FREE", "ADMISSION_PAID",
+    "ADMISSION_UNKNOWN", "ALLOWED_HOST", "validate_month", "allowed_fetch_url",
+    "resolve_url", "parse_event_time", "to_campus", "in_month",
     "in_september_2026", "event_id", "parse_sitemap", "sitemap_month_urls",
     "parse_listing", "parse_tags", "scrub_pii", "extract_summary",
     "parse_detail", "is_blacksburg", "search", "filter_events", "browse",

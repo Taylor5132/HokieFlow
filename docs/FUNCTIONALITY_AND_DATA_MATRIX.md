@@ -76,7 +76,7 @@ when reality contradicts Plan A, a **re-plan that states exactly what changed**.
 | **C. Choose food safely** | "Is it open right now / when does it close?" | ✅ Yes (D2) | Two windows; `is_open_now`, `closes_in_min` |
 | **D. Navigate** | "Get me from A to B." | ✅ Yes (schematic) | Own GTFS-geometry map + keyless Apple/Google deep links per leg |
 | **D. Navigate** | "Turn-by-turn directions" | 🔵 Handed off | We open the phone's maps app; we do not build turn-by-turn |
-| **E. Discover later** | "What's happening on campus?" | ⛔ Not built | Events source identified, no scraper |
+| **E. Discover later** | "What's happening on campus?" | ✅ Yes (Sept 2026, Blacksburg) | Frozen normalized snapshot + browse/search/filter/gap-fit; add-to-schedule export |
 | **E. Discover later** | Weather risk during an outdoor leg | 🟡 Backend ready | NWS client and deterministic risk are implemented; planner/API/UI wiring remains |
 | **E. Discover later** | Browse public classes / import CRNs or ICS | 🟡 Backend ready | Banner parser, ICS import, conflicts and next-class contracts implemented; app/Lakebase wiring remains |
 | **E. Discover later** | Library / gym / campus status / SafeRide | 🔵 Identified | See §7 |
@@ -129,7 +129,7 @@ when reality contradicts Plan A, a **re-plan that states exactly what changed**.
 | User question | Capability / tool | Status | Fields available now | Source | Freshness | Constraints & known gaps | UI may show |
 |---|---|---|---|---|---|---|---|
 | "Will weather affect my walk?" | `weather.forecast_strip`, `active_alerts`, `assess_leg`, `plan_risk` | 🟡 | Hourly windows, precipitation probability, temperature, wind, active alerts, per-leg risk evidence, source/freshness states | NWS `api.weather.gov` | points 24 h; hourly 25 min; alerts 3 min; observation 10 min | Backend and tests implemented; no replay weather fixture because the available capture was temporally incoherent; planner trigger/API/UI not wired | Live mode may show forecast evidence with NWS attribution; replay must show weather unavailable |
-| "What's happening on campus?" | `get_events` | 🔵 | Always `[]` + reason | `events.vt.edu/events` (HTML, no API) | — | Scraper never built | "No events data" empty state only |
+| "What's happening on campus?" | `get_events` | ✅ | Typed result: `state` (ok/no-match/empty/stale/partial/out-of-scope), `match_state`, `events[]`, `reason`, `coverage`, `fetched_at` | `events.vt.edu` sitemap + public detail HTML (no API) | On crawl | 27 Blacksburg Sept 2026 events; snapshot honestly partial because 33 of 67 detail fetches failed | Event list + empty/no-match/partial/stale/out-of-scope states |
 | "Predict bus lateness" | `predict_bus_delay` | ⛔ | `expected_delta_min: None, confidence: 0.0, basis: "no_model"` | — | — | No model; gate is ~2,000 labelled rows; no bus time series is committed (`data/` is runtime-only) | "No prediction available" only |
 | "Predict dining wait" | — (SDD listed `predict_dining_wait`) | ⛔ | — | — | — | No ground truth exists; deliberately dropped | Nothing |
 
@@ -349,7 +349,7 @@ carry the resolved window.
 | 5.13 | **Re-planned** | Bus early/late/full, or dining closing | "RE-PLANNED — <cause>", the numeric detail, Plan A beside Plan B | ✅ Banner + both plans + map overlay |
 | 5.14 | **Navigation handoff** | User taps a map link | Per-leg Apple/Google link; "your maps app supplies turn-by-turn" | ✅ Deep links per walk/bus leg; opens externally |
 | 5.15 | **No live vehicles** | Empty snapshot | "No live vehicles" + schedule fallback | 🟡 `get_live_bus` returns `count: 0` + reason; not a dedicated visual state |
-| 5.16 | **Events unavailable** | Any events ask | "Events feed not built" | 🔵 Always `[]` + reason; no UI surface today |
+| 5.16 | **Events unavailable / partial** | Any events ask | "No events match" / "some events may be missing" | ✅ `get_events` returns a typed `state` (empty/no-match/partial/stale/out-of-scope) + `reason` + `coverage` |
 | 5.17 | **Live from-now planning** | Live request with a future deadline (free text or preset) | "Planning from now (10:00 AM) to your 1:25 PM deadline." | ✅ `start = evaluated_at`, `end = deadline`; interpretation note shown; a live preset uses the captured now instead of the frozen 11:22 start |
 | 5.18 | **Missing deadline** | Live free text with no time | "What time do you need to arrive by?" | ✅ `clarification.kind = need_deadline`; no itinerary, no borrowed demo window |
 | 5.19 | **Deadline already passed** | Live free text or preset whose deadline is in the past | "<time> has already passed today. Do you mean a later time, or tomorrow?" | ✅ `clarification.kind = deadline_passed` (free text and preset guard); never silently rolled to tomorrow |
@@ -436,7 +436,7 @@ clock; replay is pinned; and the heavier `/api/status` is fetched once at boot.
 | **Dining** | D2 only: 470 recipes, allergens, hours, whole-menu nutrition | 🟡 | `foodpro.students.vt.edu/menus/API/*`, `apps.students.vt.edu/hours/...` | Daily / weekly | No SLA; menu fails silently on wrong date format | D2 dish, macros, hours, allergen status |
 | **Location / walking** | 8 named places (1 verified) + device origin | 🟡 | Hard-coded registry + browser geolocation | Per request / static | Building coordinates await VT GIS calibration; geolocation needs HTTPS | Origin label ± accuracy; walk estimate |
 | **Weather** | `hokieday.weather` normalizes NWS point/hourly/alerts/observation and scores outdoor legs | 🟡 | NWS `https://api.weather.gov/points/{lat},{lon}` | 3 min–24 h by resource | Keyless, official, cached; backend only; replay unavailable until coherent capture; KBCB is airport observation | Live forecast evidence may be shown after API wiring; never imply certainty or show weather in current replay |
-| **Events** | None | 🔵 | `https://events.vt.edu/events` (server-rendered HTML, no API) | 6 h (proposed) | Brittle scrape; no API | Roadmap only — empty state today |
+| **Events** | 27 Blacksburg September 2026 events (from a 67-candidate crawl) | 🟡 | `https://events.vt.edu/sitemap.xml` + public detail HTML (AEM; no API) | On crawl (snapshot `fetched_at`) | No API; 33 of 67 detail fetches failed; snapshot is partial, PII-scrubbed and does not claim complete coverage | Browse/search/filter/gap-fit; add-to-schedule export; typed partial/empty/no-match/out-of-scope states |
 | **Classes / calendar** | `hokieday.classes`: public Banner HTML parser, CRN selection, bounded ICS import, conflicts, schedule records and next-class contract | 🟡 | Public POST `HZSKVTSC.P_ProcRequest`; user-provided ICS/CRNs | Per term / user import | Backend only; only term 202609 has verified window; Banner weekly recurrence is explicitly assumed and excluded from deadlines by default; no personal VT system access | Figma may use documented loading/TBA/conflict/stale/recurrence-unavailable states; current app must not claim automatic personal schedule sync |
 | **Library / study** | None | 🔵 | `https://lib.vt.edu/about-us/hours.html`; bookings `https://kiosk.lib.vt.edu/bookings/`; space search `https://calendar.lib.vt.edu/reserve/group-study` | Daily | HTML/booking systems; no documented API | Roadmap only |
 | **Gym occupancy** | None | 🔵 | Rec Sports Connect2 live counts, e.g. `https://www.connect2mycloud.com/Widgets/Data/locationCount?type=bar&key=874fbaa7-d67f-48a0-8aa5-6d4ebbdc0b08` | ~minutes | Undocumented widget endpoint; per-facility keys | Roadmap only |
@@ -463,7 +463,7 @@ forcing GTFS. B1 and P1 are therefore closed below.
 | B3 | **Attach live state to the chosen bus leg** | Enables a "live vehicle" badge on the plan, not just in the header | Chosen bus leg carries real `is_realtime`, `load_pct`, `sched_delta_min`, `observed_at` | — |
 | B4 | **Consecutive bus samples + a stated staleness policy** | Justifies any future motion/heading; strengthens the replay label | ≥ N samples at 60 s cadence persisted; UI exposes "observed at" and refuses to animate from one sample | Poller running |
 | B5 | 🟡 **PARTIAL — Weather backend** (NWS) | Normalization, freshness and deterministic leg-risk are implemented | Remaining: LocalSource/tool adapter, `/api/weather`, attach risk to walk legs, weather re-plan trigger and UI; replay stays unavailable until coherent capture | NWS backend complete |
-| B6 | **Events integration** (scrape) | Unlocks the "discover later" flow | ≥1 day of events parsed to `{title, start, place, tags, url}`; cached; degrades to `[]` | events.vt.edu |
+| B6 | ✅ **DONE — Events backend** (AEM crawl) | Unlocks the "discover later" flow | Frozen partial September 2026 Blacksburg snapshot (27 events); browse/search/filter/gap-fit; tool contract; typed health/match states; crawler honors robots + strict URL allowlist. Remaining: app endpoint/UI | events.vt.edu |
 | B7 | **Campus status / closures** | Unlocks a safety banner and route-avoidance copy | Status + active closures parsed; UI banner when active | vt.edu/status, ArcGIS |
 | B8 | **Library hours** | Unlocks a study-spot job | Hours for Newman/others; `is_open_now`, `closes_in_min` | LibCal/HTML |
 | B9 | **Gym occupancy** | Unlocks "how busy is the gym" | Live counts per facility with `observed_at` | Connect2 |
@@ -547,7 +547,7 @@ Every component must name all five before it is marked ready.
 | Route colours 24/24, unused | Committed `fixtures/bt_gtfs.bin`, verified through `gtfs.load_gtfs().routes`; no `route_color` reference in `hokieday/` or `app/` |
 | Bus leg `is_realtime` hard-coded False | `hokieday/tools.py` `_build_itinerary` |
 | Weather backend present; planner trigger absent | `hokieday/weather.py`; `hokieday/tools.py` `_replan_trigger` comment |
-| Events always empty | `hokieday/tools.py` `get_events`, `EVENTS_REASON` |
+| Events typed states + partial snapshot | `hokieday/events.py` `browse`/`snapshot_state`; `hokieday/tools.py` `get_events`, `LocalSource.events` |
 | No ML model | `hokieday/tools.py` `predict_bus_delay` |
 | Bounded parser, not LLM | `app/server.py` `parse_free_text` |
 | Feasibility guards (closed gap) | `tests/test_feasibility.py`: tight window → `feasible:false` + `deadline_missed`; unknown place → no itinerary; rationale never "fits" |
