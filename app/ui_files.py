@@ -39,11 +39,15 @@ _ASSET_TYPES = {
     "bus-location.js": "text/javascript; charset=utf-8",
     "dining.js": "text/javascript; charset=utf-8",
     "schedule.js": "text/javascript; charset=utf-8",
+    "directions.js": "text/javascript; charset=utf-8",
+    "preferences.js": "text/javascript; charset=utf-8",
+    "buildings.js": "text/javascript; charset=utf-8",
     "vt-gis.js": "text/javascript; charset=utf-8",
 }
 
 _CACHEABLE = {"styles.css", "app.js", "config.js", "model.js", "fixtures.js",
               "home-live.js", "bus-location.js", "dining.js", "schedule.js",
+              "directions.js", "preferences.js", "buildings.js",
               "vt-gis.js"}
 
 
