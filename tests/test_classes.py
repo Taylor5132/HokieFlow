@@ -1249,6 +1249,97 @@ class TestReviewRound2(unittest.TestCase):
         self.assertTrue(ok.valid, ok.errors)
         self.assertTrue(ok.events[0].all_day)
 
+    def test_nested_vevent_discards_enclosing_and_never_injects(self):
+        # A VEVENT nested inside a VEVENT is malformed. The enclosing event is
+        # discarded and the nested one is ignored until balanced -- the nested
+        # 2099 DTSTART must never be emitted as an event. See the earlier
+        # VALARM test (a sub-component, not a nested VEVENT).
+        ics = ("BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:outer\nSUMMARY:Outer\n"
+               "DTSTART;TZID=America/New_York:20260824T100000\n"
+               "DTEND;TZID=America/New_York:20260824T110000\n"
+               "BEGIN:VEVENT\nUID:inner\nSUMMARY:Injected\n"
+               "DTSTART;TZID=America/New_York:20990101T000000\n"
+               "DTEND;TZID=America/New_York:20990101T010000\n"
+               "END:VEVENT\n"
+               "END:VEVENT\nEND:VCALENDAR\n")
+        p = classes.parse_ics(ics)
+        self.assertFalse(p.valid)
+        self.assertEqual(p.events, ())
+        self.assertTrue(any("nested" in e.lower() for e in p.errors))
+        # Expanding whatever survived never reaches 2099.
+        self.assertEqual(classes.expand_ics_events(p.events), [])
+
+    def test_nested_vevent_then_outer_stays_ignored(self):
+        # A well-formed nested VEVENT inside an outer VEVENT must not be
+        # emitted either, even if the outer later closes cleanly.
+        ics = ("BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:outer\nSUMMARY:Outer\n"
+               "DTSTART;TZID=America/New_York:20260824T100000\n"
+               "DTEND;TZID=America/New_York:20260824T110000\n"
+               "BEGIN:VEVENT\nUID:nested\nSUMMARY:Nested\n"
+               "DTSTART;TZID=America/New_York:20260831T100000\n"
+               "DTEND;TZID=America/New_York:20260831T110000\n"
+               "END:VEVENT\nEND:VEVENT\nEND:VCALENDAR\n")
+        p = classes.parse_ics(ics)
+        self.assertFalse(p.valid)
+        self.assertEqual(p.events, ())
+        self.assertEqual([e.uid for e in p.events], [])
+
+    def test_expand_ics_events_is_globally_bounded(self):
+        ev = classes.parse_ics(
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:many\nSUMMARY:m\n"
+            "DTSTART;TZID=America/New_York:20260824T100000\n"
+            "DTEND;TZID=America/New_York:20260824T110000\n"
+            "RRULE:FREQ=WEEKLY;BYDAY=MO\n"
+            "END:VEVENT\nEND:VCALENDAR\n").events[0]
+        with self.assertRaises(classes.BoundsExceeded) as ctx:
+            classes.expand_ics_events(
+                [ev], start=date(2026, 8, 24), end=date(2026, 12, 9),
+                tz=TZ, max_occurrences=5)
+        self.assertEqual(ctx.exception.kind, "occurrences")
+        self.assertEqual(ctx.exception.limit, 5)
+        # Under the cap it still returns the sorted occurrences.
+        occ = classes.expand_ics_events(
+            [ev], start=date(2026, 8, 24), end=date(2026, 9, 14), tz=TZ,
+            max_occurrences=5)
+        self.assertEqual(len(occ), 4)
+        self.assertEqual([o.date.isoformat() for o in occ],
+                         ["2026-08-24", "2026-08-31", "2026-09-07",
+                          "2026-09-14"])
+
+    def test_mixed_source_next_class_is_incomplete_not_authoritative(self):
+        # An excluded Banner meeting (09:00) can precede the ICS candidate
+        # (14:00); the ICS candidate must not be reported as the authoritative
+        # scheduled next class.
+        banner = _section("10002", days=("M",), begin="09:00", end="10:00")
+        ics = classes.parse_ics(
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:icslate\nSUMMARY:Late\n"
+            "DTSTART;TZID=America/New_York:20260914T140000\n"
+            "DTEND;TZID=America/New_York:20260914T150000\n"
+            "END:VEVENT\nEND:VCALENDAR\n").events
+        at = datetime(2026, 9, 14, 8, 0, tzinfo=TZ)
+        out = classes.next_class_json(
+            [banner], at, start=date(2026, 9, 14), end=date(2026, 9, 14),
+            tz=TZ, ics_events=ics)
+        self.assertEqual(out["status"], "recurrence_unavailable")
+        self.assertIsNone(out["deadline"])
+        self.assertTrue(out["incomplete"])
+        self.assertEqual(out["omitted_sources"], ["banner"])
+        self.assertTrue(out["candidate"]["incomplete"])
+        self.assertFalse(out["candidate"]["authoritative"])
+        self.assertEqual(out["candidate"]["crn"], "icslate")
+        # With the Banner opt-in the earlier Banner meeting is authoritative.
+        opted = classes.next_class_json(
+            [banner], at, start=date(2026, 9, 14), end=date(2026, 9, 14),
+            tz=TZ, ics_events=ics, allow_term_assumption=True)
+        self.assertEqual(opted["status"], "scheduled")
+        self.assertEqual(opted["crn"], "10002")
+        # ICS-only remains authoritative.
+        solo = classes.next_class_json(
+            [], at, start=date(2026, 9, 14), end=date(2026, 9, 14), tz=TZ,
+            ics_events=ics)
+        self.assertEqual(solo["status"], "scheduled")
+        self.assertEqual(solo["crn"], "icslate")
+
 
 if __name__ == "__main__":
     unittest.main()

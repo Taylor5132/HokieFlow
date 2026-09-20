@@ -81,7 +81,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import config
@@ -1130,6 +1130,26 @@ def schedule_conflicts(
     return find_conflicts(occ)
 
 
+def _bounded_occurrences(
+    occurrences: Iterable[ClassOccurrence],
+    *,
+    max_occurrences: int = MAX_TOTAL_OCCURRENCES,
+) -> list[ClassOccurrence]:
+    """Materialize occurrences under the GLOBAL cap, else ``BoundsExceeded``.
+
+    The single bounded aggregator shared by ``combined_occurrences`` and
+    ``expand_ics_events``. It stops the moment the cap is exceeded so a
+    hostile/large calendar cannot build an unbounded list; the typed error
+    carries ``kind='occurrences'``, the limit and the actual count.
+    """
+    out: list[ClassOccurrence] = []
+    for o in occurrences:
+        out.append(o)
+        if len(out) > max_occurrences:
+            raise BoundsExceeded("occurrences", max_occurrences, len(out))
+    return out
+
+
 def combined_occurrences(
     sections: Iterable[ClassSection],
     ics_events: Iterable[IcsEvent],
@@ -1149,19 +1169,16 @@ def combined_occurrences(
     is raised past ``max_occurrences`` so a huge schedule is refused, not
     materialized.
     """
-    out: list[ClassOccurrence] = []
-    for s in sections:
-        for o in expand_section(s, start=start, end=end, tz=tz):
-            if o.term_assumed and not allow_term_assumption:
-                continue
-            out.append(o)
-            if len(out) > max_occurrences:
-                raise BoundsExceeded("occurrences", max_occurrences, len(out))
-    for e in ics_events:
-        for o in expand_ics_event(e, start=start, end=end, tz=tz):
-            out.append(o)
-            if len(out) > max_occurrences:
-                raise BoundsExceeded("occurrences", max_occurrences, len(out))
+    def _all() -> Iterator[ClassOccurrence]:
+        for s in sections:
+            for o in expand_section(s, start=start, end=end, tz=tz):
+                if o.term_assumed and not allow_term_assumption:
+                    continue
+                yield o
+        for e in ics_events:
+            yield from expand_ics_event(e, start=start, end=end, tz=tz)
+
+    out = _bounded_occurrences(_all(), max_occurrences=max_occurrences)
     out.sort(key=lambda o: (o.start, o.crn))
     return out
 
@@ -1237,6 +1254,15 @@ def next_class_json(
     ics_events: Iterable[IcsEvent] | None = None,
     allow_term_assumption: bool = False,
 ) -> dict:
+    """API-ready next-class payload.
+
+    Banner recurrences are excluded unless ``allow_term_assumption=True``. When
+    timed Banner sections are excluded but an ICS candidate survives, the
+    result is INCOMPLETE (``status="recurrence_unavailable"``,
+    ``incomplete=true``, ``omitted_sources=["banner"]``) and the ICS meeting is
+    exposed only under ``candidate`` -- an omitted Banner meeting may be
+    earlier, so an ICS candidate is never authoritative here.
+    """
     b = _validate_buffer(buffer_min)
     tz = tz or campus_tz()
     if at.tzinfo is None:
@@ -1291,6 +1317,34 @@ def next_class_json(
             "unverified_terms": unverified,
             "allow_term_assumption": allow_term_assumption,
             "term_assumption_required": assumed_excluded,
+        }
+    if assumed_excluded:
+        # There ARE timed Banner sections, but their whole-term recurrence was
+        # deliberately excluded. Any surviving candidate is ICS-only, and it
+        # cannot be authoritative: an omitted Banner occurrence may fall before
+        # it. Return a typed INCOMPLETE result and expose the ICS candidate
+        # only as incomplete -- never as a status=scheduled next class.
+        candidate = nc.to_dict()
+        candidate["incomplete"] = True
+        candidate["authoritative"] = False
+        return {
+            "schema": SCHEMA_NEXT_CLASS,
+            "status": "recurrence_unavailable",
+            "at": at.isoformat(timespec="seconds"),
+            "deadline": None,
+            "buffer_min": b,
+            "allow_term_assumption": allow_term_assumption,
+            "term_assumption_required": True,
+            "incomplete": True,
+            "omitted_sources": ["banner"],
+            "candidate": candidate,
+            "reason": (
+                "next class is indeterminate: timed Banner sections are "
+                "whole-term inferences excluded without "
+                "allow_term_assumption=True, so the ICS candidate shown is "
+                "not authoritative (an omitted Banner meeting may come "
+                "first). Pass allow_term_assumption=True to include Banner "
+                "recurrence, or use Banner-only/ICS-only input."),
         }
     payload = {"schema": SCHEMA_NEXT_CLASS, "at": at.isoformat(timespec="seconds"),
                "allow_term_assumption": allow_term_assumption}
@@ -1957,6 +2011,8 @@ def parse_ics(text: str, *, tz: ZoneInfo | None = None) -> IcsParse:
         errors.append("calendar is truncated: missing END:VCALENDAR")
 
     in_event = False
+    discard_event = False      # enclosing event is malformed -> never emit it
+    vevent_depth = 0           # >1 while a nested BEGIN:VEVENT is open
     sub_depth = 0
     sub_name = ""
     props: dict[str, tuple[dict[str, str], str]] = {}
@@ -1968,8 +2024,18 @@ def parse_ics(text: str, *, tz: ZoneInfo | None = None) -> IcsParse:
         upper = line.upper()
         if upper == "BEGIN:VEVENT":
             if in_event:
-                errors.append("nested BEGIN:VEVENT; previous event discarded")
+                # A VEVENT may not nest inside another VEVENT. Discard the
+                # ENCLOSING event and ignore the nested one until it is
+                # balanced -- never reset state and emit the nested event (a
+                # nested VEVENT must not inject e.g. a 2099 DTSTART).
+                errors.append(
+                    "nested BEGIN:VEVENT; enclosing event discarded")
+                discard_event = True
+                vevent_depth += 1
+                continue
             in_event = True
+            discard_event = False
+            vevent_depth = 1
             sub_depth = 0
             sub_name = ""
             props = {}
@@ -1979,15 +2045,27 @@ def parse_ics(text: str, *, tz: ZoneInfo | None = None) -> IcsParse:
             if not in_event:
                 errors.append("END:VEVENT with no BEGIN:VEVENT")
                 continue
+            if vevent_depth > 1:
+                # Closing a nested VEVENT: keep ignoring it and its properties.
+                vevent_depth -= 1
+                continue
             if sub_depth > 0:
                 errors.append(
                     f"VEVENT has unterminated sub-component {sub_name!r}; "
                     "event discarded")
                 in_event = False
+                discard_event = False
+                vevent_depth = 0
                 sub_depth = 0
                 sub_name = ""
                 continue
             in_event = False
+            vevent_depth = 0
+            if discard_event:
+                discard_event = False
+                sub_depth = 0
+                sub_name = ""
+                continue
             if len(events) >= MAX_ICS_EVENTS:
                 errors.append(
                     f"more than {MAX_ICS_EVENTS} VEVENTs; remaining skipped")
@@ -2198,11 +2276,20 @@ def _expand_ics_event_impl(event: IcsEvent, *, start: date | None = None,
 
 def expand_ics_events(events: Iterable[IcsEvent], *, start: date | None = None,
                       end: date | None = None,
-                      tz: ZoneInfo | None = None) -> list[ClassOccurrence]:
-    """Expand many IcsEvents into a single sorted occurrence list."""
-    out: list[ClassOccurrence] = []
-    for e in events:
-        out.extend(expand_ics_event(e, start=start, end=end, tz=tz))
+                      tz: ZoneInfo | None = None,
+                      max_occurrences: int = MAX_TOTAL_OCCURRENCES,
+                      ) -> list[ClassOccurrence]:
+    """Expand many IcsEvents into one sorted list, GLOBALLY bounded.
+
+    Goes through the same bounded aggregator as ``combined_occurrences``: past
+    ``max_occurrences`` this raises the typed ``BoundsExceeded`` rather than
+    materializing an unbounded list.
+    """
+    def _all() -> Iterator[ClassOccurrence]:
+        for e in events:
+            yield from expand_ics_event(e, start=start, end=end, tz=tz)
+
+    out = _bounded_occurrences(_all(), max_occurrences=max_occurrences)
     out.sort(key=lambda o: (o.start, o.crn))
     return out
 

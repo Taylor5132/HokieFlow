@@ -175,6 +175,14 @@ reused across terms, so every selection/resolution path carries the term.
 `buffer_min` must be finite, non-negative and ≤ `MAX_BUFFER_MIN` (240) or
 `ValueError` is raised.
 
+**Mixed-source incompleteness.** When timed Banner sections are present but
+excluded (no `allow_term_assumption=True`), a surviving ICS candidate is NOT
+reported as `status=scheduled`: an omitted Banner occurrence may precede it.
+The payload is `status=recurrence_unavailable` with `incomplete=true`,
+`omitted_sources=["banner"]`, and the ICS meeting exposed only under
+`candidate` (itself `incomplete=true`, `authoritative=false`). ICS-only input
+remains authoritative.
+
 **Term-assumption provenance (partial-term safety).** Banner exposes only a
 weekly meeting pattern, so its recurrence is a WHOLE-TERM INFERENCE flagged
 `term_assumed=True` / `provenance="banner_weekly_assumed"`. It must NOT drive a
@@ -186,7 +194,8 @@ with `term_assumption_required=true`; pass `allow_term_assumption=True` to opt
 in. ICS dated occurrences are always usable. An unknown/unverified term yields
 `status="unavailable"` with `unverified_terms` — no fallback window ever.
 
-**Global bounds.** `combined_occurrences`/`find_conflicts` refuse to build an
+**Global bounds.** `combined_occurrences` (and `expand_ics_events`) and
+`find_conflicts` refuse to build an
 unbounded result: `MAX_TOTAL_OCCURRENCES` (5 000) and `MAX_CONFLICTS` (1 000)
 raise the typed `BoundsExceeded(kind, limit, actual)`. `next_class_json` returns
 `status="bounds_exceeded"` + `bounds`; `schedule_json` returns
@@ -229,7 +238,9 @@ A stored schedule record is deliberately minimal:
   (including commas, semicolons, backslashes and newlines). Nested components
   (e.g. `VALARM`) are TRACKED: their inner properties are ignored and can never
   overwrite a VEVENT property; an unterminated sub-component discards the
-  event. Anything else (`FREQ=MONTHLY`, `WKST`, `RDATE`, `EXDATE`, ordinal
+  event. A nested `BEGIN:VEVENT` (a VEVENT inside a VEVENT) DISCARDS the
+  enclosing event and ignores the nested one until it is balanced — the nested
+event is never emitted, so it cannot inject a `2099` `DTSTART`. Anything else (`FREQ=MONTHLY`, `WKST`, `RDATE`, `EXDATE`, ordinal
   `BYDAY`, non-positive `INTERVAL`/`COUNT`, invalid `UNTIL`, unknown `TZID`,
   missing `UID`, malformed `DTSTART`, truncated `VEVENT`) is **flagged and
   skipped**, never guessed.
@@ -240,7 +251,9 @@ A stored schedule record is deliberately minimal:
   single occurrence; a weekly RRULE expands only within `COUNT`/`UNTIL`/window.
   `UNTIL` is compared as an AWARE INSTANT (not a date), inclusive. It never
   raises (a malformed event returns `[]`).
-- `expand_ics_events(events, ...)` — many events to one sorted list.
+- `expand_ics_events(events, *, start, end, tz, max_occurrences=MAX_TOTAL_OCCURRENCES)`
+  — many events to one sorted list, through the same GLOBAL bounded aggregator
+  as `combined_occurrences`: past the cap it raises the typed `BoundsExceeded`.
 - ICS occurrences carry `source="ics"`, `term_assumed=False`,
   `provenance="ics_dated"`.
 - **No `to_section`.** An ICS event is NOT converted into a Banner section, so
@@ -392,10 +405,13 @@ nothing. Final-exam pages are NOT fetched or parsed (there is no `--exams`).
 - **ICS subset.** Monthly recurrence, exception dates (`EXDATE`/`RDATE`),
   `WKST`, and ordinal `BYDAY` are out of scope and are rejected/flagged. Nested
   components (e.g. `VALARM`) are tracked and ignored, never allowed to overwrite
-  a VEVENT property; `VALUE=DATE` requires exactly 8 digits; `UNTIL` is
+  a VEVENT property; a nested `BEGIN:VEVENT` discards the enclosing event and
+  the nested event is never emitted; `VALUE=DATE` requires exactly 8 digits;
+  `UNTIL` is
   compared as an aware instant. Input size, per-event recurrence and GLOBAL
   combined occurrence/conflict counts are bounded (`MAX_ICS_*`,
-  `MAX_TOTAL_OCCURRENCES`, `MAX_CONFLICTS`); an ICS event is never turned into a
+  `MAX_TOTAL_OCCURRENCES`, `MAX_CONFLICTS`, enforced by `expand_ics_events` and
+  `combined_occurrences`); an ICS event is never turned into a
   weekly Banner section.
 - **No persistence.** Schedule records are plain dicts for a later
   Lakebase/JSON store; nothing is written to a DB by this module.
