@@ -25,3 +25,9 @@ databrickscfg
 credentials.json
 credentials*.json
 token*
+
+# Local UI account database and frontend dependencies
+runtime/
+*.sqlite3
+*.sqlite3-*
+node_modules/

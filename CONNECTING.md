@@ -1,3 +1,5 @@
+> Current UI: run `python3 serve.py --port 3001`. Navigation now opens Apple Maps. [CAMPUS-INTEGRATION.md](CAMPUS-INTEGRATION.md) supersedes earlier GIS integration instructions.
+
 # Final UI — remaining team connections
 
 The final UI defaults to backend mode. No synthetic plan, class, clock or bus is shown. Missing services use ordinary empty/error states. Developer notes and roadmap panels are not rendered.
