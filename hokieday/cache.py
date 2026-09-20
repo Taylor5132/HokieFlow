@@ -574,22 +574,8 @@ def put_json(name: str, url: str, payload: Any, *, params: dict | None = None) -
 
 # ------------------------------------------------------------------ public metadata
 # These are the supported ways OUTSIDE cache.py to inspect or write provenance
-# envelopes. They exist so cache consumers never reach for `_read_envelope` /
-# `_json_path` / `_write_envelope` directly; those private names may change.
-def read_envelope(name: str, params: dict | None = None) -> dict | None:
-    """Public read of a cached envelope dict, or None when absent/unreadable.
-
-    Never touches the network and never raises for a missing/corrupt entry.
-    """
-    p = _json_path(name, params)
-    if not p.exists():
-        return None
-    try:
-        return _read_envelope(p)
-    except Exception:                                          # noqa: BLE001
-        return None
-
-
+# envelopes. `read_envelope` is defined above alongside `metadata` and
+# `get_json_with_metadata`; the helpers below add the weather bundle APIs.
 def envelope_meta(name: str, params: dict | None = None) -> dict | None:
     """Public provenance metadata for a cache entry, or None when absent.
 

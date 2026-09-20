@@ -9,7 +9,7 @@ as such.
 (package `hokieday/`, imports, file names, config keys).
 
 **As verified:** 2026-09-20 after VT GIS, reviewed NWS weather and public class/ICS
-backend integration. Offline suite: **526 tests, 0 failures** under `DEMO_MODE=cache`. Live bus
+backend plus FoodPro basic-directory integration. Offline suite: **598 tests, 0 failures** under `DEMO_MODE=cache`. Live bus
 fixture captured **2026-09-19T15:22:29Z**. See §12 for the exact verification commands.
 
 ---
@@ -539,7 +539,7 @@ Every component must name all five before it is marked ready.
 
 | Claim | Where it lives |
 |---|---|
-| 526 offline tests pass after VT GIS + weather + class/ICS backend integration | `python3 -m unittest discover -s tests` |
+| 598 offline tests pass after VT GIS + weather + class/ICS + FoodPro basic backend integration | `python3 -m unittest discover -s tests` |
 | 13 vehicles, one snapshot | `fixtures/bt_buses.json` (`fetched_at 2026-09-19T15:22:29Z`) |
 | No committed bus time series | `.gitignore` excludes `data/`; only the single `fixtures/bt_buses.json` observation is shipped |
 | 470 recipes, 188 blank allergens, 42 nut, 174 veg, 231 vegan | `fixtures/dining_menu__dtdate=09-19-2026__location_num=15.json` |
@@ -562,7 +562,7 @@ Run from the repo root. All are read-only; none modify the repository.
 
 ```bash
 # 1. Offline suite (no network, pinned clock)
-DEMO_MODE=cache python3 -m unittest discover -s tests -v        # -> Ran 526 tests, OK
+DEMO_MODE=cache python3 -m unittest discover -s tests -v        # -> Ran 598 tests, OK
 DEMO_MODE=cache python3 -m unittest tests.test_time tests.test_feasibility -v
 
 # 2. Fixture and snapshot counts
