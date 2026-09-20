@@ -94,6 +94,32 @@ class TestReplayClock(unittest.TestCase):
         self.assertGreater(minutes, 0)
 
 
+class TestServerBootstrapOrder(unittest.TestCase):
+    """The script entrypoint must set sys.path before importing repo modules.
+
+    `python3 app/server.py` puts app/ (not the repo root) on sys.path[0], so an
+    import of a repo-root module placed above the path setup fails at startup --
+    and only in script mode, which is exactly how the deployed app and the local
+    accounts setup run it. A direct `import app.server` during tests hides it.
+    """
+
+    def test_path_setup_precedes_repo_root_imports(self):
+        source = (REPO / "app" / "server.py").read_text(encoding="utf-8")
+        path_setup = source.index("sys.path.insert(0, str(REPO))")
+        for mod in ("from auth import", "from hokieday import",
+                    "from app.local_env import"):
+            self.assertLess(
+                path_setup, source.index(mod),
+                f"{mod} must come after sys.path.insert(0, str(REPO))",
+            )
+
+    def test_dotenv_is_loaded_before_auth(self):
+        """database.py reads SUPABASE_* at import, so .env must be loaded first."""
+        source = (REPO / "app" / "server.py").read_text(encoding="utf-8")
+        self.assertLess(source.index('load_local_env(REPO / ".env")'),
+                        source.index("from auth import"))
+
+
 class TestWallClockTripwire(unittest.TestCase):
     def test_no_unapproved_wall_clock_calls(self):
         offenders = set()

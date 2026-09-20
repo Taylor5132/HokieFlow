@@ -120,6 +120,27 @@ every variable the app reads.
 For a deployment, set the same names through the platform's environment UI and
 do not ship `.env`.
 
+### Local setup
+
+```bash
+# The agent needs NOTHING beyond the stdlib: the Gemini adapter uses urllib.
+cp .env.example .env && chmod 600 .env     # then fill GEMINI_API_KEY/MODEL
+
+# Accounts (sign-in, saved plans) additionally need the declared packages.
+# Homebrew's Python refuses pip installs (PEP 668), so use a project venv:
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python app/server.py             # accounts enabled
+python3 app/server.py                      # agent only; /api/auth/* answers 503
+```
+
+Both interpreters pass the same suite; with the venv the 11 account tests run
+instead of skipping. `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` are NOT read by
+this code -- the OAuth flow delegates to Supabase, so the Google credentials
+belong in the Supabase dashboard's Auth provider settings. The app-side variable
+that matters is `APP_URL` (the OAuth redirect target), which defaults to the
+local server and must be the deployed URL in production.
+
 No model is hardcoded. If any setting is absent, or Gemini fails, `/api/ask`
 falls back to the bounded parser. `DEMO_MODE=cache` always bypasses the provider,
 even if credentials are present. The `ui/` client may attach only its
