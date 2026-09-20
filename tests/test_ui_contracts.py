@@ -150,3 +150,107 @@ class AssetMapContract(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class HttpEdgeContractTests(unittest.TestCase):
+    """The deployed server must answer odd requests, not drop the connection.
+
+    A dropped connection is invisible locally but becomes 502 Bad Gateway behind
+    a proxy, which is how the deployed app behaved: BaseHTTPRequestHandler's
+    send_error() -> log_error() -> log_message() received an HTTPStatus enum,
+    `"/api/" in HTTPStatus.X` raised TypeError inside send_error, and no error
+    response was ever written.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import threading
+        from http.server import ThreadingHTTPServer
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def _conn(self):
+        import http.client
+        return http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
+
+    def test_log_message_survives_an_httpstatus_argument(self):
+        """The exact crash: send_error passes an enum, not a string."""
+        from http import HTTPStatus
+        import io
+        from contextlib import redirect_stderr
+        handler = server.Handler.__new__(server.Handler)
+        handler.client_address = ("127.0.0.1", 1234)
+        with redirect_stderr(io.StringIO()):
+            handler.log_message("code %d, message %s",
+                                HTTPStatus.NOT_IMPLEMENTED, "Unsupported method")
+
+    def test_unsupported_method_gets_a_response_not_an_empty_reply(self):
+        for method in ("DELETE", "PATCH"):
+            conn = self._conn()
+            conn.request(method, "/api/ask", body="{}",
+                         headers={"Content-Type": "application/json"})
+            response = conn.getresponse()
+            self.assertEqual(response.status, 405, method)
+            body = json.loads(response.read())
+            self.assertIn("GET", body["allow"])
+            conn.close()
+
+    def test_options_and_head_are_answered(self):
+        conn = self._conn()
+        conn.request("OPTIONS", "/api/ask")
+        self.assertEqual(conn.getresponse().status, 204)
+        conn.close()
+        conn = self._conn()
+        conn.request("HEAD", "/api/ask")
+        self.assertEqual(conn.getresponse().status, 200)
+        conn.close()
+
+    def test_malformed_request_line_still_gets_a_status_line(self):
+        import socket
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=20)
+        try:
+            sock.sendall(b"BOGUS /x HTTP/1.1\r\nHost: test\r\n\r\n")
+            data = sock.recv(200)
+            self.assertTrue(data.startswith(b"HTTP/1."),
+                            f"expected a status line, got {data!r}")
+        finally:
+            sock.close()
+
+    def test_oversized_body_is_refused_without_desyncing_the_socket(self):
+        """A refused body must not poison the connection.
+
+        The guard refuses without parsing, so the bytes are either discarded or
+        the socket is closed. Leaving them unread on a keep-alive connection made
+        the NEXT request parse as garbage, which the deployed proxy surfaced as a
+        502. So: the 413 must arrive, and the same connection must still work.
+        """
+        conn = self._conn()
+        conn.request("POST", "/api/ask",
+                     body=json.dumps({"text": "x" * 1_100_000}),
+                     headers={"Content-Type": "application/json"})
+        response = conn.getresponse()
+        self.assertEqual(response.status, 413)
+        self.assertIn("limit_bytes", json.loads(response.read()))
+        if response.getheader("Connection") == "close":
+            conn.close()
+            return
+        conn.request("GET", "/api/status")     # same socket, new request
+        follow_up = conn.getresponse()
+        self.assertEqual(follow_up.status, 200,
+                         "the connection must be usable after a refused body")
+        follow_up.read()
+        conn.close()
+
+    def test_bounded_body_is_still_accepted(self):
+        conn = self._conn()
+        conn.request("POST", "/api/ask",
+                     body=json.dumps({"text": "hungry, Burruss to McBryde by 1:25"}),
+                     headers={"Content-Type": "application/json"})
+        self.assertEqual(conn.getresponse().status, 200)
+        conn.close()

@@ -114,6 +114,11 @@ from app.gemini_provider import GeminiProvider  # noqa: E402
 
 TZ = ZoneInfo(config.CAMPUS_TZ)
 
+# Largest JSON request body we will parse, and the largest unread body we are
+# willing to discard so that a refusal can still be delivered cleanly.
+MAX_JSON_BODY = 1_000_000
+MAX_DRAIN_BYTES = 8_000_000
+
 # Preset scenarios. Each is a deterministic call into the SAME plan_day the agent
 # uses -- the demo is not a re-enactment.
 SCENARIOS: list[dict] = [
@@ -1228,27 +1233,57 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):        # quieter console
-        if "/api/" not in (args[0] if args else ""):
-            return
+        """Log /api/ lines only -- and NEVER raise.
 
-    def _send(self, code: int, body: bytes, ctype: str, extra_headers: list[tuple[str, str]] | None = None) -> None:
+        BaseHTTPRequestHandler.send_error() calls log_error() ->
+        log_message("code %d, message %s", HTTPStatus.NOT_IMPLEMENTED, ...): the
+        first argument is an HTTPStatus ENUM, not a string. Testing it with `in`
+        raised TypeError inside send_error, so the error response was never
+        written and the client got an empty reply -- which a proxy reports as
+        502 Bad Gateway. Every unsupported method or malformed request line hit
+        this, i.e. the server answered 502 instead of 501/400.
+        """
+        try:
+            text = fmt % args if args else str(fmt)
+        except Exception:                                    # noqa: BLE001
+            text = f"{fmt} {args}"
+        if "/api/" in text:
+            sys.stderr.write(f"{self.address_string()} - {text}\n")
+
+    def _send(self, code: int, body: bytes, ctype: str,
+              extra_headers: list[tuple[str, str]] | None = None,
+              close: bool = False) -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if close:
+            # Announce the close so a proxy does not reuse a socket whose request
+            # body we deliberately never read.
+            self.send_header("Connection", "close")
+            self.close_connection = True
         if extra_headers:
             for key, value in extra_headers:
                 self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
-    def _json(self, obj, code: int = 200, extra_headers: list[tuple[str, str]] | None = None) -> None:
+    def _json(self, obj, code: int = 200,
+              extra_headers: list[tuple[str, str]] | None = None,
+              close: bool = False) -> None:
         self._send(code, json.dumps(obj, default=str, indent=1).encode("utf-8"),
-                   "application/json; charset=utf-8", extra_headers)
+                   "application/json; charset=utf-8", extra_headers,
+                   close=close)
 
     def _read_json(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
         if not length:
+            return {}
+        if length > MAX_JSON_BODY:
+            # Do not read an unbounded body into memory; consume what we can so
+            # the refusal stays deliverable, and let the route reject the payload.
+            if not self._drain_body(length):
+                self.close_connection = True
             return {}
         raw = self.rfile.read(length)
         if not raw:
@@ -1290,6 +1325,46 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, b"{}", "application/json; charset=utf-8")
             return True
         return False
+
+    def _drain_body(self, length: int) -> bool:
+        """Read and discard an unread request body, so the response can be sent.
+
+        Refusing a request and closing immediately makes the client's in-flight
+        write fail: a browser shows a network error instead of our 413, and
+        http.client raises mid-send. Discarding a bounded amount first lets the
+        client finish writing and read the answer. Returns False when the body is
+        too large to discard, in which case the caller must close the socket.
+        """
+        if length <= 0:
+            return True
+        if length > MAX_DRAIN_BYTES:
+            return False
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(65_536, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+        return True
+
+    def do_OPTIONS(self) -> None:             # noqa: N802
+        """No CORS preflight is needed (same-origin app); answer plainly."""
+        self._send(204, b"", "text/plain; charset=utf-8",
+                   [("Allow", "GET, POST, PUT, HEAD, OPTIONS")])
+
+    def do_HEAD(self) -> None:                # noqa: N802
+        """Health probes use HEAD; answer like GET without a body."""
+        self._send(200, b"", "application/json; charset=utf-8")
+
+    def do_DELETE(self) -> None:              # noqa: N802
+        self._method_not_allowed()
+
+    def do_PATCH(self) -> None:               # noqa: N802
+        self._method_not_allowed()
+
+    def _method_not_allowed(self) -> None:
+        self._json({"error": "method not allowed",
+                    "allow": ["GET", "POST", "PUT"]}, 405)
 
     def do_GET(self) -> None:                 # noqa: N802
         path = self.path.split("?")[0]
@@ -1499,9 +1574,11 @@ class Handler(BaseHTTPRequestHandler):
         # time in the response; the browser clock is never consulted.
         now = config.now(TZ)
         length = int(self.headers.get("Content-Length") or 0)
-        if length < 0 or length > 1_000_000:
+        if length < 0 or length > MAX_JSON_BODY:
+            drained = 0 <= length <= MAX_DRAIN_BYTES and self._drain_body(length)
             self._json({"error": "request body too large",
-                        "_time": time_meta(now)}, 413)
+                        "limit_bytes": MAX_JSON_BODY,
+                        "_time": time_meta(now)}, 413, close=not drained)
             return
         payload = self._read_json()
         if (isinstance(payload, dict) and not payload.get("scenario_id")
